@@ -22,6 +22,8 @@ path = "src/lib.rs"
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+rpassword = "7"
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "io-std", "io-util", "time", "fs", "process", "signal"] }
 # Serialization

@@ -72,8 +72,26 @@ pub enum KvendraError {
     #[error("unsafe escape hatch quota exceeded ({used}/{max})")]
     UnsafeQuotaExceeded { used: u32, max: u32 },
 
+    #[error("detection blocked: {0}")]
+    DetectionBlocked(String),
+
+    #[error("keychain error: {0}")]
+    Keychain(String),
+
+    #[error("http error: {0}")]
+    Http(String),
+
+    #[error("tui error: {0}")]
+    Tui(String),
+
     #[error("internal error")]
     Internal,
+}
+
+impl From<reqwest::Error> for KvendraError {
+    fn from(err: reqwest::Error) -> Self {
+        KvendraError::Http(err.to_string())
+    }
 }
 
 impl From<serde_json::Error> for KvendraError {
