@@ -1,6 +1,6 @@
 [package]
 name = "kvendra"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "Developer harness CLI for Kvendra — pre-alpha placeholder."
 license = "Apache-2.0"
