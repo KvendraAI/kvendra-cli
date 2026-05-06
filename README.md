@@ -1,16 +1,18 @@
 # kvendra-cli
 
-> **Pre-launch.** Developer CLI for the Kvendra platform.
+**The harness for advanced engineering.**
 
-## What lives here
-
-- `kvendra` command-line tool for managing workspaces, KBs, skills, and pipelines from the terminal
-- Authentication flow (OAuth device flow + API tokens)
-- Local-first operations with sync to the platform
+Developer CLI for Kvendra. Manage workspaces, knowledge bases, skills, and pipelines from the terminal.
 
 ## Status
 
-🚧 Building. Not yet usable.
+Pre-alpha. Placeholder repository — `npx kvendra init` does not yet exist.
+
+## What will live here
+
+- `kvendra` command-line tool for workspace, KB, skills, and pipeline operations.
+- OAuth device flow plus API token authentication.
+- Local-first operations with sync to the platform.
 
 ## Install (when released)
 
@@ -27,9 +29,9 @@ brew install kvendra/tap/kvendra
 
 ## Links
 
+- Site: [kvendra.com](https://kvendra.com)
 - Org: [github.com/KvendraAI](https://github.com/KvendraAI)
-- Web: [kvendra.com](https://kvendra.com)
-- Contact: admin@kvendra.ai
+- Contact: hello@kvendra.ai
 
 ## License
 
