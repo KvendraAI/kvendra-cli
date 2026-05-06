@@ -1,10 +1,14 @@
 //! CLI surface — clap derive enums + dispatch.
 
 pub mod audit;
+pub mod completion;
+pub mod config_cmd;
+pub mod dashboard;
 pub mod init;
 pub mod lock;
 pub mod mcp;
 pub mod primitive;
+pub mod recover;
 pub mod secret;
 pub mod unlock;
 
@@ -31,6 +35,8 @@ pub enum Commands {
     Unlock(unlock::UnlockArgs),
     /// Lock the vault (zeroize derived key).
     Lock,
+    /// Reset the master password using the BIP-39 mnemonic (ADR-KVD-011).
+    Recover(recover::RecoverArgs),
     /// Manage stored secret profiles.
     #[command(subcommand)]
     Secret(secret::SecretCommand),
@@ -42,4 +48,11 @@ pub enum Commands {
     Mcp(mcp::McpCommand),
     /// Inspect or verify the audit log.
     Audit(audit::AuditArgs),
+    /// Live dashboard TUI (vault state + recent audit).
+    Dashboard,
+    /// Generate shell completion script (AC-CLI-3).
+    Completion(completion::CompletionArgs),
+    /// Manage CLI configuration (keychain etc.).
+    #[command(subcommand)]
+    Config(config_cmd::ConfigCommand),
 }
