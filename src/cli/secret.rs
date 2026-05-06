@@ -10,12 +10,13 @@
 //!   - `set-allowlist <profile_id> --file PATH`
 
 use crate::allowlist::{ProfileSpec, validate as allowlist_validate};
-use crate::config::kvendra_home;
+use crate::config::{Config, kvendra_home};
 use crate::error::{KvendraError, KvendraResult};
 use crate::vault::{Profile, Vault};
 use clap::{Args, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
+use zeroize::Zeroize;
 
 #[derive(Debug, Subcommand)]
 pub enum SecretCommand {
@@ -53,6 +54,9 @@ pub struct AddArgs {
     /// Optional ISO-8601 expiration date.
     #[arg(long)]
     pub expiration: Option<String>,
+    /// Read master password from stdin (recommended for scripts).
+    #[arg(long)]
+    pub password_stdin: bool,
 }
 
 #[derive(Debug, Args)]
@@ -62,6 +66,9 @@ pub struct RotateArgs {
     pub secret_env: Option<String>,
     #[arg(long)]
     pub secret_file: Option<PathBuf>,
+    /// Read master password from stdin (recommended for scripts).
+    #[arg(long)]
+    pub password_stdin: bool,
 }
 
 #[derive(Debug, Args)]
@@ -81,17 +88,62 @@ pub struct SetAllowlistArgs {
 
 pub async fn run(cmd: SecretCommand) -> KvendraResult<()> {
     let home = kvendra_home()?;
-    let vault = Vault::new(home);
+    let vault = Vault::new(home.clone());
 
     match cmd {
-        SecretCommand::Add(args) => add(&vault, args).await,
+        SecretCommand::Add(args) => add(&vault, &home, args).await,
         SecretCommand::List => list(&vault),
         SecretCommand::GetMeta { profile_id } => get_meta(&vault, &profile_id),
-        SecretCommand::Rotate(args) => rotate(&vault, args).await,
+        SecretCommand::Rotate(args) => rotate(&vault, &home, args).await,
         SecretCommand::Revoke { profile_id } => revoke(&vault, &profile_id),
         SecretCommand::Validate(args) => validate_cmd(&vault, args),
         SecretCommand::SetAllowlist(args) => set_allowlist(&vault, args),
     }
+}
+
+/// Resolve the master password and ensure the vault is unlocked in-process.
+///
+/// If the vault is already unlocked (e.g. inside an embedded `mcp serve`),
+/// returns immediately. Otherwise, reads the master password from one of:
+/// 1. `--password-stdin` (recommended for scripts).
+/// 2. Env var `KVENDRA_PASSWORD` (same name used by `kvendra unlock`).
+/// 3. Interactive prompt via `rpassword` (only if stdin is a TTY).
+///
+/// Then re-derives the session key in-process. The password is zeroized
+/// before this function returns. Mirrors the canonical pattern used by
+/// `kvendra audit verify` (per ADR-KVD-012, opción B owner).
+fn ensure_unlocked(vault: &Vault, home: &Path, password_stdin: bool) -> KvendraResult<()> {
+    if vault.is_unlocked() {
+        return Ok(());
+    }
+    let cfg = Config::load(home).unwrap_or_default();
+    let mut password = read_master_password(password_stdin)?;
+    let result = vault.unlock(password.as_bytes(), cfg.vault.idle_timeout_minutes);
+    password.zeroize();
+    result
+}
+
+fn read_master_password(password_stdin: bool) -> KvendraResult<String> {
+    if password_stdin {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_line(&mut buf)
+            .map_err(|e| KvendraError::Vault(format!("read password from stdin: {e}")))?;
+        if buf.ends_with('\n') {
+            buf.pop();
+            if buf.ends_with('\r') {
+                buf.pop();
+            }
+        }
+        return Ok(buf);
+    }
+    if let Ok(p) = std::env::var("KVENDRA_PASSWORD")
+        && !p.is_empty()
+    {
+        return Ok(p);
+    }
+    println!("Enter the master password (will not echo):");
+    rpassword::read_password().map_err(|e| KvendraError::Vault(format!("read password: {e}")))
 }
 
 fn read_secret(env: Option<&str>, file: Option<&PathBuf>) -> KvendraResult<Vec<u8>> {
@@ -108,10 +160,8 @@ fn read_secret(env: Option<&str>, file: Option<&PathBuf>) -> KvendraResult<Vec<u
     ))
 }
 
-async fn add(vault: &Vault, args: AddArgs) -> KvendraResult<()> {
-    if !vault.is_unlocked() {
-        return Err(KvendraError::VaultLocked);
-    }
+async fn add(vault: &Vault, home: &Path, args: AddArgs) -> KvendraResult<()> {
+    ensure_unlocked(vault, home, args.password_stdin)?;
     let plaintext = read_secret(args.secret_env.as_deref(), args.secret_file.as_ref())?;
     vault.put_secret(&args.profile_id, &plaintext)?;
 
@@ -147,10 +197,8 @@ fn get_meta(vault: &Vault, profile_id: &str) -> KvendraResult<()> {
     Ok(())
 }
 
-async fn rotate(vault: &Vault, args: RotateArgs) -> KvendraResult<()> {
-    if !vault.is_unlocked() {
-        return Err(KvendraError::VaultLocked);
-    }
+async fn rotate(vault: &Vault, home: &Path, args: RotateArgs) -> KvendraResult<()> {
+    ensure_unlocked(vault, home, args.password_stdin)?;
     let plaintext = read_secret(args.secret_env.as_deref(), args.secret_file.as_ref())?;
     vault.put_secret(&args.profile_id, &plaintext)?;
     println!("Profile '{}' rotated.", args.profile_id);
