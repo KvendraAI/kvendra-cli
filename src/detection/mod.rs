@@ -148,6 +148,32 @@ pub fn sanitize_output(s: &str) -> String {
     out
 }
 
+/// Recursively sanitize every `String` leaf inside a `serde_json::Value`,
+/// replacing detected tokens with redaction markers. Used to sanitize the
+/// MCP `structuredContent` and `error.message`/`error.data` fields before
+/// emitting them on the wire (REQ-KVD-002 AC-MCP-3).
+pub fn sanitize_value(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => {
+            let cleaned = sanitize_output(s);
+            if cleaned != *s {
+                *s = cleaned;
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                sanitize_value(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_k, val) in map.iter_mut() {
+                sanitize_value(val);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +274,59 @@ mod tests {
     fn sanitize_passes_through_safe_text() {
         let s = "totally safe log message with no secrets";
         assert_eq!(sanitize_output(s), s);
+    }
+
+    #[test]
+    fn sanitize_structured_content_redacts_github_pat() {
+        let mut v = serde_json::json!({
+            "stdout": "exporting GITHUB_TOKEN=ghp_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaaaa",
+            "exit_code": 0
+        });
+        sanitize_value(&mut v);
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(
+            !s.contains("ghp_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaaaa"),
+            "leaked GitHub PAT in: {s}"
+        );
+        assert!(s.contains("<redacted:github_pat_classic>"), "got: {s}");
+    }
+
+    #[test]
+    fn sanitize_structured_content_redacts_aws_keys_env() {
+        let mut v = serde_json::json!({
+            "headers": {
+                "X-Aws-Akid": "AKIAIOSFODNN7EXAMPLE",
+                "X-Aws-Secret": "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            }
+        });
+        sanitize_value(&mut v);
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(!s.contains("AKIAIOSFODNN7EXAMPLE"), "AKID leaked: {s}");
+        assert!(
+            !s.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+            "AWS secret leaked: {s}"
+        );
+    }
+
+    #[test]
+    fn sanitize_structured_content_redacts_recursively_in_arrays_and_nested_objects() {
+        let mut v = serde_json::json!({
+            "events": [
+                {"line": "ghp_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaaaa happened"},
+                {"line": "no secret here"},
+                {"nested": {"deep": [{"token": "npm_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaaaa"}]}}
+            ]
+        });
+        sanitize_value(&mut v);
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(
+            !s.contains("ghp_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaaaa"),
+            "leaked GitHub PAT in array: {s}"
+        );
+        assert!(
+            !s.contains("npm_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaaaa"),
+            "leaked npm token deep nested: {s}"
+        );
+        assert!(s.contains("no secret here"), "lost safe data: {s}");
     }
 }

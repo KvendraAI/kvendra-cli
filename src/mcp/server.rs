@@ -208,7 +208,11 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
     if !profile_id.is_empty() {
         if let Err(e) = enforce_allowlist(&ctx, &profile_id, name, &action, &arguments) {
             let _ = record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true).await;
-            return JsonRpcResponse::error(id, codes::APPLICATION_ERROR, e.to_string());
+            // AC-MCP-3 defence in depth: the error string can include the
+            // primitive's argv / parsed YAML on certain code paths, which
+            // could carry leaked tokens. Always scrub before returning.
+            let msg = crate::detection::sanitize_output(&e.to_string());
+            return JsonRpcResponse::error(id, codes::APPLICATION_ERROR, msg);
         }
     }
 
@@ -243,29 +247,51 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
 
     match outcome {
         Ok(value) => {
-            let text = if name == "kvendra.unsafe.raw_token" {
-                // Documented exception: the plaintext rides in `result.content[].text`
-                // (per IF-KVD-CLI-008).
-                value
-                    .get("plaintext")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_default()
-            } else {
-                // Sanitize the JSON serialization of the value before exposing it.
-                crate::detection::sanitize_output(&value.to_string())
-            };
+            let (text, structured) = build_sanitized_payload(name, value);
             JsonRpcResponse::success(
                 id,
                 serde_json::json!({
                     "content": [{ "type": "text", "text": text }],
                     "isError": false,
-                    "structuredContent": value,
+                    "structuredContent": structured,
                     "auditEventId": event_id,
                 }),
             )
         }
-        Err(err) => JsonRpcResponse::error(id, codes::APPLICATION_ERROR, err.to_string()),
+        Err(err) => {
+            // Defence in depth: sanitize the outbound error message. A
+            // misbehaving primitive that includes a leaked token in its
+            // error string must not bypass AC-MCP-3.
+            let sanitized_msg = crate::detection::sanitize_output(&err.to_string());
+            JsonRpcResponse::error(id, codes::APPLICATION_ERROR, sanitized_msg)
+        }
+    }
+}
+
+/// Build the `(content.text, structuredContent)` pair that goes on the wire
+/// for a successful `tools/call`, applying the AC-MCP-3 sanitization policy.
+///
+/// Every primitive's payload is recursively scrubbed via
+/// [`crate::detection::sanitize_value`] EXCEPT for the documented escape
+/// hatch `kvendra.unsafe.raw_token` (per IF-KVD-CLI-008): for that single
+/// primitive the plaintext rides through both `text` and
+/// `structuredContent` unaltered. This is the ONLY exception to AC-MCP-3
+/// and is gated by the profile-level `unsafe_raw_token_enabled` flag and
+/// per-session quota in the primitive itself.
+pub fn build_sanitized_payload(name: &str, value: Value) -> (String, Value) {
+    if name == "kvendra.unsafe.raw_token" {
+        // AC-MCP-3 exception: documented escape hatch per IF-KVD-CLI-008.
+        let pt = value
+            .get("plaintext")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default();
+        (pt, value)
+    } else {
+        let text = crate::detection::sanitize_output(&value.to_string());
+        let mut structured = value;
+        crate::detection::sanitize_value(&mut structured);
+        (text, structured)
     }
 }
 
@@ -340,5 +366,59 @@ async fn invoke_primitive(
         "kvendra.shell" => shell::execute(args, secret).await,
         "kvendra.unsafe.raw_token" => unsafe_raw_token::execute(args, vault, secret).await,
         other => Err(KvendraError::PrimitiveNotImplemented(other.into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AC-MCP-3 — `structuredContent` of a non-escape-hatch primitive must
+    /// have every leaked secret recursively redacted, even when the value
+    /// is buried inside nested arrays / objects (e.g. captured stdout from
+    /// `kvendra.shell`).
+    #[test]
+    fn structured_content_is_sanitized_for_regular_primitive() {
+        let payload = serde_json::json!({
+            "binary": "printenv",
+            "exit_code": 0,
+            "stdout_sanitized": "GITHUB_TOKEN=ghp_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaaaa\n",
+            "stderr_sanitized": "",
+        });
+        let (text, structured) = build_sanitized_payload("kvendra.shell", payload);
+        let s = serde_json::to_string(&structured).unwrap();
+        assert!(
+            !s.contains("ghp_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaaaa"),
+            "PAT leaked through structuredContent: {s}"
+        );
+        assert!(s.contains("<redacted:github_pat_classic>"), "got: {s}");
+        assert!(
+            !text.contains("ghp_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaaaa"),
+            "PAT leaked in text: {text}"
+        );
+    }
+
+    /// AC-MCP-3 documented exception — the escape hatch
+    /// `kvendra.unsafe.raw_token` MUST return plaintext so that opt-in
+    /// callers can read tokens directly. Every other primitive is scrubbed.
+    #[test]
+    fn unsafe_raw_token_bypasses_sanitization() {
+        let secret = "ghp_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaaaa";
+        let payload = serde_json::json!({
+            "operation": "get",
+            "profile_id": "test.github",
+            "plaintext": secret,
+        });
+        let (text, structured) =
+            build_sanitized_payload("kvendra.unsafe.raw_token", payload.clone());
+        // `text` carries the plaintext verbatim (consumer reads from there).
+        assert_eq!(text, secret);
+        // `structuredContent` keeps the plaintext intact too — the entire
+        // point of the escape hatch is to deliver the raw material.
+        let s = serde_json::to_string(&structured).unwrap();
+        assert!(
+            s.contains(secret),
+            "escape hatch unexpectedly redacted: {s}"
+        );
     }
 }
