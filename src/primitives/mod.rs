@@ -1,22 +1,21 @@
 //! Capability primitives — the 7 canonical brokers + escape hatch.
 //!
-//! Each primitive is a small async free function `execute(args: &Value) ->
-//! KvendraResult<Value>`. The MCP dispatcher hands the validated arguments
-//! and consumes the JSON value as the structured response body.
+//! Each primitive is a small async free function. Pase B-and-on signature:
+//! `execute(args: &Value, secret: Option<&SecretPlaintext>) -> KvendraResult<Value>`.
+//! The MCP dispatcher loads the profile-bound secret from the unlocked
+//! vault and passes it in (ZeroizeOnDrop wraps it for the call duration).
 //!
-//! Pase A:
-//! - Real implementations: `git`, `github`, `shell` (bind to allowlist + run).
-//! - Stubs (return `PrimitiveNotImplemented`): `npm`, `pypi`, `aws`, `http`,
-//!   `unsafe_raw_token`. Pase B fills these in.
+//! AC-MCP-3 invariant: no primitive embeds the plaintext in the JSON
+//! response. Documented exception: `kvendra.unsafe.raw_token` (IF-KVD-CLI-008).
 
+pub mod aws;
 pub mod git;
 pub mod github;
+pub mod http;
+pub mod npm;
+pub mod pypi;
 pub mod shell;
-pub mod stub_aws;
-pub mod stub_http;
-pub mod stub_npm;
-pub mod stub_pypi;
-pub mod stub_unsafe_raw_token;
+pub mod unsafe_raw_token;
 
 use serde_json::{Value, json};
 

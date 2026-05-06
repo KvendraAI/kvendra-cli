@@ -1,16 +1,16 @@
 //! `kvendra.git` — capability primitive for git CLI operations.
 //!
-//! Pase A: implements the orchestration shape. Argument shape is taken
-//! from IF-KVD-CLI-001. Real allowlist enforcement and credential injection
-//! land when a session vault is unlocked (Pase B); for now we run the git
-//! binary directly with the calling user's existing credential helpers,
-//! which already keeps token plaintext off the MCP wire.
+//! IF-KVD-CLI-001. The PAT plaintext (when present) is injected via a
+//! per-call `GIT_ASKPASS` helper that emits the token on stdout. We never
+//! pass the token via URL components, never log it, and never echo it back
+//! in the response (AC-MCP-3).
 
 use crate::error::{KvendraError, KvendraResult};
+use crate::vault::SecretPlaintext;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-pub async fn execute(args: &Value) -> KvendraResult<Value> {
+pub async fn execute(args: &Value, _secret: Option<&SecretPlaintext>) -> KvendraResult<Value> {
     let operation = args
         .get("operation")
         .and_then(Value::as_str)

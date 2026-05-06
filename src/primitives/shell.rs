@@ -6,10 +6,11 @@
 //! classes of injection (semicolons, pipes, command substitution).
 
 use crate::error::{KvendraError, KvendraResult};
+use crate::vault::SecretPlaintext;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-pub async fn execute(args: &Value) -> KvendraResult<Value> {
+pub async fn execute(args: &Value, _secret: Option<&SecretPlaintext>) -> KvendraResult<Value> {
     let op_args = args.get("args").cloned().unwrap_or(Value::Null);
     let binary = op_args
         .get("binary")

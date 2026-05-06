@@ -60,6 +60,47 @@ fn check_constraints(primitive: &str, op: &str, c: &OperationConstraints) -> Kve
             "{primitive}.{op}: wildcard `endpoints: [\"*\"]` rejected without accept_broad_scope"
         )));
     }
+
+    // Extra-strict validation for `kvendra.http`: this primitive trades the
+    // most blast radius. Reject empty `url_pattern_regex` (would allow any
+    // URL) and obviously-broad regexes like `.*` without `accept_broad_scope`.
+    if primitive == "kvendra.http" {
+        match &c.url_pattern_regex {
+            None => {
+                if !accept_broad {
+                    return Err(KvendraError::AllowlistParse(format!(
+                        "{primitive}.{op}: url_pattern_regex required (or accept_broad_scope: true)"
+                    )));
+                }
+            }
+            Some(patterns) => {
+                if patterns.is_empty() && !accept_broad {
+                    return Err(KvendraError::AllowlistParse(format!(
+                        "{primitive}.{op}: empty url_pattern_regex rejected"
+                    )));
+                }
+                for pat in patterns {
+                    let trimmed = pat.trim();
+                    if (trimmed == ".*" || trimmed == "^.*$" || trimmed == ".+") && !accept_broad {
+                        return Err(KvendraError::AllowlistParse(format!(
+                            "{primitive}.{op}: wildcard regex '{pat}' rejected without accept_broad_scope"
+                        )));
+                    }
+                    // Compile to validate well-formedness.
+                    if regex::Regex::new(pat).is_err() {
+                        return Err(KvendraError::AllowlistParse(format!(
+                            "{primitive}.{op}: invalid url_pattern_regex '{pat}'"
+                        )));
+                    }
+                }
+            }
+        }
+        if c.methods.is_none() && !accept_broad {
+            return Err(KvendraError::AllowlistParse(format!(
+                "{primitive}.{op}: methods required (or accept_broad_scope: true)"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -126,8 +167,65 @@ allowlist:
         - request:
             endpoints: ["*"]
             methods: ["GET"]
+            url_pattern_regex: ["^https://api\\.example\\.com/.*"]
 "#;
         let p = ProfileSpec::from_yaml(yaml).unwrap();
         assert!(validate(&p).is_err());
+    }
+
+    #[test]
+    fn http_requires_url_pattern() {
+        let yaml = r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.http
+      operations:
+        - request:
+            methods: ["GET"]
+"#;
+        let p = ProfileSpec::from_yaml(yaml).unwrap();
+        assert!(
+            validate(&p).is_err(),
+            "http without url_pattern_regex must be rejected"
+        );
+    }
+
+    #[test]
+    fn http_rejects_dot_star_pattern() {
+        let yaml = r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.http
+      operations:
+        - request:
+            methods: ["GET"]
+            url_pattern_regex: [".*"]
+"#;
+        let p = ProfileSpec::from_yaml(yaml).unwrap();
+        assert!(validate(&p).is_err());
+    }
+
+    #[test]
+    fn http_accepts_specific_pattern() {
+        let yaml = r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.http
+      operations:
+        - request:
+            methods: ["GET"]
+            url_pattern_regex: ["^https://api\\.example\\.com/v1/.*"]
+"#;
+        let p = ProfileSpec::from_yaml(yaml).unwrap();
+        assert!(validate(&p).is_ok());
     }
 }
