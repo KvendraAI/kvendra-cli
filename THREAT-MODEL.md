@@ -147,6 +147,15 @@ physical access) can dump that RAM. The optional OS-keychain integration
 (ADR-KVD-012) expands this surface to the OS keychain itself, which is
 why the opt-in requires an explicit disclosure.
 
+Note: when scripting unattended flows, the master password may transit
+through environment variables (`KVENDRA_PASSWORD` for `unlock` and
+`audit --verify`, `KVENDRA_INIT_PASSWORD` for `init`,
+`KVENDRA_NEW_PASSWORD` + `KVENDRA_RECOVERY_MNEMONIC` for `recover`,
+`KVENDRA_MCP_PASSWORD` for `mcp serve`). Environment variables are
+visible to the process tree and to `/proc/<pid>/environ` on Linux —
+prefer the `--password-stdin` flag where available (currently
+`audit --verify`) and clear the variable as soon as the process spawns.
+
 Future mitigation: hardware-backed wrapping (Secure Enclave / TPM 2.0 /
 Yubikey FIDO2) — deferred post-MVP.
 

@@ -34,6 +34,29 @@ npm install -g @kvendra/cli
 pip install kvendra
 ```
 
+## Non-interactive use (CI / scripts)
+
+The vault subcommands prompt by default but accept the master password and
+related material from environment variables for unattended use. The names
+below are the canonical ones honoured by the binary; older drafts of the
+docs referenced `KVENDRA_UNLOCK_PASSWORD` / `KVENDRA_RECOVER_MNEMONIC` /
+`KVENDRA_RECOVER_NEW_PASSWORD` — those names were never wired and are NOT
+recognised. Use the table:
+
+| Subcommand | Env var | Purpose |
+|---|---|---|
+| `kvendra init` | `KVENDRA_INIT_PASSWORD` | Master password for fresh vault |
+| `kvendra init` | `KVENDRA_INIT_CONFIRM_CODE` | Pre-confirmation numeric code |
+| `kvendra unlock` | `KVENDRA_PASSWORD` | Master password to unlock the session |
+| `kvendra recover` | `KVENDRA_RECOVERY_MNEMONIC` | 12-word BIP-39 phrase |
+| `kvendra recover` | `KVENDRA_NEW_PASSWORD` | Replacement master password |
+| `kvendra mcp serve` | `KVENDRA_MCP_PASSWORD` | Master password for embedded unlock |
+| `kvendra audit --verify` | `KVENDRA_PASSWORD` | Master password for cross-process verify |
+| any subcommand | `KVENDRA_HOME` | Override `~/.kvendra/` for testing/sandboxing |
+
+`kvendra audit --verify` also accepts `--password-stdin` (recommended for
+scripts: pipe the password on stdin, no env var pollution).
+
 ## Links
 
 - Site: [kvendra.com](https://kvendra.com)
