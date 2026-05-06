@@ -147,6 +147,17 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
     }
     let codes_path = vault.recovery_codes_path();
     std::fs::write(&codes_path, serde_json::to_string_pretty(&stored)?)?;
+    // The hashed recovery codes file holds salted Argon2id hashes of the
+    // numeric one-shot codes. Even though the codes are themselves hashed,
+    // we still tighten the permissions to 0600 to keep them out of reach of
+    // other local accounts (defence-in-depth — see THREAT-MODEL V2).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&codes_path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&codes_path, perms)?;
+    }
 
     // Create the vault sentinel.
     vault.create(password.as_bytes())?;
