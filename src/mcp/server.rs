@@ -38,11 +38,21 @@ pub struct ServerContext {
     pub writer: Option<AuditWriter>,
 }
 
-/// Run the MCP server until the client disconnects.
+/// Run the MCP server until the client disconnects (creates a fresh `Vault`
+/// pointed at `home`; the vault is locked unless the caller has already
+/// unlocked it via `Vault::unlock`).
 pub async fn serve(home: PathBuf) -> KvendraResult<()> {
     crate::config::ensure_layout(&home)?;
-    let config = Config::load(&home).unwrap_or_default();
     let vault = Vault::new(home.clone());
+    serve_with_vault(vault).await
+}
+
+/// Run the MCP server with an already-constructed `Vault` (typically already
+/// unlocked by the CLI entrypoint).
+pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
+    let home = vault.home().to_path_buf();
+    crate::config::ensure_layout(&home)?;
+    let config = Config::load(&home).unwrap_or_default();
 
     // The audit writer needs the HMAC sub-key, which comes from the unlocked
     // session. If locked, we degrade: audit rows are NOT appended and the

@@ -78,8 +78,16 @@ impl Config {
     }
 }
 
-/// Compute the kvendra home directory (`~/.kvendra/`).
+/// Compute the kvendra home directory.
+///
+/// Honours `$KVENDRA_HOME` for testing/sandboxing, falling back to
+/// `~/.kvendra/` (`$HOME/.kvendra/`).
 pub fn kvendra_home() -> KvendraResult<PathBuf> {
+    if let Some(p) = std::env::var_os("KVENDRA_HOME")
+        && !p.is_empty()
+    {
+        return Ok(PathBuf::from(p));
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| KvendraError::Config("HOME env var not set".into()))?;
