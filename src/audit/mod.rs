@@ -1,0 +1,64 @@
+//! Audit log — SQLite WAL + HMAC-chain (REQ-KVD-002 Bloque 6, ADR-KVD-007).
+//!
+//! Public API: [`AuditEvent`], [`AuditLog`], [`AuditWriter`].
+
+pub mod hmac;
+pub mod reader;
+pub mod schema;
+pub mod writer;
+
+use serde::{Deserialize, Serialize};
+
+/// Status field of an audit row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    Started,
+    Ok,
+    Error,
+}
+
+impl Status {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Status::Started => "started",
+            Status::Ok => "ok",
+            Status::Error => "error",
+        }
+    }
+}
+
+/// Severity level — info | warn | error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Info,
+    Warn,
+    Error,
+}
+
+impl Severity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Severity::Info => "info",
+            Severity::Warn => "warn",
+            Severity::Error => "error",
+        }
+    }
+}
+
+/// Logical audit event payload (pre-HMAC).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub ts_unix_ms: i64,
+    pub profile_id: String,
+    pub primitive: String,
+    pub action: String,
+    pub args_hash_hex: String,
+    pub status: Status,
+    pub severity: Severity,
+    /// Optional comma-separated flags (e.g. "unsafe_escape_hatch").
+    pub flags: String,
+}
+
+pub use writer::AuditWriter;
