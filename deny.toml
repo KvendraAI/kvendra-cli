@@ -1,0 +1,47 @@
+[graph]
+all-features = true
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Tracked exceptions (each must reference a follow-up plan documented in
+# `THREAT-MODEL.md` or the issue tracker before merge).
+#  - RUSTSEC-2024-0436: `paste` is unmaintained but pulled in transitively
+#    by `ratatui`. Replacement requires upstream `ratatui` to swap to the
+#    maintained `pastey` fork. Tracked as a Pase C task.
+#  - RUSTSEC-2025-0068: `serde_yml` is unsound. We use it only for
+#    parsing the on-disk allowlist YAML (read-only). Migrating to
+#    `serde_yaml_ng` is a Pase C task.
+ignore = [
+  "RUSTSEC-2024-0436",
+  "RUSTSEC-2025-0068",
+]
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "ISC",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Zlib",
+  "CC0-1.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "BSL-1.0",
+  "Unlicense",
+  "CDLA-Permissive-2.0",
+  "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
