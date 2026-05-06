@@ -80,6 +80,7 @@ const CATALOG: [PrimitiveInfo; 8] = [
         operations: &[
             "update_repo",
             "release",
+            "read_repo",
             "read_issue",
             "update_issue",
             "add_topics",

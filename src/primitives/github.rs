@@ -1,8 +1,8 @@
 //! `kvendra.github` — GitHub REST broker (IF-KVD-CLI-002).
 //!
-//! Operations: `update_repo`, `release`, `read_issue`, `update_issue`,
-//! `add_topics`. The PAT plaintext is attached as a Bearer token; it never
-//! appears in returned values.
+//! Operations: `update_repo`, `release`, `read_repo`, `read_issue`,
+//! `update_issue`, `add_topics`. The PAT plaintext is attached as a Bearer
+//! token; it never appears in returned values.
 
 use crate::error::{KvendraError, KvendraResult};
 use crate::vault::SecretPlaintext;
@@ -33,6 +33,7 @@ pub async fn execute(args: &Value, secret: Option<&SecretPlaintext>) -> KvendraR
     match operation {
         "update_repo" => update_repo(&client, &token, &op_args).await,
         "release" => release(&client, &token, &op_args).await,
+        "read_repo" => read_repo(&client, &token, &op_args).await,
         "read_issue" => read_issue(&client, &token, &op_args).await,
         "update_issue" => update_issue(&client, &token, &op_args).await,
         "add_topics" => add_topics(&client, &token, &op_args).await,
@@ -40,6 +41,19 @@ pub async fn execute(args: &Value, secret: Option<&SecretPlaintext>) -> KvendraR
             "unsupported github operation '{other}'"
         ))),
     }
+}
+
+async fn read_repo(client: &reqwest::Client, token: &str, op_args: &Value) -> KvendraResult<Value> {
+    let (owner, repo) = parse_owner_repo(op_args)?;
+    let url = format!("{GH_API}/repos/{owner}/{repo}");
+    let resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await?;
+    finalize("read_repo", resp).await
 }
 
 fn parse_owner_repo(op_args: &Value) -> KvendraResult<(String, String)> {
