@@ -1,0 +1,11 @@
+[package]
+name = "kvendra"
+version = "0.0.1"
+edition = "2024"
+description = "Developer harness CLI for Kvendra — pre-alpha placeholder."
+license = "Apache-2.0"
+repository = "https://github.com/KvendraAI/kvendra-cli"
+homepage = "https://kvendra.com"
+readme = "README.md"
+keywords = ["agents", "mcp", "kvendra", "cli", "secrets"]
+categories = ["command-line-utilities", "development-tools"]

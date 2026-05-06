@@ -35,4 +35,6 @@ brew install kvendra/tap/kvendra
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+Apache-2.0 — see [LICENSE](./LICENSE).
+
+Copyright 2026 Kvendra.
