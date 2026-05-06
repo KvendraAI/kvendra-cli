@@ -322,6 +322,40 @@ impl Vault {
         Ok(session.audit_hmac_key()?.to_vec())
     }
 
+    /// Re-derive the audit-HMAC sub-key from the master password without
+    /// touching the in-memory session. Used by `kvendra audit verify` so a
+    /// CLI invocation that does not share a process with `mcp serve` can
+    /// still verify the chain (per ADR-KVD-010 + ADR-KVD-012, opción B).
+    ///
+    /// The derived key + sub-key both live on the stack of this call: we
+    /// build them, hand back a `Vec<u8>` whose contents the caller must
+    /// zeroize after use, and drop the parent material via ZeroizeOnDrop.
+    pub fn audit_hmac_key_from_password(&self, password: &[u8]) -> KvendraResult<Vec<u8>> {
+        use crate::vault::session::{HKDF_INFO_AUDIT_HMAC, hkdf_expand};
+        let path = self.sentinel_path();
+        if !path.exists() {
+            return Err(KvendraError::Vault(
+                "vault not initialized (run `kvendra init` first)".into(),
+            ));
+        }
+        let raw = std::fs::read_to_string(&path)?;
+        let blob = Blob::from_json(&raw)?;
+        let derived = derive(password, &blob.kdf)?;
+        // Verify the password matches (same path as `unlock`) — this also
+        // catches a corrupt sentinel.
+        let mut nonce = [0u8; NONCE_LEN];
+        if blob.nonce.len() != NONCE_LEN {
+            return Err(KvendraError::Vault("sentinel nonce length invalid".into()));
+        }
+        nonce.copy_from_slice(&blob.nonce);
+        let pt = aes_open(derived.as_bytes(), &nonce, &blob.ciphertext)?;
+        if pt != b"kvendra-sentinel-v1" {
+            return Err(KvendraError::InvalidMasterPassword);
+        }
+        let sub = hkdf_expand(derived.as_bytes(), HKDF_INFO_AUDIT_HMAC);
+        Ok(sub.to_vec())
+    }
+
     /// Mark a profile as quarantined (detection layer Block severity).
     pub fn mark_quarantined(&self, profile_id: &str) -> KvendraResult<()> {
         if let Ok(mut meta) = self.load_profile_meta(profile_id) {
@@ -396,6 +430,39 @@ mod tests {
         let (_dir, v) = open_test_vault();
         v.create_with_params(b"correct", fast_params()).unwrap();
         let r = v.unlock(b"wrong", 30);
+        assert!(matches!(r, Err(KvendraError::InvalidMasterPassword)));
+    }
+
+    /// AC-AUDIT-2 cross-process verify (FAIL #3 fix): `audit_hmac_key_from_password`
+    /// must produce the same sub-key as the unlocked session would, so a
+    /// `kvendra audit --verify` from a fresh process can verify the chain.
+    #[test]
+    fn audit_hmac_key_matches_session_key_when_re_derived() {
+        let (_dir, v) = open_test_vault();
+        // We cannot use the high-cost params in tests (would take >1s), so we
+        // call `create_with_params` then re-derive using the SAME params via
+        // a helper that reads the on-disk sentinel.
+        v.create_with_params(b"hunter2-test", fast_params())
+            .unwrap();
+
+        // Path A: in-memory unlock + read session sub-key.
+        v.unlock(b"hunter2-test", 30).unwrap();
+        let from_session = v.audit_hmac_key().unwrap();
+
+        // Path B: re-derive in-process from the sentinel + password.
+        let from_password = v.audit_hmac_key_from_password(b"hunter2-test").unwrap();
+
+        assert_eq!(
+            from_session, from_password,
+            "session sub-key and re-derived sub-key must match"
+        );
+    }
+
+    #[test]
+    fn audit_hmac_key_from_password_rejects_wrong_password() {
+        let (_dir, v) = open_test_vault();
+        v.create_with_params(b"correct-pw", fast_params()).unwrap();
+        let r = v.audit_hmac_key_from_password(b"wrong-pw");
         assert!(matches!(r, Err(KvendraError::InvalidMasterPassword)));
     }
 }
