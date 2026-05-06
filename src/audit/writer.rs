@@ -56,7 +56,7 @@ impl AuditWriter {
                         severity,
                         ack,
                     } => {
-                        let r = update_event_status(&conn, id, status, severity);
+                        let r = update_event_status(&conn, &hmac_key, id, status, severity);
                         let _ = ack.send(r);
                     }
                     WriterCmd::Shutdown => break,
@@ -157,13 +157,68 @@ fn record_event(conn: &Connection, hmac_key: &[u8], event: &AuditEvent) -> Kvend
 
 fn update_event_status(
     conn: &Connection,
+    hmac_key: &[u8],
     id: i64,
     status: Status,
     severity: Severity,
 ) -> KvendraResult<()> {
+    // 1) Update status + severity.
     conn.execute(
         "UPDATE audit_events SET status = ?1, severity = ?2 WHERE id = ?3",
         rusqlite::params![status.as_str(), severity.as_str(), id],
     )?;
+
+    // 2) Re-compute HMAC over the updated row and persist.
+    //
+    // Without this, the chain breaks when `verify` recomputes the row's
+    // HMAC using the post-update status/severity (e.g. "ok") while the
+    // stored HMAC was signed over the pre-update values (e.g. "started").
+    // Since the writer task is serial (mpsc + dedicated thread), the next
+    // INSERT always observes the post-UPDATE HMAC as `prev_hmac`, so the
+    // chain remains consistent.
+    let (ts_unix_ms, profile_id, primitive, action, args_hash_hex, flags, prev_hmac): (
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = conn.query_row(
+        "SELECT ts_unix_ms, profile_id, primitive, action, args_hash_hex, flags, prev_hmac_hex
+         FROM audit_events WHERE id = ?1",
+        [id],
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        },
+    )?;
+
+    let mac = compute_hmac(
+        hmac_key,
+        id,
+        ts_unix_ms,
+        &profile_id,
+        &primitive,
+        &action,
+        &args_hash_hex,
+        status.as_str(),
+        severity.as_str(),
+        &flags,
+        &prev_hmac,
+    );
+
+    conn.execute(
+        "UPDATE audit_events SET hmac_hex = ?1 WHERE id = ?2",
+        rusqlite::params![mac, id],
+    )?;
+
     Ok(())
 }

@@ -227,3 +227,52 @@ async fn audit_verify_cli_detects_tampering() {
         .failure()
         .stdout(contains("CORRUPTION DETECTED"));
 }
+
+// ----------------------------------------------------------------------
+// Regression: INSERT(started) → UPDATE(ok) flow used by the real MCP
+// dispatcher. Without recomputing HMAC on update, the chain breaks.
+// (Bug detected in Sesión 1.5 owner E2E smoke; ISSUE-KVD-CLI-009.)
+// ----------------------------------------------------------------------
+
+#[tokio::test]
+async fn audit_verify_passes_after_status_update() {
+    let dir = tempdir().unwrap();
+    let home = dir.path();
+    let password = b"hunter2-update-flow";
+    let _vault = bootstrap_vault(home, password);
+
+    let key = Vault::new(home.to_path_buf())
+        .audit_hmac_key_from_password(password)
+        .unwrap();
+
+    let writer = AuditWriter::spawn(home.join("audit.db"), key.clone()).unwrap();
+    // Two rows that mimic the MCP dispatcher: INSERT(started), then
+    // UPDATE(ok). Repeat to exercise prev_hmac chaining post-update.
+    for i in 0..2 {
+        let ev = AuditEvent {
+            ts_unix_ms: 1_700_000_000_000 + i,
+            profile_id: format!("test.profile-{i}"),
+            primitive: "kvendra.shell".into(),
+            action: "exec".into(),
+            args_hash_hex: format!("{:064x}", i),
+            status: Status::Started,
+            severity: Severity::Info,
+            flags: String::new(),
+        };
+        let id = writer.record(ev).await.unwrap();
+        writer
+            .update_status(id, Status::Ok, Severity::Info)
+            .await
+            .unwrap();
+    }
+    writer.shutdown().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Verify chain: must succeed because update_event_status recomputes HMAC.
+    let conn = open_readonly(&home.join("audit.db")).unwrap();
+    let r = verify_chain(&conn, &key);
+    assert!(
+        r.is_ok(),
+        "expected chain valid after update_status; got {r:?}"
+    );
+}
