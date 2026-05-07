@@ -25,7 +25,7 @@ pub enum ConfigCommand {
     /// Manage approval layer (REQ-KVD-003 / ROAD-KVD-007).
     #[command(subcommand)]
     Approval(ApprovalCommand),
-    /// Manage `KVENDRA_MCP_PASSWORD` keychain pattern (REQ-KVD-006 / ISSUE-010).
+    /// Manage MCP password keychain pattern (REQ-KVD-005 / ISSUE-KVD-CLI-017).
     #[command(subcommand, name = "mcp-password")]
     McpPassword(McpPasswordCommand),
 }

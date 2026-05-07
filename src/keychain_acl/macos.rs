@@ -1,0 +1,137 @@
+//! macOS implementation of presence-gated keychain access
+//! (REQ-KVD-005 / ISSUE-KVD-CLI-017).
+//!
+//! Stores a generic password under `service: kvendra` with
+//! `kSecAttrAccessControl = SecAccessControl(.userPresence)`. Every read
+//! triggers the OS-managed TouchID popup (or the modal password popup
+//! when biometric hardware is absent).
+//!
+//! `core-foundation` + `security-framework` are used directly because
+//! the high-level `keyring` crate does not expose access-control attributes.
+
+use super::{BiometricError, KEYCHAIN_SERVICE};
+use core_foundation::base::TCFType;
+use core_foundation::data::CFData;
+use core_foundation::dictionary::CFMutableDictionary;
+use core_foundation::string::CFString;
+use core_foundation_sys::base::{CFGetTypeID, CFRelease, CFTypeRef};
+use core_foundation_sys::data::CFDataGetTypeID;
+use security_framework::access_control::SecAccessControl;
+use security_framework_sys::base::{errSecAuthFailed, errSecItemNotFound, errSecSuccess};
+use security_framework_sys::item::{
+    kSecAttrAccessControl, kSecAttrAccount, kSecAttrService, kSecClass, kSecClassGenericPassword,
+    kSecReturnData, kSecValueData,
+};
+use security_framework_sys::keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete};
+
+/// macOS error code for "user explicitly cancelled the auth prompt".
+/// Apple's value (defined in CoreServices/CarbonCore.h, not re-exported by
+/// `security-framework-sys`).
+const ERR_SEC_USER_CANCELED: i32 = -128;
+
+/// `kSecAccessControlUserPresence` flag value as defined by Apple's
+/// `SecAccessControl.h`. The `security-framework` crate accepts the raw
+/// `CFOptionFlags` (`u64`) here.
+const SEC_ACCESS_CONTROL_USER_PRESENCE: core_foundation::base::CFOptionFlags = 1;
+
+fn build_query(label: &str) -> CFMutableDictionary<CFString, core_foundation::base::CFType> {
+    let mut q = CFMutableDictionary::new();
+    unsafe {
+        q.add(
+            &CFString::wrap_under_get_rule(kSecClass),
+            &CFString::wrap_under_get_rule(kSecClassGenericPassword).as_CFType(),
+        );
+        q.add(
+            &CFString::wrap_under_get_rule(kSecAttrService),
+            &CFString::new(KEYCHAIN_SERVICE).as_CFType(),
+        );
+        q.add(
+            &CFString::wrap_under_get_rule(kSecAttrAccount),
+            &CFString::new(label).as_CFType(),
+        );
+    }
+    q
+}
+
+pub fn save_with_user_presence(label: &str, secret: &str) -> Result<(), BiometricError> {
+    let access_control = SecAccessControl::create_with_flags(SEC_ACCESS_CONTROL_USER_PRESENCE)
+        .map_err(|e| BiometricError::Backend(format!("create access control: {e}")))?;
+
+    // Always delete any pre-existing item first so re-saving with a different
+    // ACL or after migration produces a clean entry.
+    let _ = delete(label);
+
+    let mut query = build_query(label);
+    let data = CFData::from_buffer(secret.as_bytes());
+    unsafe {
+        query.add(
+            &CFString::wrap_under_get_rule(kSecValueData),
+            &data.as_CFType(),
+        );
+        query.add(
+            &CFString::wrap_under_get_rule(kSecAttrAccessControl),
+            &access_control.as_CFType(),
+        );
+    }
+
+    let status = unsafe { SecItemAdd(query.as_concrete_TypeRef(), std::ptr::null_mut()) };
+    map_status_to_void(status)
+}
+
+pub fn read_with_user_presence(label: &str) -> Result<String, BiometricError> {
+    let mut query = build_query(label);
+    unsafe {
+        let cf_true = core_foundation::boolean::CFBoolean::true_value();
+        query.add(
+            &CFString::wrap_under_get_rule(kSecReturnData),
+            &cf_true.as_CFType(),
+        );
+    }
+
+    let mut result: CFTypeRef = std::ptr::null();
+    let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut result) };
+    map_status_to_kind(status, label)?;
+
+    if result.is_null() {
+        return Err(BiometricError::NotFound(label.to_string()));
+    }
+    let bytes = unsafe {
+        let type_id = CFGetTypeID(result);
+        if type_id != CFDataGetTypeID() {
+            CFRelease(result);
+            return Err(BiometricError::Backend(format!(
+                "unexpected CFTypeRef returned for label={label}"
+            )));
+        }
+        let data = CFData::wrap_under_create_rule(result as _);
+        data.bytes().to_vec()
+    };
+    String::from_utf8(bytes)
+        .map_err(|e| BiometricError::Backend(format!("keychain item not utf8: {e}")))
+}
+
+pub fn delete(label: &str) -> Result<(), BiometricError> {
+    let query = build_query(label);
+    let status = unsafe { SecItemDelete(query.as_concrete_TypeRef()) };
+    if status == errSecItemNotFound {
+        return Err(BiometricError::NotFound(label.to_string()));
+    }
+    map_status_to_void(status)
+}
+
+fn map_status_to_void(status: i32) -> Result<(), BiometricError> {
+    match status {
+        s if s == errSecSuccess => Ok(()),
+        s if s == ERR_SEC_USER_CANCELED || s == errSecAuthFailed => Err(BiometricError::Rejected),
+        other => Err(BiometricError::Backend(format!("OSStatus {other}"))),
+    }
+}
+
+fn map_status_to_kind(status: i32, label: &str) -> Result<(), BiometricError> {
+    match status {
+        s if s == errSecSuccess => Ok(()),
+        s if s == errSecItemNotFound => Err(BiometricError::NotFound(label.to_string())),
+        s if s == ERR_SEC_USER_CANCELED || s == errSecAuthFailed => Err(BiometricError::Rejected),
+        other => Err(BiometricError::Backend(format!("OSStatus {other}"))),
+    }
+}

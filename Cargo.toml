@@ -1,6 +1,6 @@
 [package]
 name = "kvendra"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -45,6 +45,13 @@ bip39 = { version = "2", features = ["rand"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 # OS keychain (opt-in)
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent"] }
+
+# macOS biometric ACL (REQ-KVD-005 / ISSUE-KVD-CLI-017) — direct deps for SecAccessControl + SecItem*
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+security-framework-sys = "2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
 # HTTP
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 # TUI (Pase B placeholder)

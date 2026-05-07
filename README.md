@@ -57,6 +57,62 @@ recognised. Use the table:
 `kvendra audit --verify` also accepts `--password-stdin` (recommended for
 scripts: pipe the password on stdin, no env var pollution).
 
+## MCP auto-unlock with biometric ACL (macOS)
+
+When the broker is launched as an MCP subprocess by an IDE / Desktop client
+(Claude Code, Cursor, Cline, ...), passing the master password via the
+`KVENDRA_MCP_PASSWORD` env var leaves it in plaintext inside `~/.claude.json`
+(and equivalents) — readable by any process running as your user. The
+recommended setup on macOS now uses the OS keychain with a `userPresence`
+access-control attribute so every read triggers TouchID (or the modal
+password popup if biometric hardware is absent), and the prompt is
+OS-mediated rather than written to `/dev/tty` (mitigates the TTY-hijack
+pattern documented in PAT-KVD-007).
+
+```bash
+# 1. Store the master password in the OS keychain (TouchID popup will
+#    appear here so the OS can attach the userPresence ACL).
+kvendra config mcp-password enable
+
+# 2. Migrate any existing client config (~/.claude.json etc.) to use the
+#    new flag. A `*.bak.<timestamp>` of the original is written next to it.
+kvendra config mcp-password migrate-to-keychain-acl --client claude-code
+```
+
+Post-migration, your MCP client config should look like:
+
+```json
+{
+  "mcpServers": {
+    "kvendra": {
+      "command": "kvendra",
+      "args": ["mcp", "serve", "--use-keychain"]
+    }
+  }
+}
+```
+
+When the client spawns the broker, `--use-keychain` reads the password
+from the keychain entry; the OS shows a TouchID / password popup once
+per session and the broker proceeds to unlock the vault. No env var, no
+wrapper script, no `/dev/tty` interaction.
+
+### Platform support
+
+| Platform | `enable` / `migrate-to-keychain-acl` / `--use-keychain` | Workaround |
+|---|---|---|
+| macOS (with TouchID) | ✓ TouchID popup | — |
+| macOS (no TouchID) | ✓ OS modal password popup | — |
+| Windows | ✗ rejects with clear error | continue using `KVENDRA_MCP_PASSWORD` env var |
+| Linux | ✗ rejects with clear error | continue using `KVENDRA_MCP_PASSWORD` env var |
+
+The keychain-ACL flow is **macOS only in the current release**. On
+Windows and Linux the subcommands reject explicitly so we do not create
+a false sense of biometric protection — a `keyring`-base item without
+an enforced ACL would still be readable by any user-level process.
+Cross-platform hardening (Windows Hello, Linux PolKit / `pam`) is
+tracked in ROAD-KVD-008 and will land in a follow-up release.
+
 ## Links
 
 - Site: [kvendra.com](https://kvendra.com)

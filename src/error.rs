@@ -78,6 +78,12 @@ pub enum KvendraError {
     #[error("keychain error: {0}")]
     Keychain(String),
 
+    #[error("biometric/presence prompt rejected by user")]
+    BiometricRejected,
+
+    #[error("biometric/keychain ACL not available on this platform: {0}")]
+    BiometricUnavailable(String),
+
     #[error("http error: {0}")]
     Http(String),
 

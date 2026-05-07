@@ -17,6 +17,7 @@ pub mod cli;
 pub mod config;
 pub mod detection;
 pub mod error;
+pub mod keychain_acl;
 pub mod mcp;
 pub mod primitives;
 pub mod tui;

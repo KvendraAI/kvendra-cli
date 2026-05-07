@@ -5,6 +5,62 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
+## [0.1.0-alpha.4] — 2026-05-07
+
+REQ-KVD-005 / ISSUE-KVD-CLI-017 closure (1/4 of ROAD-KVD-008 bundle).
+Closes GAP 1 + GAP 6 of the L1 threat model on macOS by replacing the
+exposed `mcp-password fetch` + wrapper-script pattern with an inline
+`--use-keychain` flag gated by `kSecAttrAccessControl(.userPresence)`.
+Mitigates the TTY-hijack pattern (PAT-KVD-007) when the broker is
+spawned by an IDE/Desktop MCP client. macOS only in this release;
+Windows / Linux fall back to the legacy `KVENDRA_MCP_PASSWORD` env var
+path until cross-platform hardening lands. ADR-KVD-020 documents the
+decision orthogonal to ADR-KVD-012.
+
+### Changed (REQ-KVD-005 / ISSUE-KVD-CLI-017)
+
+- **`kvendra mcp serve --use-keychain`** (new flag, **macOS only**): reads
+  the master password from the OS keychain (item `kvendra/mcp-password/v1`
+  under service `kvendra`) gated by `kSecAttrAccessControl(.userPresence)`.
+  Every read triggers a TouchID popup, or — when biometric hardware is
+  absent — the OS modal password popup. The prompt is OS-mediated and
+  never touches `/dev/tty`, mitigating the TTY-hijack pattern documented
+  in **PAT-KVD-007** when the broker is spawned by an IDE/Desktop MCP
+  client (Claude Code, Cursor, ...).
+- **`kvendra config mcp-password fetch` removed.** The legacy wrapper
+  script (`~/.kvendra/wrappers/kvendra-mcp-serve`) is no longer generated
+  by `enable`. Together these eliminate the GAP 1 + GAP 6 surfaces
+  identified in the L1 threat model (ADR-KVD-010 V2-extension): an L1
+  attacker can no longer obtain the password via `kvendra config
+  mcp-password fetch` and cannot substitute the wrapper.
+- **`kvendra config mcp-password migrate-to-keychain-acl`** (replaces
+  `migrate`): rewrites `~/.claude.json` (and other supported clients) to
+  use `command: kvendra` + `args: ["mcp", "serve", "--use-keychain"]`,
+  re-saves the keychain entry with `userPresence` ACL, removes any
+  leftover wrapper script, and writes a `*.bak.<timestamp>` of the
+  original config.
+- **Compatibility note:** `--use-keychain` and `enable` /
+  `migrate-to-keychain-acl` are **macOS only** in this release. On
+  Windows / Linux they reject explicitly to avoid creating a false sense
+  of biometric protection (a `keyring`-base item without enforced ACL
+  would be readable by any L1 process). Workaround on those platforms:
+  continue using the legacy `KVENDRA_MCP_PASSWORD` env var path. Cross-
+  platform hardening (Windows Hello, Linux PolKit / `pam`) is tracked in
+  ROAD-KVD-008 and will land in a follow-up.
+
+### Added
+
+- New module `src/keychain_acl/` (`mod` + `macos` + `other` stubs)
+  exposing `save_with_user_presence` / `read_with_user_presence` /
+  `delete` over `service: kvendra`. macOS implementation uses
+  `core-foundation` + `security-framework` with
+  `SecAccessControlCreateWithFlags(USER_PRESENCE)`.
+- `KvendraError::BiometricRejected` and `KvendraError::BiometricUnavailable`
+  variants for unambiguous error reporting.
+- 6 new integration tests in `tests/cli.rs` covering `fetch` removal,
+  `--use-keychain` clap surface, and `--password-env` / `--no-unlock`
+  conflict semantics; 3 new unit tests in `cli/config_mcp_password.rs`.
+
 ## [0.1.0-alpha.3] — 2026-05-07
 
 ROAD-KVD-007 closure: 5-issue hardening + polish bundle gating AWS
