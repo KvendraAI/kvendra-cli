@@ -8,6 +8,44 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use clap::Args;
 use std::path::PathBuf;
+use subtle::ConstantTimeEq;
+
+/// Maximum interactive attempts before `kvendra init` aborts when the
+/// password and its confirmation disagree.
+const MAX_CONFIRMATION_ATTEMPTS: u8 = 3;
+
+/// Constant-time check that two candidate passwords match. The length check
+/// is `==` (and therefore non-CT), but local-process timing is not in our
+/// threat model — see ADR-KVD-010.
+fn passwords_match(pw1: &str, pw2: &str) -> bool {
+    pw1.len() == pw2.len() && bool::from(pw1.as_bytes().ct_eq(pw2.as_bytes()))
+}
+
+/// Prompt for the master password twice and confirm via constant-time
+/// comparison. Loops up to `max_attempts` before erroring out — protects
+/// against silent typos at vault setup, which would otherwise become
+/// undetectable until the first `unlock` (AC-VAULT-1, REQ-KVD-002).
+fn prompt_password_with_confirmation(max_attempts: u8) -> KvendraResult<String> {
+    for attempt in 1..=max_attempts {
+        println!("Enter a master password (will not echo):");
+        let pw1 = rpassword::read_password()
+            .map_err(|e| KvendraError::Vault(format!("read password: {e}")))?;
+        println!("Confirm master password:");
+        let pw2 = rpassword::read_password()
+            .map_err(|e| KvendraError::Vault(format!("read password confirmation: {e}")))?;
+        if passwords_match(&pw1, &pw2) {
+            return Ok(pw1);
+        }
+        if attempt == max_attempts {
+            return Err(KvendraError::Vault(format!(
+                "master password did not match confirmation after {max_attempts} attempts — init aborted"
+            )));
+        }
+        let remaining = max_attempts - attempt;
+        eprintln!("Passwords do not match. Try again ({remaining} attempts remaining).");
+    }
+    unreachable!("loop returns or errors before exiting")
+}
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
@@ -48,11 +86,7 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
 
     let password = match args.password_env {
         Some(s) => s,
-        None => {
-            println!("Enter a master password (will not echo):");
-            rpassword::read_password()
-                .map_err(|e| KvendraError::Vault(format!("read password: {e}")))?
-        }
+        None => prompt_password_with_confirmation(MAX_CONFIRMATION_ATTEMPTS)?,
     };
     if password.len() < 8 {
         return Err(KvendraError::Vault(
@@ -149,4 +183,23 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
 
     println!("Vault initialized at {}", home.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::passwords_match;
+
+    #[test]
+    fn passwords_match_returns_true_for_identical_inputs() {
+        assert!(passwords_match("hunter2-test", "hunter2-test"));
+        assert!(passwords_match("", ""));
+    }
+
+    #[test]
+    fn passwords_match_returns_false_for_mismatch() {
+        assert!(!passwords_match("hunter2-test", "hunter2-tesT"));
+        assert!(!passwords_match("hunter2-test", "hunter2-tes"));
+        assert!(!passwords_match("a", "ab"));
+        assert!(!passwords_match("ab", "a"));
+    }
 }
