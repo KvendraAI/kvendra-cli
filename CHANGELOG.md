@@ -5,6 +5,124 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
+## [0.1.0-alpha.3] — 2026-05-07
+
+ROAD-KVD-007 closure: 5-issue hardening + polish bundle gating AWS
+profile habilitation, public marketing, and 0.1.0 stable promotion.
+No breaking changes to the YAML allowlist surface (new fields are
+`Option<bool>` with `#[serde(default)]`); a previously-valid
+`accepts_minimum_valid_profile` legacy fixture had to add
+`accept_destructive: true` on `kvendra.git.push` to keep semantics.
+
+### Added
+
+- **ISSUE-KVD-CLI-011** (REQ-KVD-003) — Configurable interactive approval
+  layer for `tools/call`. New `src/approval/` module (`mod`, `policy`,
+  `cache`, `tty`) with three modes (`silent` / `ask` / `ask-destructive`,
+  default `ask-destructive`), env > profile-YAML > config.toml > default
+  cascade, ASCII-box prompt to `/dev/tty` (Unix) / `CONIN$+CONOUT$`
+  (Windows), in-memory `[a]pprove-all-5min` cache, audit flags
+  `approval_granted` / `_denied` / `_timeout` / `_no_tty_denied` /
+  `_cache_hit`. New CLI subcommand `kvendra config approval get|set|status`.
+  ADRs: KVD-013 (prompt format), KVD-014 (cache storage), KVD-015 (timeout
+  default 30s), KVD-016 (silent does NOT require TTY). Closes V7 +
+  partially mitigates O1.LLM-auto-approve in the threat model
+  (ADR-KVD-010). Tests: 28 (26 unit + 8 integration).
+- **ISSUE-KVD-CLI-012** (REQ-KVD-004) — Forbidden methods restrictivos en
+  allowlist. New `src/allowlist/catalog.rs` with `const CATALOG: &[DestructiveRule]`
+  of 14 owner-ratified entries (e.g. `kvendra.aws.s3_sync` with `delete:true`,
+  `kvendra.git.push`, `kvendra.unsafe.raw_token`, etc.) + 4 pure
+  `fn(&Value) -> bool` predicates. Validator rejects allowlists with
+  destructive ops missing `accept_destructive: true`; `secret validate`
+  marks each operation `[⚠ DESTRUCTIVE — owner accepted]` /
+  `[⚠ ANNOTATED]` inline. `approval::policy::lookup_destructive` now
+  consults the catalog (single source of truth with REQ-003). ADRs:
+  KVD-017 (const Rust array), KVD-018 (fn pointer signature), KVD-019
+  (print format). Tests: 23 unit. Closes the third structural barrier
+  for V7.
+- **ISSUE-KVD-CLI-010** (last hardening) — `kvendra config mcp-password
+  enable | migrate --client claude-code | status | disable | fetch`. The
+  master password no longer needs to live in plaintext under
+  `~/.claude.json`: it is stored in the OS keychain via the `keyring`
+  crate (`service: kvendra`, `label: kvendra/mcp-password/v1`,
+  independent of the `derived-key/v1` namespace from ADR-KVD-012),
+  and a wrapper script at `~/.kvendra/wrappers/kvendra-mcp-serve`
+  (perms 0700) loads it at spawn time. Closes the V2-extension where
+  any process of the same user could read the password from the MCP
+  client config.
+- **ISSUE-KVD-CLI-014** (REQ-KVD-005 fix B+C) — LLM-friendly tool docs:
+  `PrimitiveInfo` gains a multi-line `operations_doc` per catalog entry
+  (8 primitives) so `tools/list` returns descriptions enumerating each
+  operation's expected `args` shape. `tools/call` now intercepts
+  `KvendraError::InvalidArgs` and returns a structured JSON-RPC error
+  (`code = INVALID_PARAMS`, `data = { error_type, primitive, operation,
+  hint, message }`) so the agent can self-correct without retries.
+  Diagnosis from `consultancy-v3` Sesion 3 confirmed H2 as the root
+  cause of the AC-MCP-4 retry pattern; option A (one tool per
+  operation) was deferred post-Beta to avoid breaking existing allowlists.
+- **TEST entries** in KB v3: TEST-KVD-CLI-030 (AC-APPROVAL-6 no TTY),
+  TEST-KVD-CLI-031 (AC-APPROVAL-4 timeout), TEST-KVD-CLI-032
+  (AC-APPROVAL-3 TTY isolation).
+
+### Fixed
+
+- **ISSUE-KVD-CLI-013** — `kvendra.github.add_topics` now appends
+  rather than replacing. The previous implementation called
+  `PUT /repos/{owner}/{repo}/topics` directly with the new list, which
+  GitHub interprets as a replacement; the new flow GETs the existing
+  topics, merges by `merge_topics_unique` (preserves order, deduplicates
+  by string value), and then PUTs the merged list. Sister-primitive
+  audit (`update_repo`, `update_issue`, `release`, `git.tag` without
+  `--force`, `aws.s3_sync` with `delete: true` opt-in) confirmed only
+  `add_topics` had this issue. Detected during the AC-MCP-4 write smoke
+  on 2026-05-07.
+
+### Changed
+
+- `OperationConstraints` (allowlist DSL) gains two `Option<bool>` fields,
+  `destructive` (declarative; from REQ-003) and `accept_destructive`
+  (opt-in; from REQ-004). Both default to `None`, so existing
+  allowlist YAML files keep parsing without changes — a fixture
+  reproducing `~/.kvendra/allowlists/github.kvendraai.cli-readonly.yaml`
+  is asserted to keep validating in `validator::tests`.
+- `Config` gains an `approval: ApprovalConfig` section with
+  `mode: ApprovalMode` (default `AskDestructive`),
+  `timeout_seconds: u32` (default 30, validated to `[5, 600]`), and
+  `cache_ttl_seconds: u32` (default 300). Existing `config.toml`
+  files keep loading without changes (all fields default).
+- `JsonRpcResponse::error_with_data(...)` constructor added per JSON-RPC
+  2.0 §5.1; consumed by the approval block-dispatch path and by the
+  new structured `InvalidArgs` response.
+- `mcp::server::tools_call` adds the approval hook between the
+  allowlist enforcement and the `Started` audit row. Detection layer
+  ordering remains: detection → allowlist → approval → audit
+  Started → dispatch.
+- `approval::policy::lookup_destructive(spec, primitive, operation, args)`
+  signature now takes `args: &Value` so it can consult the catalog at
+  approval time with the actual runtime arguments.
+
+### Trace
+
+- ROAD-KVD-007: `in-progress` → `done`.
+- TXNs (5): TXN-KVD-20260507-002 / 003 / 004 / 005 / 006.
+- Commits in main: `db2b0c5` (011), `413a59b` (012), `c761f8f` (013),
+  `400ab41` (014), `4ae7d36` (010), and this version bump on top.
+- Suite: 78 → **149 passed** (+71 tests), 0 failed, 1 ignored
+  (pre-existing slow Argon2id E2E).
+- Threat model V7 (ADR-KVD-010) now has four structural barriers
+  (allowlist + forbidden methods + approval + audit) plus the keychain
+  pattern for `KVENDRA_MCP_PASSWORD`.
+
+### Out of scope (deferred)
+
+- `cargo publish` real to crates.io. The placeholder `kvendra` v0.0.2
+  remains the published artifact until `0.1.0` (no `-alpha` suffix) is
+  cut.
+- GitHub Releases via cargo-dist binaries — deferred to `0.1.0` stable.
+- Promotion to `0.1.0` stable — owner decided 2026-05-07 to keep the
+  conservative alpha bump until a final smoke E2E with Claude Code
+  confirms the bundle in real use.
+
 ## [0.1.0-alpha.2] — 2026-05-07
 
 Cleanup release before Sesion 2 (Claude Code MCP integration). Closes
