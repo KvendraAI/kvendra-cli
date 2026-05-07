@@ -111,10 +111,13 @@ pub struct OperationConstraints {
     pub projects: Option<Vec<String>>,
     pub endpoints: Option<Vec<String>>,
     pub accept_broad_scope: Option<bool>,
-    /// Marca explícita de operación destructiva (REQ-KVD-003 / sister
-    /// ISSUE-KVD-CLI-012). Cuando es `true`, modo `ask-destructive` dispara
-    /// prompt. Ausencia = `false` (hasta que ISSUE-012 introduzca catalog).
+    /// Marca explícita de operación destructiva (REQ-KVD-003). Cuando es
+    /// `true`, modo `ask-destructive` dispara prompt. Ausencia = `false`.
     pub destructive: Option<bool>,
+    /// Opt-in del owner para ejecutar una operación marcada `Destructive`
+    /// por el catálogo canónico (REQ-KVD-004 / ADR-KVD-017). Ausencia →
+    /// `false` → la allowlist es rechazada al `secret set-allowlist`.
+    pub accept_destructive: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -6,8 +6,9 @@
 //!   3. global `~/.kvendra/config.toml` `[approval] mode`
 //!   4. default `ask-destructive` (ADR-KVD-016 — silent es opt-in explícito)
 
-use crate::allowlist::{Operation, ProfileSpec};
+use crate::allowlist::{Operation, ProfileSpec, catalog};
 use crate::approval::ApprovalMode;
+use serde_json::Value;
 
 /// Resuelve el modo activo siguiendo la cascade canónica.
 pub fn resolve_mode(
@@ -52,13 +53,18 @@ pub fn mode_name(mode: ApprovalMode) -> &'static str {
     }
 }
 
-/// Recorre la allowlist del profile y retorna la flag `destructive` declarada
-/// para `(primitive, operation)`. Si no aparece, `false` por defecto.
-///
-/// Sister ISSUE-KVD-CLI-012 introducirá un catalog canónico que poblará el
-/// fallback (e.g. `kvendra.shell.exec`, `kvendra.aws.s3_sync` con `delete:true`,
-/// etc.). Hasta entonces el field YAML es la única fuente.
-pub fn lookup_destructive(spec: &ProfileSpec, primitive: &str, operation: &str) -> bool {
+/// Single source of truth para la flag `destructive` (REQ-KVD-004 / ADR-KVD-017):
+/// consulta primero el catálogo canónico y, si no aplica, el field
+/// `destructive: true` declarado por el user en el YAML.
+pub fn lookup_destructive(
+    spec: &ProfileSpec,
+    primitive: &str,
+    operation: &str,
+    args: &Value,
+) -> bool {
+    if catalog::is_destructive(primitive, operation, args) {
+        return true;
+    }
     spec.allowlist
         .primitives
         .iter()
@@ -143,25 +149,98 @@ mod tests {
     }
 
     #[test]
-    fn lookup_destructive_reads_field_or_defaults_false() {
+    fn lookup_destructive_consults_catalog_when_args_match() {
         let yaml = r#"
 profile_id: t
 secret:
-  type: token
+  type: aws
 allowlist:
   primitives:
     - name: kvendra.aws
       operations:
         - s3_sync:
             buckets: ["b"]
-            destructive: true
-        - s3_cp:
-            buckets: ["b"]
+            accept_destructive: true
 "#;
         let spec: ProfileSpec = serde_yml::from_str(yaml).unwrap();
-        assert!(lookup_destructive(&spec, "kvendra.aws", "s3_sync"));
-        assert!(!lookup_destructive(&spec, "kvendra.aws", "s3_cp"));
-        assert!(!lookup_destructive(&spec, "kvendra.aws", "missing_op"));
-        assert!(!lookup_destructive(&spec, "kvendra.unknown", "s3_sync"));
+        // Catalog: s3_sync con delete=true → Destructive (sin necesidad de
+        // user-declared field).
+        let args_with_delete = serde_json::json!({ "delete": true });
+        assert!(lookup_destructive(
+            &spec,
+            "kvendra.aws",
+            "s3_sync",
+            &args_with_delete
+        ));
+        // Sin delete=true: catálogo NO marca destructive y el YAML tampoco
+        // declara destructive: true → false.
+        let args_no_delete = serde_json::json!({});
+        assert!(!lookup_destructive(
+            &spec,
+            "kvendra.aws",
+            "s3_sync",
+            &args_no_delete
+        ));
+    }
+
+    #[test]
+    fn lookup_destructive_reads_user_declared_when_catalog_no_match() {
+        let yaml = r#"
+profile_id: t
+secret:
+  type: token
+allowlist:
+  primitives:
+    - name: kvendra.github
+      operations:
+        - read_issue:
+            repos: ["owner/repo"]
+            destructive: true
+"#;
+        let spec: ProfileSpec = serde_yml::from_str(yaml).unwrap();
+        // read_issue NO está en el catálogo, pero el user declaró destructive: true.
+        assert!(lookup_destructive(
+            &spec,
+            "kvendra.github",
+            "read_issue",
+            &serde_json::Value::Null
+        ));
+        // Operation distinta: no marcada en catálogo ni declarada → false.
+        assert!(!lookup_destructive(
+            &spec,
+            "kvendra.github",
+            "read_repo",
+            &serde_json::Value::Null
+        ));
+        assert!(!lookup_destructive(
+            &spec,
+            "kvendra.unknown",
+            "x",
+            &serde_json::Value::Null
+        ));
+    }
+
+    #[test]
+    fn lookup_destructive_lambda_invoke_unconditional() {
+        let yaml = r#"
+profile_id: t
+secret:
+  type: aws
+allowlist:
+  primitives:
+    - name: kvendra.aws
+      operations:
+        - lambda_invoke:
+            functions: ["fn"]
+            accept_destructive: true
+"#;
+        let spec: ProfileSpec = serde_yml::from_str(yaml).unwrap();
+        // lambda_invoke siempre destructive según catálogo, aunque args sea null.
+        assert!(lookup_destructive(
+            &spec,
+            "kvendra.aws",
+            "lambda_invoke",
+            &serde_json::Value::Null
+        ));
     }
 }

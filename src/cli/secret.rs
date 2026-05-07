@@ -9,7 +9,8 @@
 //!   - `validate <profile_id> | --all`
 //!   - `set-allowlist <profile_id> --file PATH`
 
-use crate::allowlist::{ProfileSpec, validate as allowlist_validate};
+use crate::allowlist::dsl::OperationConstraints;
+use crate::allowlist::{ProfileSpec, catalog, validate as allowlist_validate};
 use crate::config::{Config, kvendra_home};
 use crate::error::{KvendraError, KvendraResult};
 use crate::vault::{Profile, Vault};
@@ -321,10 +322,16 @@ fn print_validation(vault: &Vault, profile_id: &str) -> bool {
             for op in &prim.operations {
                 for (op_name, constraints) in op {
                     let suffix = format_constraints(constraints);
-                    if suffix.is_empty() {
-                        println!("  - {}.{op_name}", prim.name);
+                    let mark = destructive_mark(&prim.name, op_name, constraints);
+                    let line_body = if suffix.is_empty() {
+                        format!("  - {}.{op_name}", prim.name)
                     } else {
-                        println!("  - {}.{op_name} {suffix}", prim.name);
+                        format!("  - {}.{op_name} {suffix}", prim.name)
+                    };
+                    if mark.is_empty() {
+                        println!("{line_body}");
+                    } else {
+                        println!("{line_body} {mark}");
                     }
                 }
             }
@@ -421,9 +428,32 @@ fn format_expiration(exp: &str) -> String {
     }
 }
 
+/// REQ-KVD-004 / ADR-KVD-019 — marca inline para `kvendra secret validate`.
+/// Devuelve `""` si la operación no es destructive ni annotated.
+fn destructive_mark(primitive: &str, op: &str, c: &OperationConstraints) -> &'static str {
+    let canonical_destructive = catalog::could_be_destructive(primitive, op, c);
+    let user_declared = c.destructive.unwrap_or(false);
+    if canonical_destructive || user_declared {
+        if c.accept_destructive.unwrap_or(false) {
+            "[\u{26a0} DESTRUCTIVE \u{2014} owner accepted]"
+        } else {
+            // Defensivo: el validator habría rechazado el profile antes de
+            // llegar aquí. Si el user fuerza load (e.g. test) lo señalamos.
+            "[\u{26a0} DESTRUCTIVE \u{2014} MISSING accept_destructive]"
+        }
+    } else {
+        let synthetic = catalog::constraints_to_args_value(c);
+        if catalog::is_annotated(primitive, op, &synthetic) {
+            "[\u{26a0} ANNOTATED]"
+        } else {
+            ""
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_constraints, format_expiration};
+    use super::{destructive_mark, format_constraints, format_expiration};
     use crate::allowlist::OperationConstraints;
     use time::OffsetDateTime;
 
@@ -474,5 +504,37 @@ mod tests {
     #[test]
     fn format_expiration_falls_back_for_unparseable() {
         assert_eq!(format_expiration("not-a-date"), "not-a-date");
+    }
+
+    #[test]
+    fn destructive_mark_destructive_with_opt_in() {
+        let c = OperationConstraints {
+            accept_destructive: Some(true),
+            ..Default::default()
+        };
+        let mark = destructive_mark("kvendra.aws", "lambda_invoke", &c);
+        assert!(mark.contains("DESTRUCTIVE"), "got: {mark}");
+        assert!(mark.contains("owner accepted"), "got: {mark}");
+    }
+
+    #[test]
+    fn destructive_mark_destructive_without_opt_in_is_defensive() {
+        let c = OperationConstraints::default();
+        let mark = destructive_mark("kvendra.aws", "lambda_invoke", &c);
+        assert!(mark.contains("MISSING accept_destructive"), "got: {mark}");
+    }
+
+    #[test]
+    fn destructive_mark_annotated() {
+        let c = OperationConstraints::default();
+        let mark = destructive_mark("kvendra.aws", "cloudfront_invalidate", &c);
+        assert_eq!(mark, "[\u{26a0} ANNOTATED]");
+    }
+
+    #[test]
+    fn destructive_mark_safe_returns_empty() {
+        let c = OperationConstraints::default();
+        let mark = destructive_mark("kvendra.github", "read_repo", &c);
+        assert_eq!(mark, "");
     }
 }

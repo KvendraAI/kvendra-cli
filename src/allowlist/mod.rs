@@ -4,10 +4,14 @@
 //! AC-ALLOW-1): empty methods or wildcard endpoints without `accept_broad_scope`
 //! are rejected.
 
+pub mod catalog;
 pub mod dsl;
 pub mod enforcer;
 pub mod validator;
 
+pub use catalog::{
+    DestructiveKind, DestructiveRule, could_be_destructive, is_annotated, is_destructive,
+};
 pub use dsl::{Allowlist, Operation, OperationConstraints, PrimitiveAllow, ProfileSpec};
 pub use enforcer::check;
 pub use validator::validate;

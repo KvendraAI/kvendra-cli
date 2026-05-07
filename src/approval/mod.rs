@@ -172,7 +172,8 @@ pub async fn check(
                     .as_ref()
                     .and_then(|a| a.mode.as_deref())
                     .and_then(policy::parse_mode);
-                let destructive = policy::lookup_destructive(&spec, primitive, operation);
+                let destructive =
+                    policy::lookup_destructive(&spec, primitive, operation, arguments);
                 (mode, destructive)
             }
             None => (None, false),
