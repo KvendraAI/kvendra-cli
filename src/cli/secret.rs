@@ -314,23 +314,27 @@ fn print_validation(vault: &Vault, profile_id: &str) -> bool {
     }
 
     if issues.is_empty() {
-        println!("Status: VALID");
+        println!("Status: VALID ✓");
         println!("Secret type: {}", meta.secret_type);
         println!("Allowlist:");
         for prim in &spec.allowlist.primitives {
             for op in &prim.operations {
-                for op_name in op.keys() {
-                    println!("  - {}.{op_name}", prim.name);
+                for (op_name, constraints) in op {
+                    let suffix = format_constraints(constraints);
+                    if suffix.is_empty() {
+                        println!("  - {}.{op_name}", prim.name);
+                    } else {
+                        println!("  - {}.{op_name} {suffix}", prim.name);
+                    }
                 }
             }
             if prim.name == "kvendra.unsafe.raw_token" && prim.unsafe_raw_token_allowed {
                 println!("  - {} (unsafe escape hatch)", prim.name);
             }
         }
-        if let Some(exp) = &spec.expiration {
-            println!("Expiration: {exp}");
-        } else {
-            println!("Expiration: (none — recommend setting one)");
+        match &spec.expiration {
+            Some(exp) => println!("Expiration: {}", format_expiration(exp)),
+            None => println!("Expiration: (none — recommend setting one)"),
         }
         println!("Audit level: {}", spec.audit_level);
         if meta.unsafe_raw_token_enabled {
@@ -341,11 +345,134 @@ fn print_validation(vault: &Vault, profile_id: &str) -> bool {
         }
         true
     } else {
-        println!("Status: REJECTED");
+        println!("Status: REJECTED ✗");
         println!("Issues:");
         for i in &issues {
             println!("  - {i}");
         }
         false
+    }
+}
+
+/// Format an `OperationConstraints` for display next to its operation name.
+/// Returns either an empty string (no constraints set) or a parenthesised
+/// summary like `(repos: a, b) (refs: main)`. Lets the user see the actual
+/// scope a profile was granted without having to inspect the YAML manually.
+fn format_constraints(c: &crate::allowlist::OperationConstraints) -> String {
+    fn list(label: &str, v: &Option<Vec<String>>) -> Option<String> {
+        v.as_ref()
+            .filter(|xs| !xs.is_empty())
+            .map(|xs| format!("({label}: {})", xs.join(", ")))
+    }
+    fn flag(label: &str, v: Option<bool>) -> Option<String> {
+        v.filter(|b| *b).map(|_| format!("({label})"))
+    }
+    [
+        list("repos", &c.repos),
+        list("refs", &c.refs),
+        list("forbidden_args", &c.forbidden_args),
+        list("tag_pattern", &c.tag_pattern),
+        list("org", &c.org),
+        list("repo", &c.repo),
+        list("fields_allowed", &c.fields_allowed),
+        list("forbidden_fields", &c.forbidden_fields),
+        list("binaries", &c.binaries),
+        list("env_vars_to_inject", &c.env_vars_to_inject),
+        list(
+            "forbidden_env_export_to_agent",
+            &c.forbidden_env_export_to_agent,
+        ),
+        list("url_pattern_regex", &c.url_pattern_regex),
+        list("methods", &c.methods),
+        list("forbidden_methods", &c.forbidden_methods),
+        list("buckets", &c.buckets),
+        list("distributions", &c.distributions),
+        list("functions", &c.functions),
+        list("packages", &c.packages),
+        list("projects", &c.projects),
+        list("endpoints", &c.endpoints),
+        c.cwd_pattern
+            .as_ref()
+            .map(|s| format!("(cwd_pattern: {s})")),
+        flag("accept_broad_scope", c.accept_broad_scope),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+/// Render a `YYYY-MM-DD` expiration string with a `(N days remaining)` /
+/// `(expires today)` / `(expired N days ago)` suffix when parseable.
+/// Falls back to the raw string when parsing fails (defensive).
+fn format_expiration(exp: &str) -> String {
+    use time::Date;
+    use time::macros::format_description;
+    let fmt = format_description!("[year]-[month]-[day]");
+    let Ok(date) = Date::parse(exp, &fmt) else {
+        return exp.to_string();
+    };
+    let today = OffsetDateTime::now_utc().date();
+    let days = (date - today).whole_days();
+    match days.cmp(&0) {
+        std::cmp::Ordering::Greater => format!("{exp} ({days} days remaining)"),
+        std::cmp::Ordering::Equal => format!("{exp} (expires today)"),
+        std::cmp::Ordering::Less => format!("{exp} (expired {} days ago)", -days),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_constraints, format_expiration};
+    use crate::allowlist::OperationConstraints;
+    use time::OffsetDateTime;
+
+    #[test]
+    fn format_constraints_empty_for_default() {
+        let c = OperationConstraints::default();
+        assert_eq!(format_constraints(&c), "");
+    }
+
+    #[test]
+    fn format_constraints_renders_repos_and_refs() {
+        let c = OperationConstraints {
+            repos: Some(vec!["KvendraAI/kvendra-cli".into()]),
+            refs: Some(vec!["main".into(), "feat/*".into()]),
+            ..Default::default()
+        };
+        let s = format_constraints(&c);
+        assert!(s.contains("(repos: KvendraAI/kvendra-cli)"), "got: {s}");
+        assert!(s.contains("(refs: main, feat/*)"), "got: {s}");
+    }
+
+    #[test]
+    fn format_expiration_includes_days_remaining_for_future() {
+        let future = OffsetDateTime::now_utc().date() + time::Duration::days(29);
+        let s = format!(
+            "{:04}-{:02}-{:02}",
+            future.year(),
+            u8::from(future.month()),
+            future.day()
+        );
+        let out = format_expiration(&s);
+        assert!(out.contains("29 days remaining"), "got: {out}");
+    }
+
+    #[test]
+    fn format_expiration_marks_expired_for_past() {
+        let past = OffsetDateTime::now_utc().date() - time::Duration::days(5);
+        let s = format!(
+            "{:04}-{:02}-{:02}",
+            past.year(),
+            u8::from(past.month()),
+            past.day()
+        );
+        let out = format_expiration(&s);
+        assert!(out.contains("expired 5 days ago"), "got: {out}");
+    }
+
+    #[test]
+    fn format_expiration_falls_back_for_unparseable() {
+        assert_eq!(format_expiration("not-a-date"), "not-a-date");
     }
 }
