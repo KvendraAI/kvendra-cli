@@ -296,7 +296,23 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             // misbehaving primitive that includes a leaked token in its
             // error string must not bypass AC-MCP-3.
             let sanitized_msg = crate::detection::sanitize_output(&err.to_string());
-            JsonRpcResponse::error(id, codes::APPLICATION_ERROR, sanitized_msg)
+            // ISSUE-KVD-CLI-014 fix C — para errores de InvalidArgs devolvemos
+            // un payload estructurado en `data` con el primitive + operation +
+            // hint, para que el cliente MCP (LLM) auto-corrija sin retry.
+            if matches!(err, KvendraError::InvalidArgs(_)) {
+                let data = serde_json::json!({
+                    "error_type": "invalid_args",
+                    "primitive": name,
+                    "operation": action,
+                    "message": sanitized_msg,
+                    "hint": format!(
+                        "see `kvendra primitive info {name}` or the description in tools/list for the expected args shape per operation"
+                    ),
+                });
+                JsonRpcResponse::error_with_data(id, codes::INVALID_PARAMS, sanitized_msg, data)
+            } else {
+                JsonRpcResponse::error(id, codes::APPLICATION_ERROR, sanitized_msg)
+            }
         }
     }
 }
