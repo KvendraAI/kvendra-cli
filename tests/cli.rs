@@ -165,6 +165,82 @@ fn mcp_serve_use_keychain_conflicts_with_no_unlock() {
         .stderr(contains("cannot be used with").or(contains("conflict")));
 }
 
+/// E2E regression for the bug uncovered by the alpha.7 smoke (caveat E2E-D-1):
+/// `kvendra secret set-allowlist <profile> --file <yaml>` post-REQ-007 needs
+/// the `kvendra/allowlist-hmac/v1` HKDF sub-key, which only exists while the
+/// session is unlocked. The pre-fix dispatcher invoked `set_allowlist` without
+/// an `ensure_unlocked` call, so any caller hit `KvendraError::VaultLocked`.
+/// The fix wires `ensure_unlocked` (env-var or `--password-stdin`) through the
+/// CLI command, and this test exercises the full subprocess path that the
+/// previous unit tests bypassed by calling helpers directly.
+///
+/// Slow (Argon2id high-cost on init); opt-in with `cargo test -- --include-ignored`.
+#[cfg(unix)]
+#[test]
+#[ignore = "slow argon2 cost — opt-in via `cargo test -- --include-ignored`"]
+fn secret_set_allowlist_unlocks_vault_via_env_var() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // Bootstrap the vault — same env vars used by the smoke harness.
+    Command::cargo_bin("kvendra")
+        .unwrap()
+        .args(["init", "--no-verify"])
+        .env("KVENDRA_HOME", home)
+        .env("KVENDRA_INIT_PASSWORD", "hunter2-set-allowlist-cli")
+        .env("KVENDRA_INIT_CONFIRM_CODE", "0")
+        .assert()
+        .success();
+    // Create a profile.
+    Command::cargo_bin("kvendra")
+        .unwrap()
+        .args([
+            "secret",
+            "add",
+            "smoke.gh",
+            "--secret-type",
+            "github_pat",
+            "--secret-env",
+            "FAKE_TOKEN",
+        ])
+        .env("KVENDRA_HOME", home)
+        .env("KVENDRA_PASSWORD", "hunter2-set-allowlist-cli")
+        .env("FAKE_TOKEN", "ghp_fakefakefake1234567890aBcDeFgHiJkLmN")
+        .assert()
+        .success();
+    // Write a minimal allowlist YAML to a temp file.
+    let yaml_path = dir.path().join("allowlist.yaml");
+    let mut f = std::fs::File::create(&yaml_path).unwrap();
+    f.write_all(
+        b"profile_id: smoke.gh\n\
+          secret:\n  type: github_pat\n\
+          allowlist:\n  primitives:\n    - name: kvendra.git\n      operations:\n        - pull:\n            repos: [\"github.com/KvendraAI/*\"]\n",
+    )
+    .unwrap();
+    // The fix under test: the dispatcher must unlock the vault using
+    // KVENDRA_PASSWORD before computing the allowlist HMAC.
+    Command::cargo_bin("kvendra")
+        .unwrap()
+        .args([
+            "secret",
+            "set-allowlist",
+            "smoke.gh",
+            "--file",
+            yaml_path.to_str().unwrap(),
+        ])
+        .env("KVENDRA_HOME", home)
+        .env("KVENDRA_PASSWORD", "hunter2-set-allowlist-cli")
+        .assert()
+        .success()
+        .stdout(contains("HMAC persisted"));
+    // Sanity-check the on-disk profile meta has the new field populated.
+    let meta_raw = std::fs::read_to_string(home.join("profiles/smoke.gh.json")).unwrap();
+    assert!(
+        meta_raw.contains("allowlist_hmac_hex"),
+        "profile meta JSON missing allowlist_hmac_hex after set-allowlist: {meta_raw}"
+    );
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn config_mcp_password_enable_rejects_on_non_macos() {

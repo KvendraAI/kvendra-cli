@@ -5,6 +5,35 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
+## [0.1.0-alpha.8] — 2026-05-07
+
+E2E smoke fix uncovered while validating the alpha.7 bundle on a clean
+vault. `kvendra secret set-allowlist <profile> --file <yaml>` returned
+`KvendraError::VaultLocked` because the dispatcher invoked the helper
+without `ensure_unlocked`. Post-REQ-007 the helper needs the
+`kvendra/allowlist-hmac/v1` HKDF sub-key (only available while the
+vault is unlocked), so any caller that did not happen to pre-unlock
+the vault hit the error. Existing tests exercised
+`compute_allowlist_hmac` directly, bypassing the CLI dispatcher and
+missing the bug.
+
+### Fixed
+
+- `kvendra secret set-allowlist` now unlocks the vault via the same
+  helper used by `add` / `rotate` (env var `KVENDRA_PASSWORD` or
+  `--password-stdin`) before computing the HMAC. Behaviour matches
+  the documented flow in REQ-KVD-007 and the `set-allowlist` examples
+  in the README.
+
+### Added
+
+- New `--password-stdin` flag on `kvendra secret set-allowlist`,
+  consistent with the other vault-mutating subcommands.
+- Slow integration test `secret_set_allowlist_unlocks_vault_via_env_var`
+  in `tests/cli.rs` (gated by `#[ignore]` for CI cost — opt-in via
+  `cargo test -- --include-ignored`). Drives the full subprocess
+  path that the previous unit tests bypassed.
+
 ## [0.1.0-alpha.7] — 2026-05-07
 
 REQ-KVD-008 / ISSUE-KVD-CLI-019 — Config.toml HMAC + `home_canonical` +

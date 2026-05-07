@@ -85,6 +85,9 @@ pub struct SetAllowlistArgs {
     pub profile_id: String,
     #[arg(long)]
     pub file: PathBuf,
+    /// Read master password from stdin (recommended for scripts).
+    #[arg(long)]
+    pub password_stdin: bool,
 }
 
 pub async fn run(cmd: SecretCommand) -> KvendraResult<()> {
@@ -98,7 +101,7 @@ pub async fn run(cmd: SecretCommand) -> KvendraResult<()> {
         SecretCommand::Rotate(args) => rotate(&vault, &home, args).await,
         SecretCommand::Revoke { profile_id } => revoke(&vault, &profile_id),
         SecretCommand::Validate(args) => validate_cmd(&vault, args),
-        SecretCommand::SetAllowlist(args) => set_allowlist(&vault, args),
+        SecretCommand::SetAllowlist(args) => set_allowlist(&vault, &home, args),
     }
 }
 
@@ -224,7 +227,13 @@ fn revoke(vault: &Vault, profile_id: &str) -> KvendraResult<()> {
     Ok(())
 }
 
-fn set_allowlist(vault: &Vault, args: SetAllowlistArgs) -> KvendraResult<()> {
+fn set_allowlist(vault: &Vault, home: &Path, args: SetAllowlistArgs) -> KvendraResult<()> {
+    // REQ-KVD-007 / ISSUE-018 — `set-allowlist` persists an HMAC of the YAML
+    // signed with the `kvendra/allowlist-hmac/v1` HKDF sub-key. The sub-key
+    // only exists while the session is unlocked, so we must unlock here even
+    // if the caller assumed locked-vault semantics from prior releases.
+    ensure_unlocked(vault, home, args.password_stdin)?;
+
     let raw = std::fs::read_to_string(&args.file)?;
     let spec: ProfileSpec = serde_yml::from_str(&raw)?;
     if spec.profile_id != args.profile_id {
