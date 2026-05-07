@@ -2,6 +2,7 @@
 //!
 //! Public API: [`AuditEvent`], [`AuditLog`], [`AuditWriter`].
 
+pub mod bootstrap;
 pub mod hmac;
 pub mod reader;
 pub mod schema;

@@ -143,6 +143,57 @@ fn kvendra_home_perms_are_0700_and_files_are_0600() {
 }
 
 // ----------------------------------------------------------------------
+// ISSUE-KVD-CLI-003 — vault_created audit row written by init
+// ----------------------------------------------------------------------
+
+/// `kvendra init` must persist a single `kvendra.system / vault_created`
+/// row anchoring the audit chain to the moment of vault initialisation.
+/// Otherwise forensics can only fall back to the (mutable) filesystem
+/// mtime of `audit.db`. The row is HMAC-chained from the start.
+#[cfg(unix)]
+#[tokio::test]
+async fn vault_created_event_persisted_after_init_bootstrap() {
+    use kvendra::audit::reader::open_readonly;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let home = dir.path();
+    let v = bootstrap_vault(home, b"hunter2-vault-created");
+    let hmac_key = v
+        .audit_hmac_key_from_password(b"hunter2-vault-created")
+        .unwrap();
+
+    kvendra::audit::bootstrap::write_vault_created_event(
+        &v.audit_db_path(),
+        hmac_key,
+        "0.1.0-test",
+    )
+    .await
+    .unwrap();
+
+    let audit_path = v.audit_db_path();
+    assert!(audit_path.exists(), "audit.db missing after bootstrap");
+    let mode = std::fs::metadata(&audit_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "audit.db perms must be 0600");
+
+    let conn = open_readonly(&audit_path).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "expected exactly 1 vault_created row");
+    let (action, primitive, status): (String, String, String) = conn
+        .query_row(
+            "SELECT action, primitive, status FROM audit_events ORDER BY id LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(action, "vault_created");
+    assert_eq!(primitive, "kvendra.system");
+    assert_eq!(status, "ok");
+}
+
+// ----------------------------------------------------------------------
 // FAIL #2 — MCP structuredContent leak via primitive output
 // ----------------------------------------------------------------------
 

@@ -1,5 +1,6 @@
 //! `kvendra init` — vault bootstrap with full recovery UX (ADR-KVD-011).
 
+use crate::audit::bootstrap::write_vault_created_event;
 use crate::config::{Config, ensure_layout, kvendra_home, set_file_mode_secure};
 use crate::error::{KvendraError, KvendraResult};
 use crate::vault::Vault;
@@ -180,6 +181,17 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
 
     // Create the vault sentinel.
     vault.create(password.as_bytes())?;
+
+    // Bootstrap the audit log with a `vault_created` row so forensics can
+    // anchor the chain to the moment of initialisation rather than the
+    // filesystem mtime of `audit.db` (mutable). ISSUE-KVD-CLI-003.
+    let hmac_key = vault.audit_hmac_key_from_password(password.as_bytes())?;
+    write_vault_created_event(
+        &vault.audit_db_path(),
+        hmac_key,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await?;
 
     println!("Vault initialized at {}", home.display());
     Ok(())
