@@ -12,9 +12,13 @@
 //! Cascade de configuración (más específica gana):
 //!   env > profile YAML > config.toml > default.
 
+pub mod biometric;
 pub mod cache;
 pub mod policy;
+pub mod transport;
 pub mod tty;
+
+pub use transport::Transport;
 
 use crate::allowlist::ProfileSpec;
 use crate::audit::reader::args_hash_hex;
@@ -61,6 +65,14 @@ pub enum ApprovalDecision {
     Timeout,
     /// Modo `ask*` activo pero sin TTY accesible.
     NoTty,
+    /// MCP transport: el user aceptó el popup OS (TouchID / dialog) y la
+    /// llamada queda autorizada por la ventana de cache. Cache poblada.
+    BiometricGranted,
+    /// MCP transport: el user rechazó el popup OS. Bloquea dispatch.
+    BiometricRejected,
+    /// MCP transport: el OS no puede mostrar el popup biometric (Linux
+    /// headless, Windows no soportado, etc.). Bloquea dispatch.
+    BiometricUnavailable,
 }
 
 impl ApprovalDecision {
@@ -74,6 +86,9 @@ impl ApprovalDecision {
             ApprovalDecision::Denied => Some("approval_denied"),
             ApprovalDecision::Timeout => Some("approval_timeout"),
             ApprovalDecision::NoTty => Some("approval_no_tty_denied"),
+            ApprovalDecision::BiometricGranted => Some("mcp_approval_biometric_granted"),
+            ApprovalDecision::BiometricRejected => Some("mcp_approval_biometric_rejected"),
+            ApprovalDecision::BiometricUnavailable => Some("mcp_approval_biometric_not_available"),
         }
     }
 
@@ -81,7 +96,11 @@ impl ApprovalDecision {
     pub fn blocks_dispatch(&self) -> bool {
         matches!(
             self,
-            ApprovalDecision::Denied | ApprovalDecision::Timeout | ApprovalDecision::NoTty
+            ApprovalDecision::Denied
+                | ApprovalDecision::Timeout
+                | ApprovalDecision::NoTty
+                | ApprovalDecision::BiometricRejected
+                | ApprovalDecision::BiometricUnavailable
         )
     }
 
@@ -91,6 +110,8 @@ impl ApprovalDecision {
             ApprovalDecision::Denied => Some("approval_denied"),
             ApprovalDecision::Timeout => Some("approval_timeout"),
             ApprovalDecision::NoTty => Some("approval_no_tty"),
+            ApprovalDecision::BiometricRejected => Some("approval_denied"),
+            ApprovalDecision::BiometricUnavailable => Some("approval_no_biometric"),
             _ => None,
         }
     }
@@ -207,10 +228,22 @@ pub async fn check(
     };
 
     let _guard = ctx.approval_prompt_lock.lock().await;
-    let backend = tty::TtyApprovalBackend;
-    let decision = backend.ask(prompt_ctx).await;
+    let decision: ApprovalDecision = if ctx.transport.is_mcp() {
+        biometric::BiometricApprovalBackend.ask(prompt_ctx).await
+    } else {
+        tty::TtyApprovalBackend.ask(prompt_ctx).await
+    };
 
-    if matches!(decision, ApprovalDecision::GrantedAllForFiveMin) && !profile_id.is_empty() {
+    // The TTY path uses an explicit `[a]pprove-all-5min` button to populate
+    // the cache. The biometric path has no equivalent multi-button UI, so a
+    // single biometric grant warms the cache for the same TTL window — the
+    // prompt is OS-mediated and the user is implicitly opting into the
+    // 5-minute relaxation by accepting it.
+    if matches!(
+        decision,
+        ApprovalDecision::GrantedAllForFiveMin | ApprovalDecision::BiometricGranted
+    ) && !profile_id.is_empty()
+    {
         ctx.approval_cache.approve(profile_id, cache_ttl).await;
     }
 
@@ -239,6 +272,11 @@ pub fn hint_for(decision: ApprovalDecision, timeout_seconds: u32) -> &'static st
         }
         ApprovalDecision::NoTty => {
             "no TTY available; set KVENDRA_APPROVAL_MODE=silent for non-interactive contexts"
+        }
+        ApprovalDecision::BiometricRejected => "user denied this operation via OS popup",
+        ApprovalDecision::BiometricUnavailable => {
+            "biometric/OS popup not available on this platform (macOS-only in this release); \
+             set KVENDRA_APPROVAL_MODE=silent for non-supported platforms"
         }
         _ => "",
     }

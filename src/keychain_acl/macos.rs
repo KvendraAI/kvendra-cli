@@ -135,3 +135,73 @@ fn map_status_to_kind(status: i32, label: &str) -> Result<(), BiometricError> {
         other => Err(BiometricError::Backend(format!("OSStatus {other}"))),
     }
 }
+
+/// Show an OS-modal approval popup and block until the user accepts or
+/// dismisses. Used by [`crate::approval::biometric::BiometricApprovalBackend`]
+/// to gate `tools/call` decisions on real human presence — without ever
+/// touching `/dev/tty` (mitigates PAT-KVD-007).
+///
+/// Implementation detail: this release shells out to `osascript` to display
+/// a native dialog (Approve / Cancel buttons). Migrating to a TouchID-native
+/// `LAContext.evaluatePolicy` call is straightforward (drop-in replacement
+/// at this call site) but requires ObjC FFI + block callbacks; deferred to
+/// a follow-up iteration when the complexity is justified.
+pub fn request_user_presence_only(reason: &str) -> Result<(), BiometricError> {
+    let sanitized = sanitize_for_applescript(reason);
+    let script = format!(
+        "display dialog \"{sanitized}\" with title \"kvendra approval\" \
+         buttons {{\"Cancel\", \"Approve\"}} default button \"Approve\" \
+         cancel button \"Cancel\" with icon caution"
+    );
+
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| {
+            BiometricError::Unavailable(format!(
+                "failed to spawn osascript ({e}); is `osascript` available on PATH?"
+            ))
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+    // osascript exits 1 on Cancel / on AppleScript runtime error. Both stderr
+    // strings include "User canceled." for the dialog cancel path. Any other
+    // failure is a backend / availability problem.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("User canceled") || stderr.contains("-128") {
+        Err(BiometricError::Rejected)
+    } else {
+        Err(BiometricError::Backend(format!(
+            "osascript failed: {}",
+            stderr.trim()
+        )))
+    }
+}
+
+/// Escape characters that would break the AppleScript string literal we
+/// embed into the `osascript -e` argument. Only `"` and `\` are special
+/// inside an AppleScript double-quoted string.
+fn sanitize_for_applescript(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_for_applescript;
+
+    #[test]
+    fn sanitize_escapes_quote_and_backslash() {
+        assert_eq!(sanitize_for_applescript(r#"a"b\c"#), r#"a\"b\\c"#);
+    }
+
+    #[test]
+    fn sanitize_passes_plain_text() {
+        assert_eq!(
+            sanitize_for_applescript("Destructive: kvendra.aws on profile 'p1' (s3_sync)"),
+            "Destructive: kvendra.aws on profile 'p1' (s3_sync)"
+        );
+    }
+}

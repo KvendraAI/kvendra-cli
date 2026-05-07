@@ -12,7 +12,7 @@
 //! starts, the dispatcher logs to stderr and refuses to record audit rows.
 
 use crate::allowlist::{ProfileSpec, check as allowlist_check, validate as allowlist_validate};
-use crate::approval::{self, ApprovalCache};
+use crate::approval::{self, ApprovalCache, Transport};
 use crate::audit::reader::args_hash_hex;
 use crate::audit::{AuditEvent, AuditWriter, Severity, Status};
 use crate::config::Config;
@@ -43,6 +43,10 @@ pub struct ServerContext {
     /// Serializa los prompts de approval concurrentes (REQ-KVD-003 risk
     /// mitigation): solo un prompt activo a la vez.
     pub approval_prompt_lock: Arc<Mutex<()>>,
+    /// Transport canal del approval flow (REQ-KVD-006 / ADR-KVD-021).
+    /// Inicializado a `Transport::Mcp` desde `serve_with_vault`; tests
+    /// pure-policy pueden construir un `ServerContext` con `Transport::Cli`.
+    pub transport: Transport,
 }
 
 /// Run the MCP server until the client disconnects (creates a fresh `Vault`
@@ -81,6 +85,7 @@ pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
         writer,
         approval_cache: Arc::new(ApprovalCache::new()),
         approval_prompt_lock: Arc::new(Mutex::new(())),
+        transport: Transport::Mcp,
     });
     let mut transport = StdioTransport::new();
 

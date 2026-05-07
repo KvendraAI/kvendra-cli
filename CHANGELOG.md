@@ -5,6 +5,53 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
+## [0.1.0-alpha.5] — 2026-05-07
+
+REQ-KVD-006 / ISSUE-KVD-CLI-020 closure (2/4 of ROAD-KVD-008 bundle).
+Closes the TTY hijack pattern documented in PAT-KVD-007 structurally:
+the MCP subprocess no longer touches `/dev/tty` for approval prompts.
+CLI commands keep the TTY behaviour. macOS only in this release;
+Windows / Linux: `KVENDRA_APPROVAL_MODE=silent` workaround. ADR-KVD-021
+documents the transport-based separation pattern (sister of ADR-KVD-020,
+extends ADR-KVD-016). Implementation uses `osascript` display dialog;
+TouchID-native `LAContext.evaluatePolicy` is a future hardening
+drop-in replacement.
+
+### Changed (REQ-KVD-006 / ISSUE-KVD-CLI-020)
+
+- **Approval flow now branches on transport.** `kvendra mcp serve` (MCP
+  transport) sends approval prompts to an OS-mediated dialog popup —
+  never to `/dev/tty`. CLI commands keep the historical TTY behaviour.
+  Closes the TTY-hijack pattern documented in **PAT-KVD-007** structurally:
+  no env-var heuristic, just the binary's own subcommand. macOS only in
+  this release; Windows / Linux: the broker rejects approval prompts with
+  a clear error pointing to the `KVENDRA_APPROVAL_MODE=silent` workaround.
+- **`approval::policy::requires_tty` signature**: `requires_tty(mode)` →
+  `requires_tty(mode, transport)`. Internal API — no end-user impact.
+
+### Added
+
+- New module `src/approval/transport.rs` with `Transport::{Cli, Mcp}` enum,
+  threaded through `mcp::ServerContext` (`Transport::Mcp` from
+  `serve_with_vault`).
+- New module `src/approval/biometric.rs` with `BiometricApprovalBackend`
+  implementing the `ApprovalBackend` trait. Run on `tokio::spawn_blocking`
+  to keep the reactor responsive while the OS popup is on-screen.
+- `keychain_acl::request_user_presence_only(reason)`. macOS implementation
+  shells out to `osascript` to display a native modal dialog (TouchID-
+  native `LAContext.evaluatePolicy` is a future hardening). Windows /
+  Linux return `BiometricError::Unavailable`.
+- 3 new `ApprovalDecision` variants: `BiometricGranted` (cache-warming
+  success), `BiometricRejected` (user dismissed the popup; blocks
+  dispatch with `error_type = "approval_denied"`), and
+  `BiometricUnavailable` (platform without OS popup support; blocks
+  dispatch with `error_type = "approval_no_biometric"`).
+- 3 new canonical audit flags: `mcp_approval_biometric_granted`,
+  `mcp_approval_biometric_rejected`, `mcp_approval_biometric_not_available`.
+- Test coverage: 8 net new tests across `approval/transport`, `approval/
+  biometric`, `approval/policy`, `keychain_acl/macos`, plus 4 contract
+  tests in `tests/approval_integration.rs` for the new variants.
+
 ## [0.1.0-alpha.4] — 2026-05-07
 
 REQ-KVD-005 / ISSUE-KVD-CLI-017 closure (1/4 of ROAD-KVD-008 bundle).

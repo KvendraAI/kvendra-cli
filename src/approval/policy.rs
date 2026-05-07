@@ -7,7 +7,7 @@
 //!   4. default `ask-destructive` (ADR-KVD-016 — silent es opt-in explícito)
 
 use crate::allowlist::{Operation, ProfileSpec, catalog};
-use crate::approval::ApprovalMode;
+use crate::approval::{ApprovalMode, Transport};
 use serde_json::Value;
 
 /// Resuelve el modo activo siguiendo la cascade canónica.
@@ -19,9 +19,16 @@ pub fn resolve_mode(
     env_var.or(profile_override).unwrap_or(global)
 }
 
-/// `silent` no exige TTY (CI/automation). `ask*` sí.
-pub fn requires_tty(mode: ApprovalMode) -> bool {
-    matches!(mode, ApprovalMode::Ask | ApprovalMode::AskDestructive)
+/// Decide if the active approval mode + transport requires `/dev/tty` for the
+/// prompt. CLI commands (`Transport::Cli`) keep the historical semantics:
+/// `silent` does not require TTY, `ask*` does. MCP transport never uses TTY
+/// for approval — the prompt is delegated to the OS biometric / dialog popup
+/// (REQ-KVD-006 / ISSUE-KVD-CLI-020) to mitigate PAT-KVD-007.
+pub fn requires_tty(mode: ApprovalMode, transport: Transport) -> bool {
+    match transport {
+        Transport::Cli => matches!(mode, ApprovalMode::Ask | ApprovalMode::AskDestructive),
+        Transport::Mcp => false,
+    }
 }
 
 /// Determina si la combinación de modo + flag destructive dispara prompt.
@@ -116,10 +123,17 @@ mod tests {
     }
 
     #[test]
-    fn requires_tty_only_for_ask_modes() {
-        assert!(!requires_tty(ApprovalMode::Silent));
-        assert!(requires_tty(ApprovalMode::Ask));
-        assert!(requires_tty(ApprovalMode::AskDestructive));
+    fn requires_tty_cli_only_for_ask_modes() {
+        assert!(!requires_tty(ApprovalMode::Silent, Transport::Cli));
+        assert!(requires_tty(ApprovalMode::Ask, Transport::Cli));
+        assert!(requires_tty(ApprovalMode::AskDestructive, Transport::Cli));
+    }
+
+    #[test]
+    fn requires_tty_mcp_never() {
+        assert!(!requires_tty(ApprovalMode::Silent, Transport::Mcp));
+        assert!(!requires_tty(ApprovalMode::Ask, Transport::Mcp));
+        assert!(!requires_tty(ApprovalMode::AskDestructive, Transport::Mcp));
     }
 
     #[test]

@@ -15,3 +15,7 @@ pub fn read_with_user_presence(_label: &str) -> Result<String, BiometricError> {
 pub fn delete(_label: &str) -> Result<(), BiometricError> {
     Err(BiometricError::Unavailable(unavailable_user_message()))
 }
+
+pub fn request_user_presence_only(_reason: &str) -> Result<(), BiometricError> {
+    Err(BiometricError::Unavailable(unavailable_user_message()))
+}

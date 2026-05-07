@@ -40,12 +40,16 @@ pub enum BiometricError {
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::{delete, read_with_user_presence, save_with_user_presence};
+pub use macos::{
+    delete, read_with_user_presence, request_user_presence_only, save_with_user_presence,
+};
 
 #[cfg(not(target_os = "macos"))]
 mod other;
 #[cfg(not(target_os = "macos"))]
-pub use other::{delete, read_with_user_presence, save_with_user_presence};
+pub use other::{
+    delete, read_with_user_presence, request_user_presence_only, save_with_user_presence,
+};
 
 /// Convenience: pre-canned message recommending the legacy env-var
 /// workaround on platforms where ACL is not yet supported.

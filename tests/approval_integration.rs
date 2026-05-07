@@ -188,3 +188,77 @@ async fn auto_deny_backend_denies_immediately() {
     assert_eq!(d.audit_flag(), Some("approval_denied"));
     assert_eq!(d.error_type(), Some("approval_denied"));
 }
+
+// ----------------------------------------------------------------------
+// REQ-KVD-006 / ISSUE-KVD-CLI-020 — biometric ApprovalDecision contract
+// ----------------------------------------------------------------------
+
+/// AC-BIOMETRIC-1 contract: when MCP transport accepts via biometric / OS
+/// popup, the decision must NOT block dispatch and must carry the canonical
+/// audit flag + no error_type (success path).
+#[test]
+fn biometric_granted_decision_carries_canonical_audit_flag() {
+    let d = ApprovalDecision::BiometricGranted;
+    assert!(
+        !d.blocks_dispatch(),
+        "BiometricGranted must NOT block dispatch"
+    );
+    assert_eq!(d.audit_flag(), Some("mcp_approval_biometric_granted"));
+    assert_eq!(d.error_type(), None);
+}
+
+/// AC-BIOMETRIC-2 contract: user-rejected biometric prompt must block
+/// dispatch and surface as `approval_denied` to the MCP client (so the
+/// client UX is uniform with TTY denial).
+#[test]
+fn biometric_rejected_decision_blocks_dispatch_with_canonical_flag() {
+    let d = ApprovalDecision::BiometricRejected;
+    assert!(d.blocks_dispatch(), "BiometricRejected must block dispatch");
+    assert_eq!(d.audit_flag(), Some("mcp_approval_biometric_rejected"));
+    assert_eq!(d.error_type(), Some("approval_denied"));
+}
+
+/// AC-BIOMETRIC-3 contract: Linux headless / Windows / macOS w/o biometric
+/// must block dispatch and surface as `approval_no_biometric` so the client
+/// can suggest the silent-mode workaround.
+#[test]
+fn biometric_unavailable_decision_blocks_dispatch_with_canonical_flag() {
+    let d = ApprovalDecision::BiometricUnavailable;
+    assert!(
+        d.blocks_dispatch(),
+        "BiometricUnavailable must block dispatch"
+    );
+    assert_eq!(d.audit_flag(), Some("mcp_approval_biometric_not_available"));
+    assert_eq!(d.error_type(), Some("approval_no_biometric"));
+}
+
+/// `hint_for` returns user-facing guidance when biometric paths block
+/// dispatch. Stable strings — clients can pattern-match if needed.
+#[test]
+fn hint_for_biometric_decisions_returns_user_guidance() {
+    use kvendra::approval::hint_for;
+    let rejected = hint_for(ApprovalDecision::BiometricRejected, 30);
+    assert!(rejected.contains("denied"), "got: {rejected}");
+    assert!(rejected.contains("OS popup"), "got: {rejected}");
+
+    let unavailable = hint_for(ApprovalDecision::BiometricUnavailable, 30);
+    assert!(unavailable.contains("macOS-only"), "got: {unavailable}");
+    assert!(
+        unavailable.contains("KVENDRA_APPROVAL_MODE=silent"),
+        "got: {unavailable}"
+    );
+}
+
+/// AC-BIOMETRIC-3 (non-macOS path): on platforms where the keychain_acl
+/// subsystem reports `Unavailable`, the BiometricApprovalBackend must
+/// surface that as `BiometricUnavailable` (never panic, never return
+/// `BiometricGranted` by accident — fail-safe).
+#[cfg(not(target_os = "macos"))]
+#[tokio::test(flavor = "current_thread")]
+async fn biometric_backend_unavailable_on_non_macos() {
+    let b = kvendra::approval::biometric::BiometricApprovalBackend;
+    let d = b.ask(ctx_destructive()).await;
+    assert_eq!(d, ApprovalDecision::BiometricUnavailable);
+    assert!(d.blocks_dispatch());
+    assert_eq!(d.audit_flag(), Some("mcp_approval_biometric_not_available"));
+}
