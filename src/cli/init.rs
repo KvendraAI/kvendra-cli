@@ -1,6 +1,6 @@
 //! `kvendra init` — vault bootstrap with full recovery UX (ADR-KVD-011).
 
-use crate::config::{Config, ensure_layout, kvendra_home};
+use crate::config::{Config, ensure_layout, kvendra_home, set_file_mode_secure};
 use crate::error::{KvendraError, KvendraResult};
 use crate::vault::Vault;
 use crate::vault::recovery::{RecoveryCodesFile, StoredCode, generate_codes, generate_mnemonic};
@@ -92,13 +92,7 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
             content.push_str(&format!("  - {c}\n"));
         }
         std::fs::write(path, content)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(path)?.permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(path, perms)?;
-        }
+        set_file_mode_secure(path)?;
         println!("Recovery material written to {} (0600).", path.display());
     }
 
@@ -147,17 +141,8 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
     }
     let codes_path = vault.recovery_codes_path();
     std::fs::write(&codes_path, serde_json::to_string_pretty(&stored)?)?;
-    // The hashed recovery codes file holds salted Argon2id hashes of the
-    // numeric one-shot codes. Even though the codes are themselves hashed,
-    // we still tighten the permissions to 0600 to keep them out of reach of
-    // other local accounts (defence-in-depth — see THREAT-MODEL V2).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&codes_path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&codes_path, perms)?;
-    }
+    // Defence-in-depth on top of Argon2id hashing of the numeric codes.
+    set_file_mode_secure(&codes_path)?;
 
     // Create the vault sentinel.
     vault.create(password.as_bytes())?;

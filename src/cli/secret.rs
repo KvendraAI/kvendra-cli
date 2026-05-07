@@ -221,9 +221,10 @@ fn set_allowlist(vault: &Vault, args: SetAllowlistArgs) -> KvendraResult<()> {
         )));
     }
     allowlist_validate(&spec)?;
-    std::fs::create_dir_all(vault.allowlists_dir())?;
+    crate::config::create_dir_secure(&vault.allowlists_dir())?;
     let target = vault.profile_allowlist_path(&args.profile_id);
     std::fs::write(&target, raw)?;
+    crate::config::set_file_mode_secure(&target)?;
     println!("Allowlist for '{}' set.", args.profile_id);
     Ok(())
 }

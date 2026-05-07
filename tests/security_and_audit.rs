@@ -85,6 +85,64 @@ fn recovery_codes_file_has_0600_perms() {
 }
 
 // ----------------------------------------------------------------------
+// ISSUE-KVD-CLI-004/005/006 — defence-in-depth filesystem perms
+// ----------------------------------------------------------------------
+
+/// `kvendra init` (and equivalent in-process bootstrap) must lock down
+/// `~/.kvendra/` to 0700 and every sensitive file to 0600. Other local users
+/// must not be able to enumerate the vault layout nor read sentinel/config/
+/// recovery files. Convention shared with `~/.ssh`, `~/.gnupg`,
+/// `~/.password-store`, `~/.config/sops` (see THREAT-MODEL V2).
+#[cfg(unix)]
+#[test]
+fn kvendra_home_perms_are_0700_and_files_are_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let home = dir.path();
+    // Drive the same ensure_layout + Config::save + Vault::create paths
+    // that `kvendra init` exercises (skipping the slow Argon2id high-cost
+    // derivation — same approach as the existing 0600 tests above).
+    kvendra::config::ensure_layout(home).unwrap();
+    kvendra::config::Config::default().save(home).unwrap();
+    let v = Vault::new(home.to_path_buf());
+    v.create_with_params(b"hunter2-perms-test", fast_params())
+        .unwrap();
+    // Persist a profile + secret so we cover the meta + blob paths too.
+    v.unlock(b"hunter2-perms-test", 30).unwrap();
+    v.put_secret("perms.profile", b"sometoken").unwrap();
+    v.save_profile_meta(&kvendra::vault::Profile {
+        profile_id: "perms.profile".into(),
+        secret_type: "github_pat".into(),
+        created_at: "2026-05-07T00:00:00Z".into(),
+        expiration: None,
+        unsafe_raw_token_enabled: false,
+        quarantined: false,
+    })
+    .unwrap();
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+    // Directories — 0700.
+    assert_eq!(mode(home), 0o700, "~/.kvendra/ dir");
+    assert_eq!(mode(&home.join("secrets")), 0o700, "secrets/ dir");
+    assert_eq!(mode(&home.join("allowlists")), 0o700, "allowlists/ dir");
+    assert_eq!(mode(&home.join("profiles")), 0o700, "profiles/ dir");
+
+    // Files — 0600.
+    assert_eq!(mode(&home.join("sentinel.blob")), 0o600, "sentinel.blob");
+    assert_eq!(mode(&home.join("config.toml")), 0o600, "config.toml");
+    assert_eq!(
+        mode(&home.join("secrets/perms.profile.blob")),
+        0o600,
+        "profile blob",
+    );
+    assert_eq!(
+        mode(&home.join("profiles/perms.profile.json")),
+        0o600,
+        "profile meta",
+    );
+}
+
+// ----------------------------------------------------------------------
 // FAIL #2 — MCP structuredContent leak via primitive output
 // ----------------------------------------------------------------------
 

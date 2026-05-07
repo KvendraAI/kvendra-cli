@@ -8,6 +8,7 @@ pub mod kdf;
 pub mod recovery;
 pub mod session;
 
+use crate::config::{create_dir_secure, set_file_mode_secure};
 use crate::error::{KvendraError, KvendraResult};
 use crate::vault::blob::Blob;
 use crate::vault::crypto::{NONCE_LEN, open as aes_open, random_nonce, seal as aes_seal};
@@ -166,10 +167,11 @@ impl Vault {
     }
 
     pub fn save_profile_meta(&self, profile: &Profile) -> KvendraResult<()> {
-        std::fs::create_dir_all(self.profiles_dir())?;
+        create_dir_secure(&self.profiles_dir())?;
         let path = self.profile_meta_path(&profile.profile_id);
         let raw = serde_json::to_string_pretty(profile)?;
         std::fs::write(&path, raw)?;
+        set_file_mode_secure(&path)?;
         Ok(())
     }
 
@@ -195,10 +197,10 @@ impl Vault {
     /// Init variant that accepts custom KDF params (used by tests with fast
     /// argon2 params; production callers should use [`Vault::create`]).
     pub fn create_with_params(&self, password: &[u8], params: KdfParams) -> KvendraResult<()> {
-        std::fs::create_dir_all(&self.home)?;
-        std::fs::create_dir_all(self.secrets_dir())?;
-        std::fs::create_dir_all(self.allowlists_dir())?;
-        std::fs::create_dir_all(self.profiles_dir())?;
+        create_dir_secure(&self.home)?;
+        create_dir_secure(&self.secrets_dir())?;
+        create_dir_secure(&self.allowlists_dir())?;
+        create_dir_secure(&self.profiles_dir())?;
         if self.sentinel_path().exists() {
             return Err(KvendraError::Vault(
                 "vault already initialized (sentinel.blob exists)".into(),
@@ -208,7 +210,9 @@ impl Vault {
         let nonce = random_nonce();
         let ct = aes_seal(derived.as_bytes(), &nonce, b"kvendra-sentinel-v1")?;
         let blob = Blob::new(params, nonce.to_vec(), ct);
-        std::fs::write(self.sentinel_path(), blob.to_json()?)?;
+        let sentinel = self.sentinel_path();
+        std::fs::write(&sentinel, blob.to_json()?)?;
+        set_file_mode_secure(&sentinel)?;
         Ok(())
     }
 
@@ -266,13 +270,15 @@ impl Vault {
         let nonce = random_nonce();
         let ct = aes_seal(derived.as_bytes(), &nonce, b"kvendra-sentinel-v1")?;
         let blob = Blob::new(params, nonce.to_vec(), ct);
-        std::fs::write(self.sentinel_path(), blob.to_json()?)?;
+        let sentinel = self.sentinel_path();
+        std::fs::write(&sentinel, blob.to_json()?)?;
+        set_file_mode_secure(&sentinel)?;
         Ok(())
     }
 
     /// Encrypt + persist a secret blob for `profile_id`. Requires unlocked.
     pub fn put_secret(&self, profile_id: &str, plaintext: &[u8]) -> KvendraResult<()> {
-        std::fs::create_dir_all(self.secrets_dir())?;
+        create_dir_secure(&self.secrets_dir())?;
         let g = self.session.lock().expect("session mutex poisoned");
         let session = g.as_ref().ok_or(KvendraError::VaultLocked)?;
         if session.is_expired() {
@@ -287,7 +293,9 @@ impl Vault {
         let ct = aes_seal(key, &nonce, plaintext)?;
         let params = KdfParams::high_cost(vec![]); // shell only
         let blob = Blob::new(params, nonce.to_vec(), ct);
-        std::fs::write(self.profile_blob_path(profile_id), blob.to_json()?)?;
+        let blob_path = self.profile_blob_path(profile_id);
+        std::fs::write(&blob_path, blob.to_json()?)?;
+        set_file_mode_secure(&blob_path)?;
         Ok(())
     }
 

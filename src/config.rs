@@ -74,6 +74,7 @@ impl Config {
         let path = home.join("config.toml");
         let raw = toml::to_string_pretty(self).map_err(|e| KvendraError::Config(e.to_string()))?;
         std::fs::write(&path, raw)?;
+        set_file_mode_secure(&path)?;
         Ok(())
     }
 }
@@ -96,8 +97,43 @@ pub fn kvendra_home() -> KvendraResult<PathBuf> {
 
 /// Ensure the `~/.kvendra/` layout exists.
 pub fn ensure_layout(home: &Path) -> KvendraResult<()> {
-    std::fs::create_dir_all(home)?;
-    std::fs::create_dir_all(home.join("secrets"))?;
-    std::fs::create_dir_all(home.join("allowlists"))?;
+    create_dir_secure(home)?;
+    create_dir_secure(&home.join("secrets"))?;
+    create_dir_secure(&home.join("allowlists"))?;
+    create_dir_secure(&home.join("profiles"))?;
+    Ok(())
+}
+
+/// Create a directory (idempotent) and tighten Unix perms to 0700.
+///
+/// Convention used by `~/.ssh`, `~/.gnupg`, `~/.password-store`. Other local
+/// users cannot enumerate or enter the directory (defence-in-depth on top of
+/// the per-file 0600 perms — see THREAT-MODEL V2).
+pub fn create_dir_secure(path: &Path) -> KvendraResult<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+/// Set Unix perms of an existing file to 0600 (no-op on non-Unix).
+///
+/// Apply right after writing any sensitive vault file (sentinel, config,
+/// recovery hashes, audit DB, profile blobs / metadata). Defence-in-depth.
+pub fn set_file_mode_secure(path: &Path) -> KvendraResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
