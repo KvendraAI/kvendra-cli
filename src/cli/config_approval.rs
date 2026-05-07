@@ -8,6 +8,7 @@
 use crate::approval::policy;
 use crate::config::{Config, ensure_layout, kvendra_home};
 use crate::error::{KvendraError, KvendraResult};
+use crate::vault::Vault;
 use clap::Subcommand;
 
 #[derive(Debug, Subcommand)]
@@ -23,10 +24,13 @@ pub enum ApprovalCommand {
 pub async fn run(cmd: ApprovalCommand) -> KvendraResult<()> {
     let home = kvendra_home()?;
     ensure_layout(&home)?;
-    let mut cfg = Config::load(&home).unwrap_or_default();
 
     match cmd {
         ApprovalCommand::Get => {
+            // Read-only — vault is optional. If a signed config is on disk
+            // we still try to verify if the vault happens to be unlockable
+            // via env, but for `get` the cheap path is enough.
+            let cfg = Config::load(&home, None).unwrap_or_default();
             print_resolved_mode(&cfg);
         }
         ApprovalCommand::Set { mode } => {
@@ -35,9 +39,12 @@ pub async fn run(cmd: ApprovalCommand) -> KvendraResult<()> {
                     "invalid mode '{mode}' (expected: silent | ask | ask-destructive)"
                 ))
             })?;
+            // Mutating — requires unlocked vault for HMAC signing.
+            let vault = unlock_for_approval(&home)?;
+            let mut cfg = Config::load(&home, Some(&vault)).unwrap_or_default();
             cfg.approval.mode = parsed;
             cfg.validate()?;
-            cfg.save(&home)?;
+            cfg.save(&home, &vault)?;
             println!(
                 "global approval mode set to '{}' in ~/.kvendra/config.toml",
                 policy::mode_name(parsed)
@@ -49,10 +56,32 @@ pub async fn run(cmd: ApprovalCommand) -> KvendraResult<()> {
             }
         }
         ApprovalCommand::Status => {
+            let cfg = Config::load(&home, None).unwrap_or_default();
             print_status(&cfg);
         }
     }
     Ok(())
+}
+
+/// Unlock the vault for an approval-config mutation. Mirrors `unlock_for_config`
+/// in `config_cmd.rs` (kept private here to avoid module-level cycles).
+fn unlock_for_approval(home: &std::path::Path) -> KvendraResult<Vault> {
+    let vault = Vault::new(home.to_path_buf());
+    if !vault.sentinel_path().exists() {
+        return Err(KvendraError::Vault(
+            "vault not initialized. Run `kvendra init` first.".into(),
+        ));
+    }
+    let password = match std::env::var("KVENDRA_PASSWORD") {
+        Ok(s) => s,
+        Err(_) => {
+            println!("Enter the master password (will not echo):");
+            rpassword::read_password()
+                .map_err(|e| KvendraError::Vault(format!("read password: {e}")))?
+        }
+    };
+    vault.unlock(password.as_bytes(), 30)?;
+    Ok(vault)
 }
 
 fn print_resolved_mode(cfg: &Config) {
@@ -112,28 +141,49 @@ mod tests {
     #[tokio::test]
     async fn set_persists_and_round_trips() {
         let tmp = TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("KVENDRA_HOME", tmp.path());
-        }
-        // Clear any inherited override that would obscure cascade diagnostics
-        // in the test process.
-        unsafe {
-            std::env::remove_var("KVENDRA_APPROVAL_MODE");
-        }
+        // REQ-KVD-008: `Set` requires an unlocked vault to sign config.toml.
+        // Bootstrap with fast Argon2id params (real `kvendra init` uses
+        // `high_cost` which is >1s in CI).
+        crate::config::ensure_layout(tmp.path()).unwrap();
+        let v = Vault::new(tmp.path().to_path_buf());
+        v.create_with_params(
+            b"hunter2-test",
+            crate::vault::kdf::KdfParams {
+                m_cost_kib: 19_456,
+                t_cost: 2,
+                p_cost: 1,
+                salt: vec![1u8; 16],
+            },
+        )
+        .unwrap();
 
-        let result = run(ApprovalCommand::Set {
-            mode: "silent".into(),
-        })
-        .await;
+        // Take the env-var lock for the env-var-mutating section only.
+        // `tokio::sync::Mutex` is async-aware so holding it across an await
+        // is permitted (clippy::await_holding_lock only fires on std::sync).
+        let _guard = crate::test_env_lock().lock().await;
+        let result = {
+            unsafe {
+                std::env::set_var("KVENDRA_HOME", tmp.path());
+                std::env::remove_var("KVENDRA_APPROVAL_MODE");
+                std::env::set_var("KVENDRA_PASSWORD", "hunter2-test");
+            }
+            let r = run(ApprovalCommand::Set {
+                mode: "silent".into(),
+            })
+            .await;
+            unsafe {
+                std::env::remove_var("KVENDRA_HOME");
+                std::env::remove_var("KVENDRA_PASSWORD");
+            }
+            r
+        };
         assert!(result.is_ok(), "set returned {result:?}");
 
-        let home = kvendra_home().unwrap();
-        let reloaded = Config::load(&home).unwrap();
+        // Re-load directly via the path (env vars no longer set).
+        let v2 = Vault::new(tmp.path().to_path_buf());
+        v2.unlock(b"hunter2-test", 30).unwrap();
+        let reloaded = Config::load(tmp.path(), Some(&v2)).unwrap();
         assert_eq!(reloaded.approval.mode, ApprovalMode::Silent);
-
-        unsafe {
-            std::env::remove_var("KVENDRA_HOME");
-        }
     }
 
     #[test]

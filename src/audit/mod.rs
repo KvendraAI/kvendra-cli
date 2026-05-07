@@ -10,6 +10,13 @@ pub mod writer;
 
 use serde::{Deserialize, Serialize};
 
+/// Canonical primitive string for system-level (non-MCP) audit rows such as
+/// `vault_created` (REQ-KVD-002 / ISSUE-003) and `home_rebound`
+/// (REQ-KVD-008 / ISSUE-019). Distinct from the 7 capability primitives
+/// (`kvendra.git`, `kvendra.github`, ...) so dashboards can filter system
+/// events without enumerating each action.
+pub const PRIMITIVE_SYSTEM: &str = "kvendra.system";
+
 /// Status field of an audit row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

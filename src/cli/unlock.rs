@@ -25,7 +25,10 @@ pub struct UnlockArgs {
 
 pub async fn run(args: UnlockArgs) -> KvendraResult<()> {
     let home = kvendra_home()?;
-    let cfg = Config::load(&home).unwrap_or_default();
+    // Pre-unlock load: vault is locked, so HMAC verification of config.toml
+    // is deferred. We re-load AFTER unlock with the vault attached so the
+    // signed-config invariants run end-to-end on every session start.
+    let cfg = Config::load(&home, None).unwrap_or_default();
     let vault = Vault::new(home.clone());
 
     if !vault.sentinel_path().exists() {
@@ -68,6 +71,12 @@ pub async fn run(args: UnlockArgs) -> KvendraResult<()> {
     };
 
     vault.unlock(password.as_bytes(), cfg.vault.idle_timeout_minutes)?;
+
+    // REQ-KVD-008: auto-migrate a pre-REQ-008 config.toml on first unlock
+    // post-upgrade (silent if already signed). Then re-load with the vault
+    // attached so the HMAC verification + home_canonical check run.
+    crate::config::auto_migrate_config_if_needed(&home, &vault)?;
+    let _signed_cfg = Config::load(&home, Some(&vault))?;
 
     if !args.no_keychain && cfg.vault.master_password_cache == MasterPasswordCache::OsKeychain {
         // Persist a sentinel into the keychain (presence indicator only).

@@ -74,8 +74,6 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
         .map(Ok)
         .unwrap_or_else(kvendra_home)?;
     ensure_layout(&home)?;
-    let cfg = Config::default();
-    cfg.save(&home)?;
 
     let vault = Vault::new(home.clone());
     if vault.sentinel_path().exists() {
@@ -187,6 +185,13 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
     // filesystem mtime of `audit.db` (mutable). ISSUE-KVD-CLI-003.
     let hmac_key = vault.audit_hmac_key_from_password(password.as_bytes())?;
     write_vault_created_event(&vault.audit_db_path(), hmac_key, env!("CARGO_PKG_VERSION")).await?;
+
+    // Persist the default config WITH HMAC trailer + home_canonical
+    // (REQ-KVD-008 AC-CONFIG-HMAC-1, 3). Requires an unlocked vault session
+    // for the HKDF sub-key. We unlock here using the just-set master password
+    // so the freshly-created sentinel is exercised before init returns.
+    vault.unlock(password.as_bytes(), 30)?;
+    Config::default().save(&home, &vault)?;
 
     println!("Vault initialized at {}", home.display());
     Ok(())

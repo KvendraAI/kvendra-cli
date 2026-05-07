@@ -103,12 +103,13 @@ fn kvendra_home_perms_are_0700_and_files_are_0600() {
     // that `kvendra init` exercises (skipping the slow Argon2id high-cost
     // derivation — same approach as the existing 0600 tests above).
     kvendra::config::ensure_layout(home).unwrap();
-    kvendra::config::Config::default().save(home).unwrap();
     let v = Vault::new(home.to_path_buf());
     v.create_with_params(b"hunter2-perms-test", fast_params())
         .unwrap();
     // Persist a profile + secret so we cover the meta + blob paths too.
     v.unlock(b"hunter2-perms-test", 30).unwrap();
+    // REQ-KVD-008: `Config::save` now requires `&Vault` for the HMAC sub-key.
+    kvendra::config::Config::default().save(home, &v).unwrap();
     v.put_secret("perms.profile", b"sometoken").unwrap();
     v.save_profile_meta(&kvendra::vault::Profile {
         profile_id: "perms.profile".into(),

@@ -51,7 +51,10 @@ pub async fn run(cmd: McpCommand) -> KvendraResult<()> {
         McpCommand::Serve(args) => {
             let home = kvendra_home()?;
             crate::config::ensure_layout(&home)?;
-            let cfg = Config::load(&home).unwrap_or_default();
+            // Pre-unlock load: vault is locked here. Signed-config invariants
+            // are re-verified inside `serve_with_vault` once the vault is
+            // unlocked (REQ-KVD-008).
+            let cfg = Config::load(&home, None).unwrap_or_default();
             let vault = crate::vault::Vault::new(home.clone());
             if !args.no_unlock && vault.sentinel_path().exists() {
                 let password = resolve_password(&args).await?;

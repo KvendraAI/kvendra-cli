@@ -63,7 +63,17 @@ pub async fn serve(home: PathBuf) -> KvendraResult<()> {
 pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
     let home = vault.home().to_path_buf();
     crate::config::ensure_layout(&home)?;
-    let config = Config::load(&home).unwrap_or_default();
+    // Load with the unlocked vault when available so the HMAC verifies and
+    // any home-redirect attack is detected before the broker accepts traffic.
+    let config = Config::load(
+        &home,
+        if vault.is_unlocked() {
+            Some(&vault)
+        } else {
+            None
+        },
+    )
+    .unwrap_or_default();
 
     // The audit writer needs the HMAC sub-key, which comes from the unlocked
     // session. If locked, we degrade: audit rows are NOT appended and the

@@ -19,7 +19,10 @@ pub struct RecoverArgs {
 pub async fn run(args: RecoverArgs) -> KvendraResult<()> {
     let home = kvendra_home()?;
     ensure_layout(&home)?;
-    let cfg = Config::load(&home).unwrap_or_default();
+    // Pre-unlock load: signed-config verification will run on the next
+    // unlock, since `recover` rotates the master password and therefore the
+    // HKDF sub-keys. The cfg here is only used for legacy compat fields.
+    let cfg = Config::load(&home, None).unwrap_or_default();
     let vault = Vault::new(home.clone());
 
     let mnemonic = match args.mnemonic_env {

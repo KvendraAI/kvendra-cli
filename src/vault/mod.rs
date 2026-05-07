@@ -344,6 +344,14 @@ impl Vault {
         Ok(session.allowlist_hmac_key()?.to_vec())
     }
 
+    /// Get the config-HMAC sub-key (HKDF from session key). Errors if locked.
+    /// Per REQ-KVD-008 / ISSUE-019 — used to sign `~/.kvendra/config.toml`.
+    pub fn config_hmac_key(&self) -> KvendraResult<Vec<u8>> {
+        let g = self.session.lock().expect("session mutex poisoned");
+        let session = g.as_ref().ok_or(KvendraError::VaultLocked)?;
+        Ok(session.config_hmac_key()?.to_vec())
+    }
+
     /// Re-derive the audit-HMAC sub-key from the master password without
     /// touching the in-memory session. Used by `kvendra audit verify` so a
     /// CLI invocation that does not share a process with `mcp serve` can
@@ -400,6 +408,20 @@ pub fn compute_allowlist_hmac(key: &[u8], raw_yaml: &[u8]) -> String {
     use sha2::Sha256;
     let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC accepts arbitrary key length");
     mac.update(raw_yaml);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Compute the HMAC-SHA256 of `~/.kvendra/config.toml`'s pre-trailer raw bytes
+/// using the supplied config sub-key (REQ-KVD-008 / ISSUE-019). The signed
+/// payload is the TOML serialization of all `Config` fields except `_hmac`,
+/// concatenated with a single trailing `\n` newline — the `_hmac = "..."`
+/// trailer line is appended *after* the HMAC is computed. Any change to the
+/// signed payload (including `[vault] home_canonical`) is detected on load.
+pub fn compute_config_hmac(key: &[u8], raw_toml_without_hmac: &[u8]) -> String {
+    use ::hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC accepts arbitrary key length");
+    mac.update(raw_toml_without_hmac);
     hex::encode(mac.finalize().into_bytes())
 }
 
@@ -541,5 +563,39 @@ mod tests {
             compute_allowlist_hmac(&key_a, raw),
             compute_allowlist_hmac(&key_b, raw),
         );
+    }
+
+    /// REQ-KVD-008 AC-CONFIG-HMAC-1 — `compute_config_hmac` is deterministic:
+    /// same key + bytes always yield the same hex digest.
+    #[test]
+    fn compute_config_hmac_is_deterministic() {
+        let key = [9u8; 32];
+        let raw = b"[vault]\nidle_timeout_minutes = 30\n";
+        let a = compute_config_hmac(&key, raw);
+        let b = compute_config_hmac(&key, raw);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64, "SHA-256 hex digest is 64 chars");
+    }
+
+    /// REQ-KVD-008 — different sub-keys must yield different HMACs even on
+    /// identical content. Triple-way domain separation between `audit-hmac/v1`,
+    /// `allowlist-hmac/v1` and `config-hmac/v1` is what isolates the L1
+    /// threat surface.
+    #[test]
+    fn compute_config_hmac_differs_with_subkey() {
+        use crate::vault::session::{
+            HKDF_INFO_ALLOWLIST_HMAC, HKDF_INFO_AUDIT_HMAC, HKDF_INFO_CONFIG_HMAC, hkdf_expand,
+        };
+        let master = [42u8; 32];
+        let audit = hkdf_expand(&master, HKDF_INFO_AUDIT_HMAC).to_vec();
+        let allow = hkdf_expand(&master, HKDF_INFO_ALLOWLIST_HMAC).to_vec();
+        let cfg = hkdf_expand(&master, HKDF_INFO_CONFIG_HMAC).to_vec();
+        let raw = b"[vault]\nidle_timeout_minutes = 30\n";
+        let h_audit = compute_config_hmac(&audit, raw);
+        let h_allow = compute_config_hmac(&allow, raw);
+        let h_cfg = compute_config_hmac(&cfg, raw);
+        assert_ne!(h_audit, h_allow);
+        assert_ne!(h_audit, h_cfg);
+        assert_ne!(h_allow, h_cfg);
     }
 }

@@ -24,3 +24,14 @@ pub mod tui;
 pub mod vault;
 
 pub use error::{KvendraError, KvendraResult};
+
+/// Test-only env-var lock shared by every unit test that mutates
+/// `KVENDRA_HOME` / `KVENDRA_PASSWORD`. Process-wide env vars cannot be
+/// scoped per-test, so cargo's parallel test runner needs serialization.
+/// Uses `tokio::sync::Mutex` so the guard can be held across `.await`
+/// points in async tests without tripping `clippy::await_holding_lock`.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}

@@ -117,7 +117,18 @@ fn ensure_unlocked(vault: &Vault, home: &Path, password_stdin: bool) -> KvendraR
     if vault.is_unlocked() {
         return Ok(());
     }
-    let cfg = Config::load(home).unwrap_or_default();
+    // The vault may already be unlocked from an earlier `kvendra unlock`;
+    // pass it through so a signed config is verified end-to-end. If still
+    // locked we fall back to the unsigned-or-default load.
+    let cfg = Config::load(
+        home,
+        if vault.is_unlocked() {
+            Some(vault)
+        } else {
+            None
+        },
+    )
+    .unwrap_or_default();
     let mut password = read_master_password(password_stdin)?;
     let result = vault.unlock(password.as_bytes(), cfg.vault.idle_timeout_minutes);
     password.zeroize();

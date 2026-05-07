@@ -21,8 +21,21 @@ pub enum KvendraError {
     #[error("recovery failed")]
     RecoveryFailed,
 
-    #[error("recovery code invalid or already used")]
+    #[error("recovery code does not match any known slot")]
     RecoveryCodeInvalid,
+
+    #[error("recovery code at slot {slot} already consumed for {used_for} at {used_at}")]
+    RecoveryCodeAlreadyUsed {
+        slot: usize,
+        used_for: String,
+        used_at: String,
+    },
+
+    #[error("'rebind-home' requires interactive TTY confirmation")]
+    RebindRequiresTty,
+
+    #[error("rebind confirmation mismatch — typed path does not canonicalize to target")]
+    RebindConfirmationMismatch,
 
     #[error("audit log error: {0}")]
     Audit(String),

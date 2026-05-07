@@ -5,6 +5,96 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
+## [0.1.0-alpha.7] — 2026-05-07
+
+REQ-KVD-008 / ISSUE-KVD-CLI-019 — Config.toml HMAC + `home_canonical` +
+`rebind-home` triple-barrier (4/4 of the ROAD-KVD-008 bundle). Closes
+GAP 5 (config tampering) and GAP 7 (KVENDRA_HOME redirect) of the L1
+threat model. Together with REQ-005..007 the four structural barriers
+of the L1 surface are complete.
+
+### Changed
+
+- **`Config::save` signature** now requires `&Vault` (the unlocked vault
+  provides the HKDF sub-key for the HMAC trailer). Any caller without an
+  unlocked vault gets a clear error pointing at `kvendra unlock`.
+- **`Config::load` signature** now takes `vault: Option<&Vault>`. A signed
+  `config.toml` (any post-REQ-008 file) requires the vault to verify the
+  trailer; passing `None` against a signed file returns a soft error so
+  pre-unlock callers (`kvendra unlock` itself, `mcp serve` before unlock)
+  can degrade gracefully.
+
+### Added
+
+- HKDF sub-key `kvendra/config-hmac/v1` derived from the unlocked session
+  key. Triple-domain separated from `audit-hmac/v1` and `allowlist-hmac/v1`
+  — a leak of any one sub-key cannot forge HMACs in either of the other
+  two namespaces.
+- New trailing field `_hmac` in `~/.kvendra/config.toml` (last line). The
+  HMAC-SHA256 covers every preceding TOML byte; any change (including
+  whitespace) trips the load-time verify.
+- New field `[vault] home_canonical: Option<String>` persisted inside the
+  signed payload. Verified on load (both sides canonicalized) — a copy
+  of `~/.kvendra/` to a different path no longer passes the loader.
+- New subcommand `kvendra config rebind-home --new-path <path>` with
+  triple-barrier verification: master password unlock, recovery code
+  validation (one-shot), TTY confirmation via re-typed path. Strict
+  no-TTY policy (D4=A) — non-interactive invocations are rejected.
+- New `KvendraError` variants: `RecoveryCodeAlreadyUsed { slot, used_for,
+  used_at }`, `RebindRequiresTty`, `RebindConfirmationMismatch`. The
+  pre-existing `RecoveryCodeInvalid` keeps its name but the error
+  message is now sharper.
+- New canonical audit flags emitted by the new flow:
+  `config_tampered_detected`, `home_redirect_detected`, `home_rebound`,
+  `recovery_code_replay_attempted`, `config_hmac_migrated`. The first
+  three are `error`/`warn` severity; the last two are info-level
+  tracing lines.
+- New `kvendra::audit::PRIMITIVE_SYSTEM = "kvendra.system"` constant.
+  The `home_rebound` audit row uses it (paralleling the existing
+  `vault_created` bootstrap row).
+- Auto-migration on first unlock post-upgrade. Pre-REQ-008 configs (no
+  `_hmac` trailer) are silently re-saved with the trailer + canonical
+  home — `kvendra::config::auto_migrate_config_if_needed`. Trust
+  caveat: the existing config bytes become the signed baseline.
+- Helpers `kvendra::vault::recovery::validate_code_unconsumed` and
+  `mark_code_consumed` for the rebind triple-barrier flow.
+
+### Tests
+
+- 23 net new tests for REQ-KVD-008 covering: HMAC determinism + triple-way
+  domain separation, save/load round-trip, HMAC mismatch rejection, copy
+  attack rejection, attacker-owned-vault forge rejection, modified-home
+  rejection, auto-migration silent path, all four rebind barriers
+  (master password / recovery code / typed path / no-TTY), recovery
+  code replay rejection, audit row schema (primitive + severity + slot
+  in flags CSV), and a macOS-only canonicalize sanity test.
+
+### Caveats
+
+- **Editing `~/.kvendra/config.toml` by hand invalidates the HMAC.** The
+  supported path is `kvendra config <subcommand>`. A recovery from a bad
+  edit is to restore the previous file from backup, or to bootstrap a
+  fresh config via the subcommands.
+- **Auto-migration is trust-on-first-use.** If the alpha.6 config was
+  already tampered with, the migration accepts the tampered bytes as the
+  signed baseline. Operators with security-sensitive workloads should
+  re-bootstrap their config via the subcommands after upgrading.
+- **`rebind-home` consumes one recovery code permanently.** The
+  `kvendra config recovery-codes regenerate` subcommand does NOT exist
+  in this release — a follow-up ISSUE will land post-release. Plan
+  ahead: keep a margin of unused recovery codes if you anticipate
+  multiple rebinds (laptop migrations, encrypted-volume moves).
+- **`rebind-home` strict no-TTY policy** (D4=A) blocks legitimate
+  automation. Workaround: invoke the command in an interactive shell
+  on the destination machine.
+- **`home_canonical` is semipermanent.** Once stamped, the only way to
+  change it is `rebind-home` (which consumes a recovery code). Symlink
+  changes to the parent path will trip the load-time check.
+- **Linux / WSL canonicalize edge-cases** are tracked as
+  `pending-automation:linux-ci-matrix` and
+  `pending-automation:wsl-ci-matrix` in the KB. The macOS canonicalize
+  invariants are covered by `canonicalize_macos_volumes_and_users_paths`.
+
 ## [0.1.0-alpha.6] — 2026-05-07
 
 REQ-KVD-007 / ISSUE-KVD-CLI-018 — Allowlist YAML HMAC + TOCTOU cache fix

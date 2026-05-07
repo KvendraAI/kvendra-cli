@@ -10,8 +10,10 @@
 
 use crate::cli::config_approval::{ApprovalCommand, run as run_approval};
 use crate::cli::config_mcp_password::{McpPasswordCommand, run as run_mcp_password};
+use crate::cli::config_rebind::RebindHomeArgs;
 use crate::config::{Config, MasterPasswordCache, ensure_layout, kvendra_home};
 use crate::error::{KvendraError, KvendraResult};
+use crate::vault::Vault;
 use clap::Subcommand;
 
 const KEYCHAIN_SERVICE: &str = "kvendra";
@@ -28,6 +30,11 @@ pub enum ConfigCommand {
     /// Manage MCP password keychain pattern (REQ-KVD-005 / ISSUE-KVD-CLI-017).
     #[command(subcommand, name = "mcp-password")]
     McpPassword(McpPasswordCommand),
+    /// Rebind the vault to a new `KVENDRA_HOME` location with triple-barrier
+    /// verification (master password + recovery code + TTY confirmation).
+    /// Required after a legitimate move of `~/.kvendra/` (REQ-KVD-008).
+    #[command(name = "rebind-home")]
+    RebindHome(RebindHomeArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -43,44 +50,79 @@ pub enum KeychainCommand {
 pub async fn run(cmd: ConfigCommand) -> KvendraResult<()> {
     let home = kvendra_home()?;
     ensure_layout(&home)?;
-    let mut cfg = Config::load(&home).unwrap_or_default();
+
+    // Mutating subcommands need an unlocked vault to derive the config-HMAC
+    // sub-key (REQ-KVD-008). We unlock once at the dispatcher level.
     match cmd {
-        ConfigCommand::Keychain(KeychainCommand::Enable) => {
-            cfg.vault.master_password_cache = MasterPasswordCache::OsKeychain;
-            cfg.save(&home)?;
-            println!("OS keychain integration enabled.");
-            println!(
-                "WARNING: the derived key will be stored in the OS keychain on the next unlock."
-            );
-            println!("This relaxes the strict RAM-only invariant of the threat model (V4).");
-            println!("Disable at any time with `kvendra config keychain disable`.");
-        }
-        ConfigCommand::Keychain(KeychainCommand::Disable) => {
-            cfg.vault.master_password_cache = MasterPasswordCache::RamOnly;
-            cfg.save(&home)?;
-            // Best-effort delete of any stored entry.
-            if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_LABEL) {
-                let _ = entry.delete_credential();
-            }
-            println!("OS keychain integration disabled. Stored entry wiped.");
-        }
-        ConfigCommand::Keychain(KeychainCommand::Status) => {
-            println!(
-                "master_password_cache: {:?}",
-                cfg.vault.master_password_cache
-            );
-            match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_LABEL) {
-                Ok(entry) => match entry.get_password() {
-                    Ok(_) => println!("keychain entry: present"),
-                    Err(_) => println!("keychain entry: absent"),
-                },
-                Err(e) => println!("keychain backend: {e}"),
+        ConfigCommand::Keychain(sub) => {
+            let vault = unlock_for_config(&home)?;
+            let mut cfg = Config::load(&home, Some(&vault)).unwrap_or_default();
+            match sub {
+                KeychainCommand::Enable => {
+                    cfg.vault.master_password_cache = MasterPasswordCache::OsKeychain;
+                    cfg.save(&home, &vault)?;
+                    println!("OS keychain integration enabled.");
+                    println!(
+                        "WARNING: the derived key will be stored in the OS keychain on the next unlock."
+                    );
+                    println!(
+                        "This relaxes the strict RAM-only invariant of the threat model (V4)."
+                    );
+                    println!("Disable at any time with `kvendra config keychain disable`.");
+                }
+                KeychainCommand::Disable => {
+                    cfg.vault.master_password_cache = MasterPasswordCache::RamOnly;
+                    cfg.save(&home, &vault)?;
+                    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_LABEL) {
+                        let _ = entry.delete_credential();
+                    }
+                    println!("OS keychain integration disabled. Stored entry wiped.");
+                }
+                KeychainCommand::Status => {
+                    println!(
+                        "master_password_cache: {:?}",
+                        cfg.vault.master_password_cache
+                    );
+                    match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_LABEL) {
+                        Ok(entry) => match entry.get_password() {
+                            Ok(_) => println!("keychain entry: present"),
+                            Err(_) => println!("keychain entry: absent"),
+                        },
+                        Err(e) => println!("keychain backend: {e}"),
+                    }
+                }
             }
         }
         ConfigCommand::Approval(c) => return run_approval(c).await,
         ConfigCommand::McpPassword(c) => return run_mcp_password(c).await,
+        ConfigCommand::RebindHome(args) => {
+            return crate::cli::config_rebind::run(args).await;
+        }
     }
     Ok(())
+}
+
+/// Unlock the vault for a `kvendra config <...>` subcommand that mutates
+/// `~/.kvendra/config.toml`. The HKDF sub-key for HMAC signing only exists
+/// while the session is unlocked. `KVENDRA_PASSWORD` env var honoured for
+/// non-interactive use; otherwise prompts via `rpassword`.
+fn unlock_for_config(home: &std::path::Path) -> KvendraResult<Vault> {
+    let vault = Vault::new(home.to_path_buf());
+    if !vault.sentinel_path().exists() {
+        return Err(KvendraError::Vault(
+            "vault not initialized. Run `kvendra init` first.".into(),
+        ));
+    }
+    let password = match std::env::var("KVENDRA_PASSWORD") {
+        Ok(s) => s,
+        Err(_) => {
+            println!("Enter the master password (will not echo):");
+            rpassword::read_password()
+                .map_err(|e| KvendraError::Vault(format!("read password: {e}")))?
+        }
+    };
+    vault.unlock(password.as_bytes(), 30)?;
+    Ok(vault)
 }
 
 /// Helper used by `kvendra unlock`: persist derived key in OS keychain.
