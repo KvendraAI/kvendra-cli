@@ -9,6 +9,7 @@
 //!   the master password prompt.
 
 use crate::cli::config_approval::{ApprovalCommand, run as run_approval};
+use crate::cli::config_mcp_password::{McpPasswordCommand, run as run_mcp_password};
 use crate::config::{Config, MasterPasswordCache, ensure_layout, kvendra_home};
 use crate::error::{KvendraError, KvendraResult};
 use clap::Subcommand;
@@ -24,6 +25,9 @@ pub enum ConfigCommand {
     /// Manage approval layer (REQ-KVD-003 / ROAD-KVD-007).
     #[command(subcommand)]
     Approval(ApprovalCommand),
+    /// Manage `KVENDRA_MCP_PASSWORD` keychain pattern (REQ-KVD-006 / ISSUE-010).
+    #[command(subcommand, name = "mcp-password")]
+    McpPassword(McpPasswordCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -74,6 +78,7 @@ pub async fn run(cmd: ConfigCommand) -> KvendraResult<()> {
             }
         }
         ConfigCommand::Approval(c) => return run_approval(c).await,
+        ConfigCommand::McpPassword(c) => return run_mcp_password(c).await,
     }
     Ok(())
 }
