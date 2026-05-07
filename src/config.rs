@@ -4,9 +4,15 @@
 //! `idle_timeout_minutes` defaults to 30. Detection severity defaults to
 //! `warn` (REQ-KVD-002 AC-DET-2).
 
+use crate::approval::ApprovalMode;
 use crate::error::{KvendraError, KvendraResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// Floor del timeout configurable de approval (segundos).
+pub const APPROVAL_TIMEOUT_FLOOR_SECONDS: u32 = 5;
+/// Ceiling del timeout configurable de approval (segundos).
+pub const APPROVAL_TIMEOUT_CEILING_SECONDS: u32 = 600;
 
 /// Cache mode for the derived master key (ADR-KVD-012).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -33,6 +39,28 @@ pub enum DetectionSeverity {
 pub struct Config {
     pub vault: VaultConfig,
     pub detection: DetectionConfig,
+    pub approval: ApprovalConfig,
+}
+
+/// Configuración del approval layer (REQ-KVD-003).
+///
+/// Default: `ask-destructive`, timeout 30s, cache 5 min (ADR-KVD-013..016).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApprovalConfig {
+    pub mode: ApprovalMode,
+    pub timeout_seconds: u32,
+    pub cache_ttl_seconds: u32,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            mode: ApprovalMode::default(),
+            timeout_seconds: 30,
+            cache_ttl_seconds: 300,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +94,21 @@ impl Config {
         }
         let raw = std::fs::read_to_string(&path)?;
         let cfg: Config = toml::from_str(&raw).map_err(|e| KvendraError::Config(e.to_string()))?;
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Valida invariantes runtime que no captura `serde` (e.g. floor/ceiling
+    /// del timeout de approval).
+    pub fn validate(&self) -> KvendraResult<()> {
+        let t = self.approval.timeout_seconds;
+        if !(APPROVAL_TIMEOUT_FLOOR_SECONDS..=APPROVAL_TIMEOUT_CEILING_SECONDS).contains(&t) {
+            return Err(KvendraError::Config(format!(
+                "[approval].timeout_seconds={t} out of range [{}..={}]",
+                APPROVAL_TIMEOUT_FLOOR_SECONDS, APPROVAL_TIMEOUT_CEILING_SECONDS
+            )));
+        }
+        Ok(())
     }
 
     /// Persist to `~/.kvendra/config.toml`.

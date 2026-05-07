@@ -22,6 +22,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApprovalProfileOverride {
+    /// Override del modo de approval per-profile. Acepta `silent`, `ask` o
+    /// `ask-destructive`. Aplica sólo a este profile; resto sigue el global.
+    pub mode: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileSpec {
     pub profile_id: String,
@@ -30,6 +38,9 @@ pub struct ProfileSpec {
     pub expiration: Option<String>,
     #[serde(default = "default_audit_level")]
     pub audit_level: String,
+    /// Override del modo de approval per-profile (REQ-KVD-003).
+    #[serde(default)]
+    pub approval: Option<ApprovalProfileOverride>,
 }
 
 fn default_audit_level() -> String {
@@ -100,6 +111,10 @@ pub struct OperationConstraints {
     pub projects: Option<Vec<String>>,
     pub endpoints: Option<Vec<String>>,
     pub accept_broad_scope: Option<bool>,
+    /// Marca explícita de operación destructiva (REQ-KVD-003 / sister
+    /// ISSUE-KVD-CLI-012). Cuando es `true`, modo `ask-destructive` dispara
+    /// prompt. Ausencia = `false` (hasta que ISSUE-012 introduzca catalog).
+    pub destructive: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

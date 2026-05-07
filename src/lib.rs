@@ -11,6 +11,7 @@
 //! - [`error`] — unified `KvendraError` type.
 
 pub mod allowlist;
+pub mod approval;
 pub mod audit;
 pub mod cli;
 pub mod config;

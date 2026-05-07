@@ -68,6 +68,27 @@ impl JsonRpcResponse {
             }),
         }
     }
+
+    /// Variant de [`JsonRpcResponse::error`] que adjunta un payload `data`
+    /// estructurado per JSON-RPC 2.0 §5.1. Lo consume el approval layer
+    /// (REQ-KVD-003) para devolver `{ error_type, hint }` al cliente MCP.
+    pub fn error_with_data(
+        id: Option<Value>,
+        code: i32,
+        message: impl Into<String>,
+        data: Value,
+    ) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: Some(data),
+            }),
+        }
+    }
 }
 
 /// MCP `initialize` response payload.

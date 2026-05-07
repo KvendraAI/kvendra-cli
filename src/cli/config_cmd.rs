@@ -8,6 +8,7 @@
 //! - When `disable`d, the keychain entry is wiped and unlocks fall back to
 //!   the master password prompt.
 
+use crate::cli::config_approval::{ApprovalCommand, run as run_approval};
 use crate::config::{Config, MasterPasswordCache, ensure_layout, kvendra_home};
 use crate::error::{KvendraError, KvendraResult};
 use clap::Subcommand;
@@ -20,6 +21,9 @@ pub enum ConfigCommand {
     /// Manage OS keychain integration (ADR-KVD-012).
     #[command(subcommand)]
     Keychain(KeychainCommand),
+    /// Manage approval layer (REQ-KVD-003 / ROAD-KVD-007).
+    #[command(subcommand)]
+    Approval(ApprovalCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -69,6 +73,7 @@ pub async fn run(cmd: ConfigCommand) -> KvendraResult<()> {
                 Err(e) => println!("keychain backend: {e}"),
             }
         }
+        ConfigCommand::Approval(c) => return run_approval(c).await,
     }
     Ok(())
 }

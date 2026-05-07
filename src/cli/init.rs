@@ -186,12 +186,7 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
     // anchor the chain to the moment of initialisation rather than the
     // filesystem mtime of `audit.db` (mutable). ISSUE-KVD-CLI-003.
     let hmac_key = vault.audit_hmac_key_from_password(password.as_bytes())?;
-    write_vault_created_event(
-        &vault.audit_db_path(),
-        hmac_key,
-        env!("CARGO_PKG_VERSION"),
-    )
-    .await?;
+    write_vault_created_event(&vault.audit_db_path(), hmac_key, env!("CARGO_PKG_VERSION")).await?;
 
     println!("Vault initialized at {}", home.display());
     Ok(())

@@ -12,6 +12,7 @@
 //! starts, the dispatcher logs to stderr and refuses to record audit rows.
 
 use crate::allowlist::{ProfileSpec, check as allowlist_check, validate as allowlist_validate};
+use crate::approval::{self, ApprovalCache};
 use crate::audit::reader::args_hash_hex;
 use crate::audit::{AuditEvent, AuditWriter, Severity, Status};
 use crate::config::Config;
@@ -28,6 +29,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use time::OffsetDateTime;
+use tokio::sync::Mutex;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
@@ -36,6 +38,11 @@ pub struct ServerContext {
     pub vault: Vault,
     pub config: Config,
     pub writer: Option<AuditWriter>,
+    /// Approve-all-5min cache (REQ-KVD-003 / ADR-KVD-014). Per-profile, in-mem.
+    pub approval_cache: Arc<ApprovalCache>,
+    /// Serializa los prompts de approval concurrentes (REQ-KVD-003 risk
+    /// mitigation): solo un prompt activo a la vez.
+    pub approval_prompt_lock: Arc<Mutex<()>>,
 }
 
 /// Run the MCP server until the client disconnects (creates a fresh `Vault`
@@ -72,6 +79,8 @@ pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
         vault,
         config,
         writer,
+        approval_cache: Arc::new(ApprovalCache::new()),
+        approval_prompt_lock: Arc::new(Mutex::new(())),
     });
     let mut transport = StdioTransport::new();
 
@@ -214,6 +223,30 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             let msg = crate::detection::sanitize_output(&e.to_string());
             return JsonRpcResponse::error(id, codes::APPLICATION_ERROR, msg);
         }
+    }
+
+    // Approval layer (REQ-KVD-003 — gap V7 + O1.LLM-auto-approve del threat
+    // model). Se evalúa entre el enforcement de la allowlist y el record_audit
+    // Started: si la allowlist permite y el modo del approval bloquea, NO se
+    // emite Started (sólo una row Error con flag estructurada).
+    let approval_decision = approval::check(&ctx, name, &profile_id, &action, &arguments).await;
+    if let Some(flag) = approval_decision.audit_flag() {
+        flags.push(flag.into());
+    }
+    if approval_decision.blocks_dispatch() {
+        let _ = record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true).await;
+        let error_type = approval_decision.error_type().unwrap_or("approval_failed");
+        let hint = approval::hint_for(approval_decision, ctx.config.approval.timeout_seconds);
+        let data = serde_json::json!({
+            "error_type": error_type,
+            "hint": hint,
+        });
+        return JsonRpcResponse::error_with_data(
+            id,
+            codes::APPLICATION_ERROR,
+            format!("approval not granted: {error_type}"),
+            data,
+        );
     }
 
     // Started event. `0` indicates audit was disabled (vault locked).

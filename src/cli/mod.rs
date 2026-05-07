@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod completion;
+pub mod config_approval;
 pub mod config_cmd;
 pub mod dashboard;
 pub mod init;
