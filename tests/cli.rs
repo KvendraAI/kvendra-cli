@@ -241,6 +241,75 @@ fn secret_set_allowlist_unlocks_vault_via_env_var() {
     );
 }
 
+/// E2E regression for the bug uncovered by the alpha.8 smoke (caveat E2E-B-2):
+/// `Config::load(home, None)` returned `Err("cannot verify")` for any signed
+/// `config.toml` (every alpha.7+ vault), and `kvendra unlock` swallowed it via
+/// `unwrap_or_default()`. The fallback `Config::default()` clobbered every
+/// user-set preference (most notably `master_password_cache: os-keychain`),
+/// silently disabling the REQ-005 keychain fast-path from alpha.7 onwards.
+///
+/// The fix lets `Config::load(.., None)` parse signed configs without
+/// verifying — the post-unlock load (`Config::load(.., Some(&vault))`) still
+/// enforces the HMAC and home_canonical checks. This test drives the full
+/// `kvendra unlock` subprocess against a vault with `os-keychain` selected
+/// and asserts that the cache mode survives the bootstrap path.
+///
+/// Slow (Argon2id high-cost on init); opt-in with `cargo test -- --include-ignored`.
+#[cfg(unix)]
+#[test]
+#[ignore = "slow argon2 cost — opt-in via `cargo test -- --include-ignored`"]
+fn unlock_preserves_user_preferences_from_signed_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    Command::cargo_bin("kvendra")
+        .unwrap()
+        .args(["init", "--no-verify"])
+        .env("KVENDRA_HOME", home)
+        .env("KVENDRA_INIT_PASSWORD", "hunter2-pref-preservation")
+        .env("KVENDRA_INIT_CONFIRM_CODE", "0")
+        .assert()
+        .success();
+    // Flip master_password_cache to os-keychain via the CLI subcommand
+    // (this is the same path a real user would take).
+    Command::cargo_bin("kvendra")
+        .unwrap()
+        .args(["config", "keychain", "enable"])
+        .env("KVENDRA_HOME", home)
+        .env("KVENDRA_PASSWORD", "hunter2-pref-preservation")
+        .assert()
+        .success();
+    // Confirm that the signed config really has the new cache mode (sanity).
+    let cfg = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(
+        cfg.contains("master_password_cache = \"os-keychain\""),
+        "config.toml did not flip cache mode: {cfg}"
+    );
+    // The pre-fix bug: `kvendra unlock` would reload the signed config with
+    // None vault, hit "cannot verify", and revert the cache mode to RamOnly.
+    // Post-fix: unlock should preserve the os-keychain setting through the
+    // bootstrap path. We assert that by verifying the post-unlock keychain
+    // status reports the user's preference correctly (not the default).
+    Command::cargo_bin("kvendra")
+        .unwrap()
+        .args(["unlock"])
+        .env("KVENDRA_HOME", home)
+        .env("KVENDRA_PASSWORD", "hunter2-pref-preservation")
+        .assert()
+        .success();
+    let assert = Command::cargo_bin("kvendra")
+        .unwrap()
+        .args(["config", "keychain", "status"])
+        .env("KVENDRA_HOME", home)
+        .env("KVENDRA_PASSWORD", "hunter2-pref-preservation")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("OsKeychain"),
+        "post-unlock cache mode reverted to RamOnly (E2E-B-2 regression): {stdout}"
+    );
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn config_mcp_password_enable_rejects_on_non_macos() {

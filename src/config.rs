@@ -135,35 +135,54 @@ impl Config {
         let (signed_payload, trailer_hmac) = strip_hmac_trailer(&raw);
 
         if let Some(hmac_hex) = trailer_hmac.as_deref() {
-            // Signed document. Require an unlocked vault so we can verify.
-            let v = vault.ok_or_else(|| {
-                KvendraError::Config(
-                    "config.toml is signed but vault is locked — cannot verify".into(),
-                )
-            })?;
-            let key = v.config_hmac_key()?;
-            let expected = crate::vault::compute_config_hmac(&key, signed_payload.as_bytes());
-            use subtle::ConstantTimeEq;
-            if expected.as_bytes().ct_eq(hmac_hex.as_bytes()).unwrap_u8() == 0 {
-                tracing::error!(
+            // Signed document. If we have an unlocked vault, verify; otherwise
+            // (pre-unlock bootstrap path — `kvendra unlock` itself, `mcp serve`
+            // before unlock, etc.) read the user preferences unverified and
+            // defer the verify to the post-unlock load. The post-unlock load
+            // (with `Some(&vault)`) is what actually rejects tampered configs;
+            // the pre-unlock read is best-effort for bootstrap settings only.
+            //
+            // Why: returning Err on signed-but-vault-locked silently broke
+            // `master_password_cache: os-keychain` (REQ-005) in alpha.7 — the
+            // caller's `unwrap_or_default()` swallowed the error and reverted
+            // every user-set preference to the hard-coded default, disabling
+            // the keychain fast-path without a warning. See E2E-B-2 finding.
+            if let Some(v) = vault {
+                let key = v.config_hmac_key()?;
+                let expected = crate::vault::compute_config_hmac(&key, signed_payload.as_bytes());
+                use subtle::ConstantTimeEq;
+                if expected.as_bytes().ct_eq(hmac_hex.as_bytes()).unwrap_u8() == 0 {
+                    tracing::error!(
+                        target: "kvendra::config",
+                        flag = "config_tampered_detected",
+                        "~/.kvendra/config.toml HMAC mismatch — refusing to start"
+                    );
+                    return Err(KvendraError::Config(
+                        "config_tampered_detected: ~/.kvendra/config.toml HMAC mismatch. \
+                         Refusing to start. Re-run a `kvendra config <subcommand>` to re-sign \
+                         or restore from backup."
+                            .into(),
+                    ));
+                }
+            } else {
+                tracing::debug!(
                     target: "kvendra::config",
-                    flag = "config_tampered_detected",
-                    "~/.kvendra/config.toml HMAC mismatch — refusing to start"
+                    "loading signed config without HMAC verify (vault locked) — \
+                     verify deferred to post-unlock"
                 );
-                return Err(KvendraError::Config(
-                    "config_tampered_detected: ~/.kvendra/config.toml HMAC mismatch. \
-                     Refusing to start. Re-run a `kvendra config <subcommand>` to re-sign \
-                     or restore from backup."
-                        .into(),
-                ));
             }
         }
 
         let cfg: Config = toml::from_str(&raw).map_err(|e| KvendraError::Config(e.to_string()))?;
         cfg.validate()?;
 
-        // AC-CONFIG-HMAC-3 — home_canonical comparison.
-        if let Some(signed_home) = cfg.vault.home_canonical.as_deref() {
+        // AC-CONFIG-HMAC-3 — home_canonical comparison. Only enforced when we
+        // have a vault (i.e. the HMAC was actually verified above). Pre-unlock
+        // we cannot trust the signed_home, so the redirect check is deferred
+        // to the post-unlock load.
+        if vault.is_some()
+            && let Some(signed_home) = cfg.vault.home_canonical.as_deref()
+        {
             let actual = std::fs::canonicalize(home).map_err(|e| {
                 KvendraError::Config(format!("canonicalize home '{}': {e}", home.display()))
             })?;

@@ -5,6 +5,52 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
+## [0.1.0-alpha.9] — 2026-05-07
+
+E2E smoke regression fix uncovered while validating the alpha.7+ bundle
+on a clean vault with `master_password_cache: os-keychain`. REQ-008
+(alpha.7) introduced HMAC verification in `Config::load`, which in turn
+caused every pre-unlock load (`Config::load(home, None)`) to return
+`Err("cannot verify")` for any signed `config.toml`. Callers swallowed
+the error via `unwrap_or_default()`, reverting **every user-set
+preference** (most visibly `master_password_cache: os-keychain`) to the
+hard-coded default, silently disabling the REQ-005 keychain fast-path
+from alpha.7 onwards. The bug went unnoticed because no automated test
+exercised the full `kvendra unlock` subprocess against a vault with
+non-default preferences.
+
+### Fixed
+
+- `Config::load(home, None)` now parses signed configs without verifying
+  the HMAC trailer (a `tracing::debug!` line records the deferral). The
+  post-unlock load (`Config::load(home, Some(&vault))`) still enforces
+  the HMAC and the `home_canonical` redirect check, so tampering is
+  caught the moment the vault becomes available. Pre-unlock callers can
+  read user preferences (`master_password_cache`, `idle_timeout_minutes`)
+  from the signed config without hitting the soft-error fallback.
+- The `home_canonical` redirect check is now gated on `vault.is_some()`
+  for the same reason: pre-unlock the signed value cannot be trusted, so
+  the check is deferred to the post-unlock load.
+
+### Added
+
+- Slow integration test `unlock_preserves_user_preferences_from_signed_config`
+  in `tests/cli.rs` (gated by `#[ignore]`). Drives a full `init` → `config
+  keychain enable` → `unlock` → `config keychain status` subprocess chain
+  and asserts that the user's `OsKeychain` preference survives the
+  bootstrap path. This is the test that would have caught the regression.
+
+### Notes
+
+- All bundle invariants from REQ-005..008 remain intact: tampered configs
+  are still rejected at the post-unlock load (E2 of the smoke), and the
+  KVENDRA_HOME-redirect attack is still blocked at the same point (E3).
+  The pre-unlock window is best-effort for bootstrap settings and does
+  not relax the threat model: an attacker who tampers `master_password_cache`
+  to `OsKeychain` cannot read the keychain entry without Touch ID, and
+  any tampering of `idle_timeout_minutes` is caught at the post-unlock
+  verify before the broker accepts traffic.
+
 ## [0.1.0-alpha.8] — 2026-05-07
 
 E2E smoke fix uncovered while validating the alpha.7 bundle on a clean
