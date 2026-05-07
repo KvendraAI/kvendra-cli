@@ -183,20 +183,67 @@ async fn add_topics(
     token: &str,
     op_args: &Value,
 ) -> KvendraResult<Value> {
+    // ISSUE-KVD-CLI-013 — `add_topics` debe APPENDEAR, no reemplazar. El
+    // endpoint REST de GitHub (`PUT /repos/{owner}/{repo}/topics`) reemplaza
+    // la lista entera; lo combinamos con un GET previo y mezcla unique para
+    // honrar la semántica del nombre del primitive.
     let (owner, repo) = parse_owner_repo(op_args)?;
-    let topics = op_args
+    let new_topics = op_args
         .get("topics")
         .and_then(Value::as_array)
         .ok_or_else(|| KvendraError::InvalidArgs("add_topics.topics required (array)".into()))?;
     let url = format!("{GH_API}/repos/{owner}/{repo}/topics");
+
+    let existing_resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await?;
+    let existing_status = existing_resp.status();
+    if !existing_status.is_success() {
+        let body: Value = existing_resp.json().await.unwrap_or(Value::Null);
+        return Ok(json!({
+            "operation": "add_topics",
+            "status_code": existing_status.as_u16(),
+            "success": false,
+            "phase": "fetch_existing_topics",
+            "response": body,
+        }));
+    }
+    let existing_body: Value = existing_resp.json().await.unwrap_or(Value::Null);
+    let existing_topics: Vec<Value> = existing_body
+        .get("names")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let merged = merge_topics_unique(&existing_topics, new_topics);
+
     let resp = client
         .put(&url)
         .bearer_auth(token)
         .header("Accept", "application/vnd.github+json")
-        .json(&json!({ "names": topics }))
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&json!({ "names": merged }))
         .send()
         .await?;
     finalize("add_topics", resp).await
+}
+
+/// Mezcla `existing` y `new_topics` preservando el orden de `existing`
+/// y deduplicando por valor de string.
+fn merge_topics_unique(existing: &[Value], new_topics: &[Value]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(existing.len() + new_topics.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for v in existing.iter().chain(new_topics.iter()) {
+        let Some(s) = v.as_str() else { continue };
+        if seen.insert(s.to_string()) {
+            out.push(Value::String(s.to_string()));
+        }
+    }
+    out
 }
 
 async fn finalize(operation: &str, resp: reqwest::Response) -> KvendraResult<Value> {
@@ -208,4 +255,56 @@ async fn finalize(operation: &str, resp: reqwest::Response) -> KvendraResult<Val
         "success": status.is_success(),
         "response": body,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &str) -> Value {
+        Value::String(v.into())
+    }
+
+    #[test]
+    fn merge_appends_new_to_existing_preserving_order() {
+        let existing = vec![s("cli"), s("developer-tools"), s("kvendra")];
+        let new_topics = vec![s("mcp")];
+        let out = merge_topics_unique(&existing, &new_topics);
+        assert_eq!(
+            out,
+            vec![s("cli"), s("developer-tools"), s("kvendra"), s("mcp")]
+        );
+    }
+
+    #[test]
+    fn merge_dedups_when_new_already_present() {
+        let existing = vec![s("cli"), s("kvendra")];
+        let new_topics = vec![s("kvendra"), s("rust")];
+        let out = merge_topics_unique(&existing, &new_topics);
+        assert_eq!(out, vec![s("cli"), s("kvendra"), s("rust")]);
+    }
+
+    #[test]
+    fn merge_skips_non_string_values() {
+        let existing = vec![s("cli"), Value::Number(42.into())];
+        let new_topics = vec![s("rust"), Value::Bool(true)];
+        let out = merge_topics_unique(&existing, &new_topics);
+        assert_eq!(out, vec![s("cli"), s("rust")]);
+    }
+
+    #[test]
+    fn merge_with_empty_existing_returns_new_topics_unique() {
+        let existing: Vec<Value> = vec![];
+        let new_topics = vec![s("a"), s("b"), s("a")];
+        let out = merge_topics_unique(&existing, &new_topics);
+        assert_eq!(out, vec![s("a"), s("b")]);
+    }
+
+    #[test]
+    fn merge_with_empty_new_returns_existing_unchanged() {
+        let existing = vec![s("cli"), s("rust")];
+        let new_topics: Vec<Value> = vec![];
+        let out = merge_topics_unique(&existing, &new_topics);
+        assert_eq!(out, vec![s("cli"), s("rust")]);
+    }
 }
