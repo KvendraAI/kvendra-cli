@@ -117,6 +117,7 @@ fn kvendra_home_perms_are_0700_and_files_are_0600() {
         expiration: None,
         unsafe_raw_token_enabled: false,
         quarantined: false,
+        allowlist_hmac_hex: None,
     })
     .unwrap();
     let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;

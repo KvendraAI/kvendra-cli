@@ -36,6 +36,11 @@ pub enum KvendraError {
     #[error("allowlist violation: {0}")]
     AllowlistViolation(String),
 
+    #[error(
+        "allowlist for profile '{0}' has been tampered — re-run `kvendra secret set-allowlist`"
+    )]
+    AllowlistTampered(String),
+
     #[error("profile not found")]
     ProfileNotFound,
 

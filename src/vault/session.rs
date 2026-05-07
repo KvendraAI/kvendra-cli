@@ -19,6 +19,12 @@ type HmacSha256 = Hmac<Sha256>;
 /// HKDF info string for the audit-HMAC sub-key (per ADR-KVD-010 + ADR-KVD-012).
 pub const HKDF_INFO_AUDIT_HMAC: &[u8] = b"kvendra/audit-hmac/v1";
 
+/// HKDF info string for the allowlist-HMAC sub-key (per REQ-KVD-007 / ISSUE-018).
+/// Used to sign profile allowlist YAML files so a tampered file is detected
+/// at runtime by `enforce_allowlist`. Naming follows the canonical convention
+/// `kvendra/<purpose>/v<N>` (will be formalized in ADR-KVD-022).
+pub const HKDF_INFO_ALLOWLIST_HMAC: &[u8] = b"kvendra/allowlist-hmac/v1";
+
 /// 32-byte sub-key wrapper, zeroized on drop.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct DerivedSubKey(pub [u8; 32]);
@@ -53,6 +59,7 @@ pub fn hkdf_expand(key: &[u8; 32], info: &[u8]) -> DerivedSubKey {
 pub struct SessionKey {
     inner: Inner,
     audit_hmac_key: DerivedSubKey,
+    allowlist_hmac_key: DerivedSubKey,
     idle_timeout: Duration,
     last_used: Instant,
 }
@@ -65,11 +72,13 @@ struct Inner {
 impl SessionKey {
     pub fn new(derived: DerivedKey, idle_timeout_minutes: u32) -> Self {
         let audit_hmac_key = hkdf_expand(derived.as_bytes(), HKDF_INFO_AUDIT_HMAC);
+        let allowlist_hmac_key = hkdf_expand(derived.as_bytes(), HKDF_INFO_ALLOWLIST_HMAC);
         Self {
             inner: Inner {
                 key: *derived.as_bytes(),
             },
             audit_hmac_key,
+            allowlist_hmac_key,
             idle_timeout: Duration::from_secs(u64::from(idle_timeout_minutes) * 60),
             last_used: Instant::now(),
         }
@@ -98,6 +107,14 @@ impl SessionKey {
             return Err(KvendraError::VaultLocked);
         }
         Ok(&self.audit_hmac_key)
+    }
+
+    /// Get the derived allowlist-HMAC sub-key (per REQ-KVD-007 / ISSUE-018).
+    pub fn allowlist_hmac_key(&self) -> KvendraResult<&DerivedSubKey> {
+        if self.is_expired() {
+            return Err(KvendraError::VaultLocked);
+        }
+        Ok(&self.allowlist_hmac_key)
     }
 
     pub fn is_expired(&self) -> bool {
@@ -141,5 +158,17 @@ mod tests {
         let a = hkdf_expand(&[7u8; 32], HKDF_INFO_AUDIT_HMAC);
         let b = hkdf_expand(&[8u8; 32], HKDF_INFO_AUDIT_HMAC);
         assert_ne!(a.as_bytes(), b.as_bytes());
+    }
+
+    #[test]
+    fn audit_and_allowlist_subkeys_differ_for_same_session_key() {
+        let k = [42u8; 32];
+        let a = hkdf_expand(&k, HKDF_INFO_AUDIT_HMAC);
+        let b = hkdf_expand(&k, HKDF_INFO_ALLOWLIST_HMAC);
+        assert_ne!(
+            a.as_bytes(),
+            b.as_bytes(),
+            "audit and allowlist sub-keys must differ for the same session key (domain separation)"
+        );
     }
 }

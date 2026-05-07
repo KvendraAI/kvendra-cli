@@ -173,6 +173,7 @@ async fn add(vault: &Vault, home: &Path, args: AddArgs) -> KvendraResult<()> {
         expiration: args.expiration,
         unsafe_raw_token_enabled: args.unsafe_raw_token_enabled,
         quarantined: false,
+        allowlist_hmac_hex: None,
     };
     vault.save_profile_meta(&meta)?;
 
@@ -224,9 +225,18 @@ fn set_allowlist(vault: &Vault, args: SetAllowlistArgs) -> KvendraResult<()> {
     allowlist_validate(&spec)?;
     crate::config::create_dir_secure(&vault.allowlists_dir())?;
     let target = vault.profile_allowlist_path(&args.profile_id);
-    std::fs::write(&target, raw)?;
+    std::fs::write(&target, &raw)?;
     crate::config::set_file_mode_secure(&target)?;
-    println!("Allowlist for '{}' set.", args.profile_id);
+
+    // REQ-KVD-007 / ISSUE-018: persist HMAC of the YAML so the runtime can
+    // detect tampering. Requires the vault to be unlocked.
+    let key = vault.allowlist_hmac_key()?;
+    let hmac_hex = crate::vault::compute_allowlist_hmac(&key, raw.as_bytes());
+    let mut profile = vault.load_profile_meta(&args.profile_id)?;
+    profile.allowlist_hmac_hex = Some(hmac_hex);
+    vault.save_profile_meta(&profile)?;
+
+    println!("Allowlist for '{}' set (HMAC persisted).", args.profile_id);
     Ok(())
 }
 

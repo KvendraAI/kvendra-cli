@@ -36,6 +36,12 @@ pub struct Profile {
     /// (REQ-KVD-002 AC-DET-3 — Block severity quarantines the profile).
     #[serde(default)]
     pub quarantined: bool,
+    /// HMAC of the allowlist YAML at the time it was last persisted via
+    /// `kvendra secret set-allowlist`. Verified on every `tools/call` to
+    /// detect L1 tampering of `~/.kvendra/allowlists/<id>.yaml` (REQ-KVD-007 /
+    /// ISSUE-018). `None` for legacy profiles (auto-migrated on first read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowlist_hmac_hex: Option<String>,
 }
 
 /// Plaintext secret material — zeroized on drop.
@@ -330,6 +336,14 @@ impl Vault {
         Ok(session.audit_hmac_key()?.to_vec())
     }
 
+    /// Get the allowlist-HMAC sub-key (HKDF from session key). Errors if locked.
+    /// Per REQ-KVD-007 / ISSUE-018 — used to sign profile allowlist YAML files.
+    pub fn allowlist_hmac_key(&self) -> KvendraResult<Vec<u8>> {
+        let g = self.session.lock().expect("session mutex poisoned");
+        let session = g.as_ref().ok_or(KvendraError::VaultLocked)?;
+        Ok(session.allowlist_hmac_key()?.to_vec())
+    }
+
     /// Re-derive the audit-HMAC sub-key from the master password without
     /// touching the in-memory session. Used by `kvendra audit verify` so a
     /// CLI invocation that does not share a process with `mcp serve` can
@@ -372,6 +386,21 @@ impl Vault {
         }
         Ok(())
     }
+}
+
+/// Compute the HMAC-SHA256 of an allowlist YAML's raw bytes using the
+/// supplied allowlist sub-key (REQ-KVD-007 / ISSUE-018). The hash is over
+/// the file's exact byte content — any change (whitespace, comments, line
+/// endings) is detected. The supported path to update an allowlist is
+/// `kvendra secret set-allowlist <profile> --file <yaml>`; manual editing
+/// of `~/.kvendra/allowlists/<id>.yaml` is intentionally not supported and
+/// will trip `enforce_allowlist`.
+pub fn compute_allowlist_hmac(key: &[u8], raw_yaml: &[u8]) -> String {
+    use ::hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC accepts arbitrary key length");
+    mac.update(raw_yaml);
+    hex::encode(mac.finalize().into_bytes())
 }
 
 impl From<KvendraError> for std::io::Error {
@@ -472,5 +501,45 @@ mod tests {
         v.create_with_params(b"correct-pw", fast_params()).unwrap();
         let r = v.audit_hmac_key_from_password(b"wrong-pw");
         assert!(matches!(r, Err(KvendraError::InvalidMasterPassword)));
+    }
+
+    /// REQ-KVD-007 AC-1 — `compute_allowlist_hmac` is deterministic: the
+    /// same key + bytes always yield the same hex digest. Required for the
+    /// verify-on-read invariant in `enforce_allowlist`.
+    #[test]
+    fn compute_allowlist_hmac_is_deterministic() {
+        let key = [7u8; 32];
+        let raw = b"version: 1\nprofile_id: p\n";
+        let a = compute_allowlist_hmac(&key, raw);
+        let b = compute_allowlist_hmac(&key, raw);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64, "SHA-256 hex digest is 64 chars");
+    }
+
+    /// REQ-KVD-007 AC-3 — any change to the YAML byte content must change
+    /// the HMAC, so a tampered allowlist is detected on next read.
+    #[test]
+    fn compute_allowlist_hmac_differs_on_content_change() {
+        let key = [7u8; 32];
+        let original = b"version: 1\nprofile_id: p\n";
+        let tampered = b"version: 1\nprofile_id: p\n# extra\n";
+        assert_ne!(
+            compute_allowlist_hmac(&key, original),
+            compute_allowlist_hmac(&key, tampered),
+        );
+    }
+
+    /// REQ-KVD-007 — different sub-keys must yield different HMACs even on
+    /// identical content. Domain separation between `audit-hmac/v1` and
+    /// `allowlist-hmac/v1` is what makes the threat model L1 isolation hold.
+    #[test]
+    fn compute_allowlist_hmac_differs_on_key_change() {
+        let raw = b"version: 1\nprofile_id: p\n";
+        let key_a = [1u8; 32];
+        let key_b = [2u8; 32];
+        assert_ne!(
+            compute_allowlist_hmac(&key_a, raw),
+            compute_allowlist_hmac(&key_b, raw),
+        );
     }
 }

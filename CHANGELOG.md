@@ -5,6 +5,73 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
+## [0.1.0-alpha.6] — 2026-05-07
+
+REQ-KVD-007 / ISSUE-KVD-CLI-018 — Allowlist YAML HMAC + TOCTOU cache fix
+(3/4 of ROAD-KVD-008 bundle). Closes GAPs 3 and 4 of the L1 threat model:
+out-of-band edits of `~/.kvendra/allowlists/<id>.yaml` are now detected on
+every `tools/call`, and the `[a]pprove-all-5min` cache is keyed on the
+allowlist's HMAC so any file modification invalidates the cached approval
+within the TTL window.
+
+### Changed
+
+- **`ApprovalCache::{lookup, approve, revoke}` signature** now takes
+  `ApprovalCacheKey { profile_id, allowlist_hmac_hex }` (struct key)
+  instead of `&str`. Internal API — no end-user impact, but cache hits
+  now require an exact match on both the profile id and the HMAC of the
+  allowlist YAML at the moment the entry was inserted.
+
+### Added
+
+- HKDF sub-key `kvendra/allowlist-hmac/v1` derived from the unlocked
+  session key (parallel to `kvendra/audit-hmac/v1`). Domain-separated
+  from the audit HMAC, so a leak of one cannot forge the other.
+- New field `Profile.allowlist_hmac_hex: Option<String>` persisted in
+  `~/.kvendra/profiles/<id>.json`. `#[serde(default)]` keeps profiles
+  written by older binaries loadable.
+- `kvendra::vault::compute_allowlist_hmac(key, raw_yaml)` — single
+  source of truth for the HMAC over the YAML's raw bytes (no
+  parse / re-serialize, no whitespace normalization).
+- `Vault::allowlist_hmac_key()` accessor.
+- `enforce_allowlist` re-computes the HMAC of the YAML on disk and
+  compares it against the value stored in the profile meta. Mismatch
+  returns `KvendraError::AllowlistTampered(profile_id)` and emits a
+  structured tracing log with `flag = "allowlist_tampered_detected"`.
+- **JSON-RPC `error_type: "allowlist_tampered"`** distinct from the
+  existing `allowlist_violation`. The error data includes a hint
+  pointing the operator to `kvendra secret set-allowlist <profile>
+  --file <yaml>` or a backup restore.
+- New canonical audit flags: `allowlist_tampered_detected` (severity
+  `error`, recorded when the HMAC verify fails) and
+  `allowlist_hmac_migrated` (info-level tracing line emitted on
+  first read of a legacy profile).
+- **Auto-migration on first read.** Profiles persisted by an older
+  binary load with `allowlist_hmac_hex = None`; the first
+  `tools/call` against such a profile signs the current YAML with the
+  freshly derived sub-key and writes the HMAC back to the meta.
+  Silent — no operator action required. Trust caveat: any tampering
+  that occurred before the migration is implicitly accepted as the
+  signed baseline. Operators with security-sensitive workloads
+  should re-run `kvendra secret set-allowlist` after upgrading to
+  rebaseline from a known-good YAML.
+
+### Tests
+
+- 13 new tests for REQ-KVD-007 covering the HMAC determinism /
+  domain-separation invariants, the verify path (allow / reject /
+  auto-migrate / no-op), the TOCTOU cache fix, audit-chain integrity
+  in the presence of an `allowlist_tampered_detected` row, and
+  backward-compat of the legacy meta JSON shape.
+
+### Caveats
+
+- Manual editing of `~/.kvendra/allowlists/<id>.yaml` is intentionally
+  not supported and will trip `enforce_allowlist`. The supported path
+  is `kvendra secret set-allowlist <profile> --file <yaml>`.
+- The HMAC is over the file's exact raw bytes — comments, trailing
+  whitespace, and line-ending differences all change the signature.
+
 ## [0.1.0-alpha.5] — 2026-05-07
 
 REQ-KVD-006 / ISSUE-KVD-CLI-020 closure (2/4 of ROAD-KVD-008 bundle).

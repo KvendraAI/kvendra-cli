@@ -30,7 +30,7 @@ use serde_json::Value;
 use std::time::Duration;
 use time::OffsetDateTime;
 
-pub use cache::{ApprovalCache, DEFAULT_TTL_SECONDS};
+pub use cache::{ApprovalCache, ApprovalCacheKey, DEFAULT_TTL_SECONDS};
 
 const ARGS_SUMMARY_MAX_CHARS: usize = 80;
 
@@ -208,8 +208,32 @@ pub async fn check(
         return ApprovalDecision::Silent;
     }
 
+    // REQ-KVD-007 / ISSUE-018: cache key compose with the allowlist YAML's
+    // current HMAC so any modification of the file invalidates the cache
+    // automatically (TOCTOU fix). When the vault is locked or the YAML is
+    // missing, the HMAC is empty — the cache key still works but loses the
+    // tampering guarantee for that call (audit log will surface the locked
+    // state via existing flags).
+    let allowlist_hmac_hex = if profile_id.is_empty() {
+        String::new()
+    } else {
+        let path = ctx.vault.profile_allowlist_path(profile_id);
+        if path.exists() {
+            match (
+                std::fs::read_to_string(&path),
+                ctx.vault.allowlist_hmac_key(),
+            ) {
+                (Ok(raw), Ok(key)) => crate::vault::compute_allowlist_hmac(&key, raw.as_bytes()),
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        }
+    };
+    let cache_key = ApprovalCacheKey::new(profile_id, &allowlist_hmac_hex);
+
     if !profile_id.is_empty()
-        && let Some(_remaining) = ctx.approval_cache.lookup(profile_id).await
+        && let Some(_remaining) = ctx.approval_cache.lookup(&cache_key).await
     {
         return ApprovalDecision::CacheHit;
     }
@@ -244,7 +268,7 @@ pub async fn check(
         ApprovalDecision::GrantedAllForFiveMin | ApprovalDecision::BiometricGranted
     ) && !profile_id.is_empty()
     {
-        ctx.approval_cache.approve(profile_id, cache_ttl).await;
+        ctx.approval_cache.approve(cache_key, cache_ttl).await;
     }
 
     decision

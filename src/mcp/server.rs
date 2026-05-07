@@ -220,13 +220,32 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
 
     // Allowlist enforcement (when a profile metadata + allowlist exists).
     if !profile_id.is_empty() {
-        if let Err(e) = enforce_allowlist(&ctx, &profile_id, name, &action, &arguments) {
-            let _ = record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true).await;
-            // AC-MCP-3 defence in depth: the error string can include the
-            // primitive's argv / parsed YAML on certain code paths, which
-            // could carry leaked tokens. Always scrub before returning.
-            let msg = crate::detection::sanitize_output(&e.to_string());
-            return JsonRpcResponse::error(id, codes::APPLICATION_ERROR, msg);
+        match enforce_allowlist(&ctx, &profile_id, name, &action, &arguments) {
+            Ok(()) => {}
+            Err(KvendraError::AllowlistTampered(pid)) => {
+                flags.push("allowlist_tampered_detected".into());
+                let _ =
+                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true).await;
+                let data = serde_json::json!({
+                    "error_type": "allowlist_tampered",
+                    "hint": "re-run `kvendra secret set-allowlist <profile> --file <yaml>` or restore from backup",
+                });
+                return JsonRpcResponse::error_with_data(
+                    id,
+                    codes::APPLICATION_ERROR,
+                    format!("allowlist for profile '{pid}' has been tampered"),
+                    data,
+                );
+            }
+            Err(e) => {
+                let _ =
+                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true).await;
+                // AC-MCP-3 defence in depth: the error string can include the
+                // primitive's argv / parsed YAML on certain code paths, which
+                // could carry leaked tokens. Always scrub before returning.
+                let msg = crate::detection::sanitize_output(&e.to_string());
+                return JsonRpcResponse::error(id, codes::APPLICATION_ERROR, msg);
+            }
         }
     }
 
@@ -396,6 +415,37 @@ fn enforce_allowlist(
         return Ok(());
     }
     let raw = std::fs::read_to_string(&path)?;
+
+    // REQ-KVD-007 / ISSUE-018: verify HMAC of the YAML against the value
+    // persisted in ProfileMeta. Mismatch → reject + audit. Missing HMAC
+    // (legacy profile) → auto-sign on first read post-update (D4 silent).
+    let key = ctx.vault.allowlist_hmac_key()?;
+    let current_hmac = crate::vault::compute_allowlist_hmac(&key, raw.as_bytes());
+    let mut profile = ctx.vault.load_profile_meta(profile_id)?;
+    match profile.allowlist_hmac_hex.as_deref() {
+        Some(stored) if stored == current_hmac => { /* OK, continue */ }
+        Some(_stored) => {
+            tracing::error!(
+                target: "kvendra::mcp",
+                flag = "allowlist_tampered_detected",
+                profile_id,
+                "Allowlist HMAC mismatch — refusing to use modified allowlist"
+            );
+            return Err(KvendraError::AllowlistTampered(profile_id.to_string()));
+        }
+        None => {
+            // Migration on first read (REQ-KVD-007 AC-6, D4 silent).
+            profile.allowlist_hmac_hex = Some(current_hmac);
+            ctx.vault.save_profile_meta(&profile)?;
+            tracing::info!(
+                target: "kvendra::mcp",
+                flag = "allowlist_hmac_migrated",
+                profile_id,
+                "Auto-signed legacy allowlist on first read post-REQ-007"
+            );
+        }
+    }
+
     let spec: ProfileSpec = serde_yml::from_str(&raw)?;
     allowlist_validate(&spec)?;
     allowlist_check(&spec, primitive, operation, arguments)?;
@@ -426,6 +476,156 @@ async fn invoke_primitive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::ApprovalCache;
+    use crate::vault::{Profile, kdf::KdfParams};
+    use std::sync::Arc;
+
+    fn fast_params() -> KdfParams {
+        KdfParams {
+            m_cost_kib: 19_456,
+            t_cost: 2,
+            p_cost: 1,
+            salt: vec![1u8; 16],
+        }
+    }
+
+    /// Helper used by the `enforce_allowlist` test trio below: builds an
+    /// unlocked Vault with a profile + allowlist YAML on disk + minimal
+    /// `ServerContext`. No audit writer is attached (the tests exercise the
+    /// HMAC verification path only).
+    fn fixture_with_allowlist(yaml: &str) -> (tempfile::TempDir, ServerContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-allowlist-test", fast_params())
+            .unwrap();
+        v.unlock(b"hunter2-allowlist-test", 30).unwrap();
+        v.put_secret("p", b"sometoken").unwrap();
+        v.save_profile_meta(&Profile {
+            profile_id: "p".into(),
+            secret_type: "github_pat".into(),
+            created_at: "2026-05-07T00:00:00Z".into(),
+            expiration: None,
+            unsafe_raw_token_enabled: false,
+            quarantined: false,
+            allowlist_hmac_hex: None,
+        })
+        .unwrap();
+        let allowlist_path = v.profile_allowlist_path("p");
+        std::fs::write(&allowlist_path, yaml).unwrap();
+        let key = v.allowlist_hmac_key().unwrap();
+        let hmac_hex = crate::vault::compute_allowlist_hmac(&key, yaml.as_bytes());
+        let mut profile = v.load_profile_meta("p").unwrap();
+        profile.allowlist_hmac_hex = Some(hmac_hex);
+        v.save_profile_meta(&profile).unwrap();
+
+        let ctx = ServerContext {
+            vault: v,
+            config: Config::default(),
+            writer: None,
+            approval_cache: Arc::new(ApprovalCache::new()),
+            approval_prompt_lock: Arc::new(Mutex::new(())),
+            transport: Transport::Mcp,
+        };
+        (dir, ctx)
+    }
+
+    const TEST_ALLOWLIST_YAML: &str = "profile_id: p\nsecret:\n  type: github_pat\nallowlist:\n  primitives:\n    - name: kvendra.shell\n      operations:\n        - run:\n            binaries: [\"echo\"]\n";
+
+    /// REQ-KVD-007 AC-2 — a YAML matching the persisted HMAC must pass.
+    #[test]
+    fn enforce_allowlist_passes_on_match() {
+        let (_dir, ctx) = fixture_with_allowlist(TEST_ALLOWLIST_YAML);
+        let res = enforce_allowlist(
+            &ctx,
+            "p",
+            "kvendra.shell",
+            "run",
+            &serde_json::json!({ "argv": ["echo", "hi"] }),
+        );
+        assert!(res.is_ok(), "well-formed allowlist must enforce: {res:?}");
+    }
+
+    /// REQ-KVD-007 AC-3 — a YAML modified out-of-band must trip the HMAC
+    /// check and surface as `KvendraError::AllowlistTampered`.
+    #[test]
+    fn enforce_allowlist_rejects_on_tampering() {
+        let (_dir, ctx) = fixture_with_allowlist(TEST_ALLOWLIST_YAML);
+        // Out-of-band edit: append a permissive line. HMAC no longer matches.
+        let path = ctx.vault.profile_allowlist_path("p");
+        let mut tampered = std::fs::read_to_string(&path).unwrap();
+        tampered.push_str("    env_allowlist: [\"PATH\"]\n");
+        std::fs::write(&path, tampered).unwrap();
+
+        let res = enforce_allowlist(
+            &ctx,
+            "p",
+            "kvendra.shell",
+            "run",
+            &serde_json::json!({ "argv": ["echo", "hi"] }),
+        );
+        match res {
+            Err(KvendraError::AllowlistTampered(pid)) => assert_eq!(pid, "p"),
+            other => panic!("expected AllowlistTampered, got {other:?}"),
+        }
+    }
+
+    /// REQ-KVD-007 AC-6 — a profile without `allowlist_hmac_hex` is a legacy
+    /// profile pre-REQ-007 and must be auto-signed silently on first read.
+    /// After the call, `ProfileMeta.allowlist_hmac_hex` is populated.
+    #[test]
+    fn enforce_allowlist_auto_migrates_legacy_profile() {
+        let (_dir, ctx) = fixture_with_allowlist(TEST_ALLOWLIST_YAML);
+        // Reset the migrated HMAC to None to simulate a legacy profile.
+        let mut profile = ctx.vault.load_profile_meta("p").unwrap();
+        profile.allowlist_hmac_hex = None;
+        ctx.vault.save_profile_meta(&profile).unwrap();
+
+        let res = enforce_allowlist(
+            &ctx,
+            "p",
+            "kvendra.shell",
+            "run",
+            &serde_json::json!({ "argv": ["echo", "hi"] }),
+        );
+        assert!(res.is_ok(), "auto-migration must succeed: {res:?}");
+        let after = ctx.vault.load_profile_meta("p").unwrap();
+        assert!(
+            after.allowlist_hmac_hex.is_some(),
+            "auto-migration must populate allowlist_hmac_hex"
+        );
+    }
+
+    /// REQ-KVD-007 — when no allowlist YAML is on disk, `enforce_allowlist`
+    /// is a no-op (existing behaviour preserved). The HMAC code path must
+    /// not panic / error in this case.
+    #[test]
+    fn enforce_allowlist_noop_when_no_allowlist_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-noop-test", fast_params())
+            .unwrap();
+        v.unlock(b"hunter2-noop-test", 30).unwrap();
+        let ctx = ServerContext {
+            vault: v,
+            config: Config::default(),
+            writer: None,
+            approval_cache: Arc::new(ApprovalCache::new()),
+            approval_prompt_lock: Arc::new(Mutex::new(())),
+            transport: Transport::Mcp,
+        };
+        let res = enforce_allowlist(
+            &ctx,
+            "p",
+            "kvendra.shell",
+            "run",
+            &serde_json::json!({ "argv": ["echo", "hi"] }),
+        );
+        assert!(res.is_ok(), "no allowlist on disk → allow: {res:?}");
+    }
 
     /// AC-MCP-3 — `structuredContent` of a non-escape-hatch primitive must
     /// have every leaked secret recursively redacted, even when the value
