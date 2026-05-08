@@ -5,6 +5,16 @@ use kvendra::cli::{Cli, Commands};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        // SIGPIPE handler — terminate silently on broken pipe instead of panic.
+        // Without this, `kvendra ... | head -1` panics with
+        // "failed printing to stdout: Broken pipe (os error 32)" (exit 101).
+        // SIG_DFL makes the kernel terminate the process with SIGPIPE (exit 141),
+        // matching standard CLI behavior. Fixes ISSUE-KVD-CLI-042.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
+
     // tracing init: respect RUST_LOG if present, default to info on stderr.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));

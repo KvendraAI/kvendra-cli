@@ -52,6 +52,10 @@ security-framework = "3"
 security-framework-sys = "2"
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
+
+# SIGPIPE handler (ISSUE-KVD-CLI-042) — install SIG_DFL on unix to avoid Rust default panic
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 # HTTP
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 # TUI (Pase B placeholder)
