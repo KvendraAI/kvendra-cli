@@ -1,0 +1,41 @@
+name: e2e-smoke
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/mcp/**'
+      - 'src/allowlist/**'
+      - 'src/audit/**'
+      - 'scripts/e2e-smoke.sh'
+      - '.github/workflows/e2e-smoke.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/mcp/**'
+      - 'src/allowlist/**'
+      - 'src/audit/**'
+      - 'scripts/e2e-smoke.sh'
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: e2e-smoke (macos-latest, T1.5 skipped)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Run smoke harness
+        env:
+          SMOKE_SKIP_T1_5: "1"
+        run: bash ./scripts/e2e-smoke.sh
+      - name: Upload audit log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-audit-log
+          path: /tmp/kvendra-smoke-*/audit.json
+          if-no-files-found: ignore
