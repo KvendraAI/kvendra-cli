@@ -349,9 +349,19 @@ fn check_args(
     }
 
     // repos UNION repo (D1 — any-match across both lists).
-    let repo_input = inner.get("repo").and_then(Value::as_str);
+    //
+    // Accept either `args.repo` (legacy/short form) or `args.url` (canonical
+    // form used by `clone`). Both are normalized via `extract_repo_canonical`
+    // so allowlist patterns like `github.com/Org/*` match regardless of
+    // whether the caller passed `https://github.com/Org/Repo.git`,
+    // `git@github.com:Org/Repo.git`, or the bare `github.com/Org/Repo`.
+    let repo_input: Option<String> = inner
+        .get("repo")
+        .or_else(|| inner.get("url"))
+        .and_then(Value::as_str)
+        .map(extract_repo_canonical);
     if (c.repos.is_some() || c.repo.is_some())
-        && let Some(repo) = repo_input
+        && let Some(repo) = repo_input.as_deref()
     {
         let repos_ok = c
             .repos
@@ -460,6 +470,37 @@ fn extract_owner_from_repo(repo: &str) -> Option<&str> {
     let mut parts = repo.split('/');
     let _host = parts.next()?;
     parts.next()
+}
+
+/// Normalize a git URL or repo identifier to its canonical
+/// `host/owner/name` form for matching against `repos: [...]` allowlist
+/// patterns.
+///
+/// Accepts:
+/// - `https://github.com/Org/Repo`        → `github.com/Org/Repo`
+/// - `https://github.com/Org/Repo.git`    → `github.com/Org/Repo`
+/// - `git@github.com:Org/Repo.git`        → `github.com/Org/Repo`
+/// - `github.com/Org/Repo`                → `github.com/Org/Repo` (passthrough)
+///
+/// Pattern parallel to `extract_bucket_from_s3_uri` above. Closes the
+/// permissive-on-absence gap where `clone` calls with `args.url` bypassed
+/// the `repos:` constraint (ISSUE-KVD-CLI-043).
+fn extract_repo_canonical(input: &str) -> String {
+    let s = input.trim();
+    // Strip http(s):// scheme.
+    let s = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(s);
+    // Convert SSH form `git@host:owner/name(.git)?` → `host/owner/name`.
+    if let Some(rest) = s.strip_prefix("git@")
+        && let Some((host, path)) = rest.split_once(':')
+    {
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        return format!("{host}/{path}");
+    }
+    // Strip trailing `.git`.
+    s.strip_suffix(".git").unwrap_or(s).to_string()
 }
 
 /// Compare a call's argv against a template. The template's tokens may use:
@@ -1329,6 +1370,100 @@ allowlist:
         );
         let bad = env_args(serde_json::json!({ "repo": "github.com/EvilCorp/x" }));
         assert!(check(&s, "kvendra.git", "clone", &bad).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // ISSUE-KVD-CLI-043 — args.url canonicalization closes the
+    // permissive-on-absence gap. `clone` callers may pass
+    // `args.url` (canonical) instead of `args.repo`; the enforcer must
+    // match either against `repos: [...]`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn clone_with_args_url_matches_repos_pattern_happy() {
+        let s = spec_with(
+            r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.git
+      operations:
+        - clone:
+            repos: ["github.com/KvendraAI/*"]
+"#,
+        );
+        let ok = env_args(serde_json::json!({
+            "url": "https://github.com/KvendraAI/kvendra-cli"
+        }));
+        assert!(check(&s, "kvendra.git", "clone", &ok).is_ok());
+
+        let ok_dotgit = env_args(serde_json::json!({
+            "url": "https://github.com/KvendraAI/kvendra-cli.git"
+        }));
+        assert!(check(&s, "kvendra.git", "clone", &ok_dotgit).is_ok());
+    }
+
+    #[test]
+    fn clone_with_args_url_violates_repos_pattern_rejection() {
+        let s = spec_with(
+            r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.git
+      operations:
+        - clone:
+            repos: ["github.com/KvendraAI/*"]
+"#,
+        );
+        let bad = env_args(serde_json::json!({
+            "url": "https://github.com/EvilCorp/malware"
+        }));
+        assert!(check(&s, "kvendra.git", "clone", &bad).is_err());
+    }
+
+    #[test]
+    fn extract_repo_canonical_handles_https() {
+        assert_eq!(
+            extract_repo_canonical("https://github.com/Foo/Bar"),
+            "github.com/Foo/Bar"
+        );
+        assert_eq!(
+            extract_repo_canonical("https://github.com/Foo/Bar.git"),
+            "github.com/Foo/Bar"
+        );
+        assert_eq!(
+            extract_repo_canonical("http://github.com/Foo/Bar.git"),
+            "github.com/Foo/Bar"
+        );
+    }
+
+    #[test]
+    fn extract_repo_canonical_handles_git_at() {
+        assert_eq!(
+            extract_repo_canonical("git@github.com:Foo/Bar.git"),
+            "github.com/Foo/Bar"
+        );
+        assert_eq!(
+            extract_repo_canonical("git@github.com:Foo/Bar"),
+            "github.com/Foo/Bar"
+        );
+    }
+
+    #[test]
+    fn extract_repo_canonical_handles_passthrough() {
+        assert_eq!(
+            extract_repo_canonical("github.com/Foo/Bar"),
+            "github.com/Foo/Bar"
+        );
+        assert_eq!(
+            extract_repo_canonical("  github.com/Foo/Bar  "),
+            "github.com/Foo/Bar"
+        );
     }
 
     #[test]

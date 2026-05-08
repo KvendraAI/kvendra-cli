@@ -136,7 +136,7 @@ done
 echo "$RESP" | grep -q '\[UNSAFE\]' || fail T3 "unsafe escape hatch not flagged" 44
 
 # tools/call — SHAPE MCP REAL ENVELOPE (PAT-KVD-004 critical)
-send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"kvendra.git","arguments":{"profile_id":"smoke-git-readonly","operation":"clone","args":{"repo":"github.com/KvendraAI/kvendra-cli"}}}}'
+send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"kvendra.git","arguments":{"profile_id":"smoke-git-readonly","operation":"clone","args":{"url":"github.com/KvendraAI/kvendra-cli"}}}}'
 RESP="$(recv)"
 echo "$RESP" | grep -q '"id":3' || fail T3 "tools/call id mismatch" 45
 if echo "$RESP" | grep -qiE 'allowlist[ _]?violation'; then

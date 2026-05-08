@@ -94,7 +94,7 @@ const CATALOG: [PrimitiveInfo; 8] = [
         summary: "Run git operations (clone/push/pull/commit/tag) using a stored credential profile. Token plaintext never returned.",
         operations: &["clone", "push", "pull", "commit", "tag"],
         is_unsafe: false,
-        operations_doc: "Operations:\n  clone:  args: { repo: \"owner/name\", dest: \"<path>\" }\n  push:   args: { cwd: \"<path>\", remote?: \"origin\", branch?: \"main\" }\n  pull:   args: { cwd: \"<path>\", remote?: \"origin\", branch?: \"main\" }\n  commit: args: { cwd: \"<path>\", message: \"<msg>\" }\n  tag:    args: { cwd: \"<path>\", name: \"<tag>\", message?: \"<msg>\", force?: false }\nAll operations require profile_id at the top level.",
+        operations_doc: "Operations:\n  clone:  args: { url: \"<git url>\", dst?: \"<path>\" }\n  push:   args: { cwd: \"<path>\", remote?: \"origin\", ref: \"refs/heads/<branch>\" }\n  pull:   args: { cwd: \"<path>\", remote?: \"origin\", ref: \"refs/heads/<branch>\" }\n  commit: args: { cwd: \"<path>\", message: \"<msg>\" }\n  tag:    args: { cwd: \"<path>\", name: \"<tag>\", message?: \"<msg>\" }\nAll operations require profile_id at the top level.",
     },
     PrimitiveInfo {
         name: "kvendra.github",
