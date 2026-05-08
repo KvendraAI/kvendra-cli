@@ -14,7 +14,7 @@
 use crate::allowlist::{ProfileSpec, check as allowlist_check, validate as allowlist_validate};
 use crate::approval::{self, ApprovalCache, Transport};
 use crate::audit::reader::args_hash_hex;
-use crate::audit::{AuditEvent, AuditWriter, Severity, Status};
+use crate::audit::{AuditEvent, AuditWriter, PRIMITIVE_SYSTEM, Severity, Status};
 use crate::config::Config;
 use crate::detection::{Decision, detect};
 use crate::error::{KvendraError, KvendraResult};
@@ -32,6 +32,19 @@ use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
+
+/// Outcome returned by [`enforce_allowlist`] when the allowlist check passes.
+///
+/// Distinguishes the steady-state `Unchanged` path from the rare `Migrated`
+/// path where a legacy profile (no `allowlist_hmac_hex` persisted) was
+/// auto-signed during this call. Callers can ignore the variant for control
+/// flow — the dispatcher does — but the type makes the side-effect visible
+/// in the signature so future audit hooks can react to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationOutcome {
+    Unchanged,
+    Migrated,
+}
 
 /// Server-side context shared across all dispatch calls.
 pub struct ServerContext {
@@ -109,7 +122,11 @@ pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
     Ok(())
 }
 
-async fn dispatch(req: JsonRpcRequest, ctx: Arc<ServerContext>) -> JsonRpcResponse {
+/// Dispatch a single JSON-RPC request against an existing [`ServerContext`].
+///
+/// Exposed so integration tests can drive the dispatcher in-process without
+/// going through the stdio transport.
+pub async fn dispatch(req: JsonRpcRequest, ctx: Arc<ServerContext>) -> JsonRpcResponse {
     let id = req.id.clone();
 
     if req.jsonrpc != "2.0" {
@@ -230,8 +247,8 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
 
     // Allowlist enforcement (when a profile metadata + allowlist exists).
     if !profile_id.is_empty() {
-        match enforce_allowlist(&ctx, &profile_id, name, &action, &arguments) {
-            Ok(()) => {}
+        match enforce_allowlist(&ctx, &profile_id, name, &action, &arguments).await {
+            Ok(MigrationOutcome::Unchanged) | Ok(MigrationOutcome::Migrated) => {}
             Err(KvendraError::AllowlistTampered(pid)) => {
                 flags.push("allowlist_tampered_detected".into());
                 let _ =
@@ -248,6 +265,13 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
                 );
             }
             Err(e) => {
+                // REQ-KVD-CLI-002 / ISSUE-023+033 — emit the canonical flag
+                // for forensic reconstruction (`kvendra audit --json | jq
+                // '.flags | contains("allowlist_denied")'`). Without this,
+                // the audit row is indistinguishable from network errors.
+                if let Some(canonical_flag) = audit_flag_for_error(&e) {
+                    flags.push(canonical_flag.into());
+                }
                 let _ =
                     record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true).await;
                 // AC-MCP-3 defence in depth: the error string can include the
@@ -411,18 +435,39 @@ async fn record_audit(
     w.record(event).await
 }
 
-fn enforce_allowlist(
+/// Map a [`KvendraError`] surfaced by `enforce_allowlist` (or any other
+/// pre-dispatch barrier) to the canonical audit flag string used by the
+/// forensic tooling. Returning `None` means "no flag — emit the row with
+/// whatever flags were already accumulated".
+///
+/// The set is intentionally closed: only errors that represent a *boundary
+/// rejection* (allowlist deny, expired profile, escape-hatch off) get a
+/// canonical flag. Generic I/O / parse / network errors do NOT — those
+/// would make the flag noisy and useless for forensic queries.
+fn audit_flag_for_error(err: &KvendraError) -> Option<&'static str> {
+    match err {
+        KvendraError::AllowlistViolation(_) => Some("allowlist_denied"),
+        KvendraError::ProfileExpired => Some("profile_expired"),
+        KvendraError::UnsafeNotEnabled => Some("unsafe_not_enabled"),
+        // AllowlistTampered is handled in a dedicated branch in tools_call
+        // and gets `allowlist_tampered_detected`; do not double-count it
+        // here.
+        _ => None,
+    }
+}
+
+async fn enforce_allowlist(
     ctx: &ServerContext,
     profile_id: &str,
     primitive: &str,
     operation: &str,
     arguments: &Value,
-) -> KvendraResult<()> {
+) -> KvendraResult<MigrationOutcome> {
     let path = ctx.vault.profile_allowlist_path(profile_id);
     if !path.exists() {
         // No allowlist on disk → defer to existing behaviour: allowed.
         // Documented: profiles must declare an allowlist for production use.
-        return Ok(());
+        return Ok(MigrationOutcome::Unchanged);
     }
     let raw = std::fs::read_to_string(&path)?;
 
@@ -432,6 +477,7 @@ fn enforce_allowlist(
     let key = ctx.vault.allowlist_hmac_key()?;
     let current_hmac = crate::vault::compute_allowlist_hmac(&key, raw.as_bytes());
     let mut profile = ctx.vault.load_profile_meta(profile_id)?;
+    let mut migration_outcome = MigrationOutcome::Unchanged;
     match profile.allowlist_hmac_hex.as_deref() {
         Some(stored) if stored == current_hmac => { /* OK, continue */ }
         Some(_stored) => {
@@ -445,7 +491,7 @@ fn enforce_allowlist(
         }
         None => {
             // Migration on first read (REQ-KVD-007 AC-6, D4 silent).
-            profile.allowlist_hmac_hex = Some(current_hmac);
+            profile.allowlist_hmac_hex = Some(current_hmac.clone());
             ctx.vault.save_profile_meta(&profile)?;
             tracing::info!(
                 target: "kvendra::mcp",
@@ -453,13 +499,44 @@ fn enforce_allowlist(
                 profile_id,
                 "Auto-signed legacy allowlist on first read post-REQ-007"
             );
+            // REQ-KVD-CLI-002 / ISSUE-023 — emit a DEDICATED audit row for the
+            // migration event (owner D4 decision, TXN-KVD-20260508-012). A
+            // separate row preserves the literal AC of ISSUE-023 ("audit row
+            // ... contains flag allowlist_hmac_migrated") without forcing the
+            // boundary call row to also carry the flag.
+            if let Some(writer) = ctx.writer.as_ref() {
+                let event = AuditEvent {
+                    ts_unix_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() as i64
+                        / 1_000_000,
+                    profile_id: profile_id.to_string(),
+                    primitive: PRIMITIVE_SYSTEM.to_string(),
+                    action: "allowlist_hmac_migrated".to_string(),
+                    args_hash_hex: sha256_hex(profile_id.as_bytes()),
+                    status: Status::Ok,
+                    severity: Severity::Info,
+                    flags: "allowlist_hmac_migrated".to_string(),
+                };
+                writer.record(event).await?;
+            }
+            migration_outcome = MigrationOutcome::Migrated;
         }
     }
 
     let spec: ProfileSpec = serde_yml::from_str(&raw)?;
     allowlist_validate(&spec)?;
     allowlist_check(&spec, primitive, operation, arguments)?;
-    Ok(())
+    Ok(migration_outcome)
+}
+
+/// SHA-256 over arbitrary bytes, hex-encoded. Local helper used to derive
+/// `args_hash_hex` for system-level audit rows that are not driven by a
+/// JSON args payload (e.g. the `allowlist_hmac_migrated` row, which only
+/// references the `profile_id`).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
 }
 
 async fn invoke_primitive(
@@ -501,9 +578,22 @@ mod tests {
 
     /// Helper used by the `enforce_allowlist` test trio below: builds an
     /// unlocked Vault with a profile + allowlist YAML on disk + minimal
-    /// `ServerContext`. No audit writer is attached (the tests exercise the
-    /// HMAC verification path only).
+    /// `ServerContext`. By default no audit writer is attached (the tests
+    /// exercise the HMAC verification path only); pass `attach_writer=true`
+    /// to wire up an `AuditWriter` so the dedicated migration / boundary
+    /// rows can be inspected by SQLite query in-test.
     fn fixture_with_allowlist(yaml: &str) -> (tempfile::TempDir, ServerContext) {
+        fixture_with_allowlist_inner(yaml, false)
+    }
+
+    fn fixture_with_allowlist_and_writer(yaml: &str) -> (tempfile::TempDir, ServerContext) {
+        fixture_with_allowlist_inner(yaml, true)
+    }
+
+    fn fixture_with_allowlist_inner(
+        yaml: &str,
+        attach_writer: bool,
+    ) -> (tempfile::TempDir, ServerContext) {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         crate::config::ensure_layout(home).unwrap();
@@ -530,10 +620,19 @@ mod tests {
         profile.allowlist_hmac_hex = Some(hmac_hex);
         v.save_profile_meta(&profile).unwrap();
 
+        let writer = if attach_writer {
+            Some(
+                AuditWriter::spawn(v.audit_db_path(), v.audit_hmac_key().unwrap())
+                    .expect("spawn audit writer"),
+            )
+        } else {
+            None
+        };
+
         let ctx = ServerContext {
             vault: v,
             config: Config::default(),
-            writer: None,
+            writer,
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
             transport: Transport::Mcp,
@@ -544,8 +643,8 @@ mod tests {
     const TEST_ALLOWLIST_YAML: &str = "profile_id: p\nsecret:\n  type: github_pat\nallowlist:\n  primitives:\n    - name: kvendra.shell\n      operations:\n        - run:\n            binaries: [\"echo\"]\n";
 
     /// REQ-KVD-007 AC-2 — a YAML matching the persisted HMAC must pass.
-    #[test]
-    fn enforce_allowlist_passes_on_match() {
+    #[tokio::test]
+    async fn enforce_allowlist_passes_on_match() {
         let (_dir, ctx) = fixture_with_allowlist(TEST_ALLOWLIST_YAML);
         let res = enforce_allowlist(
             &ctx,
@@ -553,14 +652,18 @@ mod tests {
             "kvendra.shell",
             "run",
             &serde_json::json!({ "argv": ["echo", "hi"] }),
+        )
+        .await;
+        assert!(
+            matches!(res, Ok(MigrationOutcome::Unchanged)),
+            "well-formed allowlist must enforce as Unchanged: {res:?}"
         );
-        assert!(res.is_ok(), "well-formed allowlist must enforce: {res:?}");
     }
 
     /// REQ-KVD-007 AC-3 — a YAML modified out-of-band must trip the HMAC
     /// check and surface as `KvendraError::AllowlistTampered`.
-    #[test]
-    fn enforce_allowlist_rejects_on_tampering() {
+    #[tokio::test]
+    async fn enforce_allowlist_rejects_on_tampering() {
         let (_dir, ctx) = fixture_with_allowlist(TEST_ALLOWLIST_YAML);
         // Out-of-band edit: append a permissive line. HMAC no longer matches.
         let path = ctx.vault.profile_allowlist_path("p");
@@ -574,7 +677,8 @@ mod tests {
             "kvendra.shell",
             "run",
             &serde_json::json!({ "argv": ["echo", "hi"] }),
-        );
+        )
+        .await;
         match res {
             Err(KvendraError::AllowlistTampered(pid)) => assert_eq!(pid, "p"),
             other => panic!("expected AllowlistTampered, got {other:?}"),
@@ -583,10 +687,12 @@ mod tests {
 
     /// REQ-KVD-007 AC-6 — a profile without `allowlist_hmac_hex` is a legacy
     /// profile pre-REQ-007 and must be auto-signed silently on first read.
-    /// After the call, `ProfileMeta.allowlist_hmac_hex` is populated.
-    #[test]
-    fn enforce_allowlist_auto_migrates_legacy_profile() {
-        let (_dir, ctx) = fixture_with_allowlist(TEST_ALLOWLIST_YAML);
+    /// After the call, `ProfileMeta.allowlist_hmac_hex` is populated AND a
+    /// dedicated `allowlist_hmac_migrated` audit row is appended (REQ-KVD-CLI-002,
+    /// owner D4 decision).
+    #[tokio::test]
+    async fn enforce_allowlist_auto_migrates_legacy_profile() {
+        let (_dir, ctx) = fixture_with_allowlist_and_writer(TEST_ALLOWLIST_YAML);
         // Reset the migrated HMAC to None to simulate a legacy profile.
         let mut profile = ctx.vault.load_profile_meta("p").unwrap();
         profile.allowlist_hmac_hex = None;
@@ -598,20 +704,44 @@ mod tests {
             "kvendra.shell",
             "run",
             &serde_json::json!({ "argv": ["echo", "hi"] }),
+        )
+        .await;
+        assert!(
+            matches!(res, Ok(MigrationOutcome::Migrated)),
+            "auto-migration must surface Migrated outcome: {res:?}"
         );
-        assert!(res.is_ok(), "auto-migration must succeed: {res:?}");
         let after = ctx.vault.load_profile_meta("p").unwrap();
         assert!(
             after.allowlist_hmac_hex.is_some(),
             "auto-migration must populate allowlist_hmac_hex"
+        );
+
+        // Drain the writer and inspect the SQLite DB directly for the
+        // dedicated row.
+        ctx.writer.as_ref().unwrap().shutdown().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let conn = rusqlite::Connection::open(ctx.vault.audit_db_path()).unwrap();
+        let (action, primitive, flags): (String, String, String) = conn
+            .query_row(
+                "SELECT action, primitive, flags FROM audit_events \
+                 WHERE action = 'allowlist_hmac_migrated' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("dedicated allowlist_hmac_migrated row must be present");
+        assert_eq!(action, "allowlist_hmac_migrated");
+        assert_eq!(primitive, PRIMITIVE_SYSTEM);
+        assert!(
+            flags.contains("allowlist_hmac_migrated"),
+            "dedicated row must carry canonical flag, got: {flags}"
         );
     }
 
     /// REQ-KVD-007 — when no allowlist YAML is on disk, `enforce_allowlist`
     /// is a no-op (existing behaviour preserved). The HMAC code path must
     /// not panic / error in this case.
-    #[test]
-    fn enforce_allowlist_noop_when_no_allowlist_on_disk() {
+    #[tokio::test]
+    async fn enforce_allowlist_noop_when_no_allowlist_on_disk() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         crate::config::ensure_layout(home).unwrap();
@@ -633,8 +763,12 @@ mod tests {
             "kvendra.shell",
             "run",
             &serde_json::json!({ "argv": ["echo", "hi"] }),
+        )
+        .await;
+        assert!(
+            matches!(res, Ok(MigrationOutcome::Unchanged)),
+            "no allowlist on disk → allow + Unchanged: {res:?}"
         );
-        assert!(res.is_ok(), "no allowlist on disk → allow: {res:?}");
     }
 
     /// AC-MCP-3 — `structuredContent` of a non-escape-hatch primitive must

@@ -193,7 +193,44 @@ pub async fn rebind_inner(
     }
     let mut codes_file: RecoveryCodesFile =
         serde_json::from_str(&std::fs::read_to_string(&codes_path)?)?;
-    let slot_idx = validate_code_unconsumed(&codes_file, recovery_code)?;
+    let slot_idx = match validate_code_unconsumed(&codes_file, recovery_code) {
+        Ok(idx) => idx,
+        Err(KvendraError::RecoveryCodeAlreadyUsed {
+            slot,
+            used_for,
+            used_at,
+        }) => {
+            // REQ-KVD-CLI-002 / ISSUE-026 — emit a DEDICATED audit row tagged
+            // `recovery_code_replay_attempted` BEFORE returning the error to
+            // the caller. The audit log is the only place where forensic
+            // tooling can spot a replay attempt, so the row must be written
+            // even though the rebind itself aborts.
+            //
+            // AC-3 of ISSUE-026: the raw recovery code MUST NOT appear in any
+            // field of the audit row. We hash `prev_canon | slot` only.
+            let writer = AuditWriter::spawn(vault.audit_db_path(), vault.audit_hmac_key()?)?;
+            let args_hash = sha256_hex(format!("{}|{}", prev_canon.display(), slot));
+            let event = AuditEvent {
+                ts_unix_ms: time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64
+                    / 1_000_000,
+                profile_id: String::new(),
+                primitive: PRIMITIVE_SYSTEM.to_string(),
+                action: "home_rebound_attempt".to_string(),
+                args_hash_hex: args_hash,
+                status: Status::Error,
+                severity: Severity::Warn,
+                flags: format!("recovery_code_replay_attempted,slot_{slot}"),
+            };
+            writer.record(event).await?;
+            writer.shutdown().await;
+            return Err(KvendraError::RecoveryCodeAlreadyUsed {
+                slot,
+                used_for,
+                used_at,
+            });
+        }
+        Err(e) => return Err(e),
+    };
 
     // Barrier 3 — typed-path confirmation.
     let typed_canon = std::fs::canonicalize(PathBuf::from(typed_path)).map_err(|e| {
@@ -549,5 +586,164 @@ mod tests {
             !codes_raw.contains("home_rebound"),
             "slot must NOT be marked consumed when the typed path mismatches"
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // REQ-KVD-CLI-002 / ISSUE-026 — recovery-code replay attempts emit a
+    // dedicated `recovery_code_replay_attempted` audit row BEFORE the error
+    // is propagated to the caller. The raw code MUST NOT appear in any field.
+    // ----------------------------------------------------------------------
+
+    /// AC-1 — a second rebind with an already-consumed code emits a row
+    /// with action `home_rebound_attempt`, primitive `kvendra.system`, status
+    /// `error`, severity `warn`, and the canonical flag
+    /// `recovery_code_replay_attempted` (plus the slot id).
+    #[tokio::test]
+    async fn replay_attempt_emits_recovery_code_replay_attempted_flag() {
+        let tmp = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        let dest2 = TempDir::new().unwrap();
+        let _v = bootstrap_vault(tmp.path());
+
+        // First call consumes slot 0.
+        let _ = rebind_inner(
+            tmp.path(),
+            dest.path(),
+            b"hunter2-test",
+            "1111-2222-33",
+            dest.path().to_string_lossy().as_ref(),
+        )
+        .await
+        .unwrap();
+        // Second call replays the same code — must be rejected AND emit the
+        // dedicated audit row.
+        let r = rebind_inner(
+            tmp.path(),
+            dest2.path(),
+            b"hunter2-test",
+            "1111-2222-33",
+            dest2.path().to_string_lossy().as_ref(),
+        )
+        .await;
+        assert!(matches!(
+            r,
+            Err(KvendraError::RecoveryCodeAlreadyUsed { slot: 0, .. })
+        ));
+        // Allow the writer thread to flush the row.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        let conn = rusqlite::Connection::open(tmp.path().join("audit.db")).unwrap();
+        let (action, severity, status, flags, primitive): (
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT action, severity, status, flags, primitive FROM audit_events \
+                 WHERE action = 'home_rebound_attempt' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(action, "home_rebound_attempt");
+        assert_eq!(severity, "warn");
+        assert_eq!(status, "error");
+        assert_eq!(primitive, "kvendra.system");
+        assert!(
+            flags.contains("recovery_code_replay_attempted"),
+            "flags must contain the canonical replay flag: {flags}"
+        );
+        assert!(
+            flags.contains("slot_0"),
+            "flags must encode the slot id: {flags}"
+        );
+    }
+
+    /// AC-2 — three replay attempts produce three distinct audit rows so
+    /// forensic counts reflect the actual attempt count.
+    #[tokio::test]
+    async fn replay_three_attempts_produce_three_rows() {
+        let tmp = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        let _v = bootstrap_vault(tmp.path());
+        // Consume slot 0 first.
+        let _ = rebind_inner(
+            tmp.path(),
+            dest.path(),
+            b"hunter2-test",
+            "1111-2222-33",
+            dest.path().to_string_lossy().as_ref(),
+        )
+        .await
+        .unwrap();
+        // Three replay attempts.
+        for _ in 0..3 {
+            let dest_n = TempDir::new().unwrap();
+            let _ = rebind_inner(
+                tmp.path(),
+                dest_n.path(),
+                b"hunter2-test",
+                "1111-2222-33",
+                dest_n.path().to_string_lossy().as_ref(),
+            )
+            .await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+        let conn = rusqlite::Connection::open(tmp.path().join("audit.db")).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE action = 'home_rebound_attempt' \
+                 AND flags LIKE '%recovery_code_replay_attempted%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3, "expected 3 replay rows, got {count}");
+    }
+
+    /// AC-3 — the raw recovery code MUST NOT appear in any audit-row column,
+    /// including `args_hash_hex` (which we derive from `prev_canon | slot`).
+    #[tokio::test]
+    async fn replay_args_hash_does_not_contain_plain_code() {
+        let tmp = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        let dest2 = TempDir::new().unwrap();
+        let _v = bootstrap_vault(tmp.path());
+        let _ = rebind_inner(
+            tmp.path(),
+            dest.path(),
+            b"hunter2-test",
+            "1111-2222-33",
+            dest.path().to_string_lossy().as_ref(),
+        )
+        .await
+        .unwrap();
+        let _ = rebind_inner(
+            tmp.path(),
+            dest2.path(),
+            b"hunter2-test",
+            "1111-2222-33",
+            dest2.path().to_string_lossy().as_ref(),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        let conn = rusqlite::Connection::open(tmp.path().join("audit.db")).unwrap();
+        let (args_hash, flags, action): (String, String, String) = conn
+            .query_row(
+                "SELECT args_hash_hex, flags, action FROM audit_events \
+                 WHERE action = 'home_rebound_attempt' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(action, "home_rebound_attempt");
+        // Nothing in the row may equal or contain the literal code.
+        let code = "1111-2222-33";
+        assert!(!args_hash.contains(code), "args_hash leaked code: {args_hash}");
+        assert!(!flags.contains(code), "flags leaked code: {flags}");
     }
 }
