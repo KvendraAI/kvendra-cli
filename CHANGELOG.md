@@ -5,7 +5,7 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
-## [0.1.0] — TBD (target post smoke real validation)
+## [0.1.0] — 2026-05-08
 
 **First stable release.** Multi-platform CLI (macOS / Linux / Windows)
 with full structural security: allowlist gate, audit log HMAC chain,
@@ -14,6 +14,12 @@ transport separation, consent gate on destructive ops.
 This release is the cumulative scope of all alpha series (alpha.1
 through alpha.11) since the project's first commit, plus distribution
 documentation polish.
+
+Smoke real Windows+Linux validation deferred per `RUN-KVD-CLI-001`
+(owner without hardware access on release day). CI matrix coverage
+(Ubuntu/macOS/Windows `cargo test` 284 green) accepted as substitute;
+extending `e2e-smoke.yml` to ubuntu-latest is the recommended
+post-stable mitigation.
 
 ### Released features
 
