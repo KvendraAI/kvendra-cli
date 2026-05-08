@@ -46,7 +46,8 @@ KVENDRA_INIT_CONFIRM_CODE="0" \
 [ -f "$TMPHOME/config.toml" ]         || fail T1 "config.toml missing" 15
 assert_perm "$TMPHOME/recovery_codes.json" 600
 assert_perm "$TMPHOME/config.toml" 600
-"$KVENDRA_BIN" audit --json | grep -q vault_created || fail T1 "no vault_created audit row" 16
+T1_AUDIT_JSON_OUT=$("$KVENDRA_BIN" audit --json)
+echo "$T1_AUDIT_JSON_OUT" | grep -q vault_created || fail T1 "no vault_created audit row" 16
 
 # ---------- T1.5: keychain ACL (gated) ----------
 phase T1.5 "kvendra config mcp-password enable"
@@ -94,11 +95,13 @@ printf '%s\n' "$SMOKE_PASSWORD" | \
     --password-stdin >/dev/null \
   || fail T2 "set-allowlist failed" 31
 
-"$KVENDRA_BIN" secret validate "$SMOKE_PROFILE_OK" | grep -q "VALID" \
+T2_VALIDATE_OUT=$("$KVENDRA_BIN" secret validate "$SMOKE_PROFILE_OK")
+echo "$T2_VALIDATE_OUT" | grep -q "VALID" \
   || fail T2 "validate not green" 32
 
 [ -f "$TMPHOME/secrets/$SMOKE_PROFILE_OK.blob" ] || fail T2 "blob not written" 33
-"$KVENDRA_BIN" secret get-meta "$SMOKE_PROFILE_OK" | grep -q "allowlist_hmac_hex" \
+T2_GETMETA_OUT=$("$KVENDRA_BIN" secret get-meta "$SMOKE_PROFILE_OK")
+echo "$T2_GETMETA_OUT" | grep -q "allowlist_hmac_hex" \
   || fail T2 "HMAC sidecar missing in profile meta" 34
 
 # ---------- T3: mcp serve + JSON-RPC roundtrip ----------
@@ -154,8 +157,8 @@ wait "$MCP_PID" 2>/dev/null || true
 
 # ---------- E: audit --verify ----------
 phase E "kvendra audit --verify"
-printf '%s\n' "$SMOKE_PASSWORD" | \
-  "$KVENDRA_BIN" audit --verify --password-stdin | grep -q "Audit chain valid" \
+E_AUDIT_VERIFY_OUT=$(printf '%s\n' "$SMOKE_PASSWORD" | "$KVENDRA_BIN" audit --verify --password-stdin)
+echo "$E_AUDIT_VERIFY_OUT" | grep -q "Audit chain valid" \
   || fail E "audit chain BROKEN (PAT-KVD-004 recurrence on UPDATE path?)" 60
 
 "$KVENDRA_BIN" audit --json > "$TMPHOME/audit.json"
