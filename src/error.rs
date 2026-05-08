@@ -37,6 +37,14 @@ pub enum KvendraError {
     #[error("rebind confirmation mismatch — typed path does not canonicalize to target")]
     RebindConfirmationMismatch,
 
+    #[error("'config recovery-codes regenerate' requires interactive TTY confirmation")]
+    RegenerateRequiresTty,
+
+    #[error(
+        "regenerate confirmation mismatch — typed string must equal 'REGENERATE-RECOVERY-CODES' exactly"
+    )]
+    RegenerateAcknowledgeMismatch,
+
     #[error("audit log error: {0}")]
     Audit(String),
 

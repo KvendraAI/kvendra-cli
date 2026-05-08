@@ -11,6 +11,7 @@
 use crate::cli::config_approval::{ApprovalCommand, run as run_approval};
 use crate::cli::config_mcp_password::{McpPasswordCommand, run as run_mcp_password};
 use crate::cli::config_rebind::RebindHomeArgs;
+use crate::cli::config_recovery_codes::{RecoveryCodesCommand, run as run_recovery_codes};
 use crate::config::{Config, MasterPasswordCache, ensure_layout, kvendra_home};
 use crate::error::{KvendraError, KvendraResult};
 use crate::vault::Vault;
@@ -35,6 +36,11 @@ pub enum ConfigCommand {
     /// Required after a legitimate move of `~/.kvendra/` (REQ-KVD-008).
     #[command(name = "rebind-home")]
     RebindHome(RebindHomeArgs),
+    /// Manage recovery codes (regenerate the 8 numeric one-time codes).
+    /// REQ-KVD-CLI-003 — double-barrier (master password + TTY re-typed
+    /// acknowledge `REGENERATE-RECOVERY-CODES`).
+    #[command(subcommand, name = "recovery-codes")]
+    RecoveryCodes(RecoveryCodesCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -98,6 +104,7 @@ pub async fn run(cmd: ConfigCommand) -> KvendraResult<()> {
         ConfigCommand::RebindHome(args) => {
             return crate::cli::config_rebind::run(args).await;
         }
+        ConfigCommand::RecoveryCodes(c) => return run_recovery_codes(c).await,
     }
     Ok(())
 }
