@@ -5,6 +5,90 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
+## [0.1.0-alpha.11] — 2026-05-08
+
+REL-KVD-CLI-0.1.0.11 — polish bundle pre-stable + smoke harness validation
+gate. Intermediate alpha between `0.1.0-alpha.10` and `0.1.0` stable. Closes
+the polish cluster of ROAD-KVD-CLI-001 and delivers an E2E smoke harness for
+cross-platform validation. Activates REQ-KVD-CLI-001 / -002 / -003. Adds
+PAT-KVD-CLI-002 and PAT-KVD-CLI-003.
+
+### Security
+
+- **Allowlist enforcement gap closed in `kvendra.git clone`** (closes
+  ISSUE-KVD-CLI-043). Pre-fix, calls carrying `args.url` bypassed the
+  enforcer (permissive-on-absence). Post-fix, the enforcer canonicalises
+  the URL and matches it against `repos: [...]` in the YAML. Severity
+  bumped minor → security-relevant after analysis. Anti-pattern captured
+  in PAT-KVD-CLI-003.
+- **`allowlist_denied` audit flag** emitted after every
+  `KvendraError::AllowlistViolation` in the MCP dispatcher (closes
+  ISSUE-KVD-CLI-033). Companion canonical flags `profile_expired` and
+  `unsafe_not_enabled` added for forensic discrimination.
+- **`allowlist_hmac_migrated` audit row** emitted after auto-migration of
+  legacy profiles (closes ISSUE-KVD-CLI-023). Required refactoring
+  `enforce_allowlist` from sync to async to access the AuditWriter.
+- **`recovery_code_replay_attempted,slot_<N>` audit row** emitted after a
+  replay attempt in `rebind-home` (closes ISSUE-KVD-CLI-026). Raw code
+  never appears in the row (hash uses `sha256(prev_canon|slot)`).
+
+### Added
+
+- **`kvendra config recovery-codes regenerate` subcommand** (closes
+  ISSUE-KVD-CLI-025). Double-barrier pattern: master password unlock
+  followed by a TTY re-typed acknowledge `REGENERATE-RECOVERY-CODES`.
+  Generates 8 fresh codes, Argon2id-hashed, atomic 0600 rewrite. Audit
+  row records `previous_used_count`. Does NOT consume a recovery code
+  (deadlock-avoidance).
+- **E2E smoke harness** (closes ISSUE-KVD-CLI-037). New
+  `scripts/e2e-smoke.sh` (~270 lines, 7 phases T1 / T1.5 / T2 / T3 / D /
+  E / F), `docs/smoke.md` checklist, and `.github/workflows/e2e-smoke.yml`
+  (macos-latest, paths-filtered). Designed to catch regressions of the
+  PAT-KVD-004 family before tag-push.
+- **SIGPIPE handler** installed in `main()` (closes ISSUE-KVD-CLI-042).
+  `kvendra <cmd> | head` and similar pipelines no longer panic with
+  exit 101 — they exit cleanly with 141. Discovered while building the
+  smoke harness.
+
+### Tests
+
+- 261 → **284** cargo tests passed (+23 new). Coverage spans the audit
+  canonical flags, the allowlist enforcer fix, the recovery-codes
+  regenerate subcommand, and the smoke harness assertions.
+
+### Compatibility
+
+- Audit DB schema unchanged. Existing rows are NOT rewritten.
+- Audit HMAC chain unchanged (sub-key `kvendra/audit-hmac/v1`).
+- Allowlist YAML format unchanged. Existing `repos: [...]` entries
+  continue to work; canonicalisation is runtime-only.
+- CLI surface backward-compatible. Only addition is
+  `recovery-codes regenerate`.
+
+### Patterns
+
+- **PAT-KVD-CLI-002** — "Test assertions must verify against the binary's
+  actual output, not SPEC-imagined wording." Five iterations of the old
+  pattern were eliminated with a verify-binary preventive sweep.
+- **PAT-KVD-CLI-003** — "Allowlist enforcer permissive-on-absence."
+  Anti-pattern detected in `inner.get(field)` with single-name lookup.
+  Applies to any new branch added to the enforcer.
+
+### Caveats
+
+- Apple Developer ID + Touch ID remain deferred to 0.2.0
+  (`ROAD-KVD-CLI-002`). Approval gate still functions via the macOS modal
+  consent-only path (PAT-KVD-CLI-001).
+- `cargo publish kvendra 0.1.0-alpha.11` to crates.io is NOT automated
+  in this release (alpha publish is opt-in, owner-decided).
+
+### Smoke validation
+
+After this release, the owner's real cross-platform smoke (Windows +
+Linux, task #7 of the pipeline) runs against the fixed `v0.1.0-alpha.11`
+tag, not HEAD/main. Any cross-platform regression will be closed via
+alpha.12 before the stable 0.1.0 tag — it will NOT be folded into 0.1.0.
+
 ## [0.1.0-alpha.10] — 2026-05-08
 
 ISSUE-KVD-CLI-031 — Allowlist enforcer field-coverage fix. The Milestone 2
