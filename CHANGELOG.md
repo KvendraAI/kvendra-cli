@@ -5,6 +5,60 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
+## [0.1.0] — TBD (target post smoke real validation)
+
+**First stable release.** Multi-platform CLI (macOS / Linux / Windows)
+with full structural security: allowlist gate, audit log HMAC chain,
+transport separation, consent gate on destructive ops.
+
+This release is the cumulative scope of all alpha series (alpha.1
+through alpha.11) since the project's first commit, plus distribution
+documentation polish.
+
+### Released features
+
+- **Capability-based MCP broker** — 7 primitives (git, github, npm,
+  pypi, aws, http, shell) + 1 escape hatch (`unsafe.raw_token`).
+- **Zero-knowledge vault** — Argon2id key derivation + AES-256-GCM
+  ciphers, master password never stored except as sentinel hash.
+- **Per-profile allowlist YAML** — HMAC-signed, TOCTOU-safe, full
+  22-field DSL coverage (operations, repos, refs, regions, buckets,
+  forbidden args, etc.).
+- **Audit log HMAC chain** — every call + every sensitive CLI op
+  recorded with canonical flags. Verifiable via `kvendra audit --verify`.
+- **Transport separation** — CLI=TTY (interactive), MCP=approval
+  (consent gate).
+- **Recovery codes** — 8 numeric one-time codes generated at `init`,
+  regenerable via `kvendra config recovery-codes regenerate`.
+- **Cross-platform CI** — Ubuntu/macOS/Windows test matrix, 284 tests.
+- **E2E smoke harness** — `scripts/e2e-smoke.sh` for pre-tag validation,
+  also runnable in GitHub Actions.
+
+### Not in 0.1.0 (future)
+
+- **Touch ID-protected MCP password storage** — requires signed binary
+  (Apple Developer ID). Planned for v0.2.0 (`ROAD-KVD-CLI-002`). Current
+  default uses RAM-only master password cache with consent modal — secure
+  in practice (see `PAT-KVD-CLI-001`).
+- **Apple notarization, Homebrew formula** — v0.2.0.
+- **Windows Authenticode signing, Linux GPG signing** — v0.3.0+
+  (`ROAD-KVD-CLI-003`).
+
+### Documentation
+
+- README install section rewritten for cross-platform, no code-signing
+  required (`ISSUE-KVD-CLI-041`).
+- New `docs/install.md` with platform-specific guides (macOS Gatekeeper,
+  Linux distros, Windows SmartScreen).
+- New `docs/security.md` with trust narrative, defense layers, and v0.1.0
+  caveats.
+
+### Migration from alpha series
+
+No breaking changes since alpha.11. Vault, audit log, allowlist YAML
+all backward-compatible. Existing alpha.11 users can `cargo install
+--force --git ...` to upgrade.
+
 ## [0.1.0-alpha.11] — 2026-05-08
 
 REL-KVD-CLI-0.1.0.11 — polish bundle pre-stable + smoke harness validation
