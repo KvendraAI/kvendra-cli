@@ -73,6 +73,8 @@ printf '%s\n' "$SMOKE_PASSWORD" | \
 ALLOWLIST_FILE="$TMPHOME/allow-ok.yaml"
 cat >"$ALLOWLIST_FILE" <<'YAML'
 profile_id: smoke-git-readonly
+secret:
+  type: github_pat
 allowlist:
   primitives:
     - name: kvendra.git
