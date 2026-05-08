@@ -20,9 +20,13 @@ on:
 
 jobs:
   smoke:
-    name: e2e-smoke (macos-latest, T1.5 skipped)
-    runs-on: macos-latest
+    name: e2e-smoke (${{ matrix.os }}, T1.5 skipped)
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -36,6 +40,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: smoke-audit-log
+          name: smoke-audit-log-${{ matrix.os }}
           path: /tmp/kvendra-smoke-*/audit.json
           if-no-files-found: ignore

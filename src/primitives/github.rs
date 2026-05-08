@@ -111,14 +111,36 @@ async fn release(client: &reqwest::Client, token: &str, op_args: &Value) -> Kven
         .get("tag_name")
         .and_then(Value::as_str)
         .ok_or_else(|| KvendraError::InvalidArgs("release.tag_name required".into()))?;
-    let body = json!({
-        "tag_name": tag,
-        "name": op_args.get("name").cloned().unwrap_or(Value::String(tag.into())),
-        "body": op_args.get("body").cloned().unwrap_or(Value::Null),
-        "draft": op_args.get("draft").cloned().unwrap_or(Value::Bool(false)),
-        "prerelease": op_args.get("prerelease").cloned().unwrap_or(Value::Bool(false)),
-        "target_commitish": op_args.get("target_commitish").cloned().unwrap_or(Value::Null),
-    });
+    // Build the body skipping optional fields the caller didn't provide.
+    // GitHub API rejects literal `null` for `target_commitish` (HTTP 422,
+    // "nil is not a string"). ISSUE-KVD-CLI-044.
+    let mut body = serde_json::Map::new();
+    body.insert("tag_name".into(), Value::String(tag.to_string()));
+    body.insert(
+        "name".into(),
+        op_args
+            .get("name")
+            .cloned()
+            .unwrap_or_else(|| Value::String(tag.to_string())),
+    );
+    if let Some(b) = op_args.get("body") {
+        body.insert("body".into(), b.clone());
+    }
+    body.insert(
+        "draft".into(),
+        op_args.get("draft").cloned().unwrap_or(Value::Bool(false)),
+    );
+    body.insert(
+        "prerelease".into(),
+        op_args
+            .get("prerelease")
+            .cloned()
+            .unwrap_or(Value::Bool(false)),
+    );
+    if let Some(tc) = op_args.get("target_commitish") {
+        body.insert("target_commitish".into(), tc.clone());
+    }
+    let body = Value::Object(body);
     let url = format!("{GH_API}/repos/{owner}/{repo}/releases");
     let resp = client
         .post(&url)
