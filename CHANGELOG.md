@@ -5,6 +5,83 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
+## [0.1.0-alpha.10] — 2026-05-08
+
+ISSUE-KVD-CLI-031 — Allowlist enforcer field-coverage fix. The Milestone 2
+boundary smoke (AC-M2-6) caught two structural bugs in
+`src/allowlist/enforcer.rs::check_args` that together blew the per-profile
+authorisation surface wide open: (a) the three branches that **were**
+implemented (`forbidden_args`, `methods`, `repos`) read their inputs from
+the **top-level envelope** instead of the inner `args` payload, so any
+real MCP `tools/call` request (canonical shape
+`{profile_id, operation, args:{...}}`) silently bypassed those checks;
+(b) **19 of the 22** declared `OperationConstraints` fields had no
+enforcement branch at all and were dead letter — `buckets`, `distributions`,
+`functions`, `binaries`, `packages`, `projects`, `refs`, `tag_pattern`,
+`fields_allowed`, `forbidden_fields`, `forbidden_methods`,
+`forbidden_env_export_to_agent`, `url_pattern_regex`, `endpoints`, `org`,
+`repo` (singular alias), `cwd_pattern`, `args_constraints`,
+`env_vars_to_inject`. The pre-existing tests passed because their fixtures
+used a "flat" envelope shape that did not match the real MCP callsite —
+PAT-KVD-004 reaffirmed (canonical shapes must be identical between tests
+and runtime).
+
+### Security
+
+- **Allowlist enforcer now reads from the canonical MCP envelope's inner
+  `args` payload** (D8). All 22 `OperationConstraints` fields have an
+  enforcement branch. Any `kvendra.aws.s3_sync` / `cloudfront_invalidate`
+  / `lambda_invoke` call against a resource outside the allowlist is now
+  rejected with a clear `AllowlistViolation`. Same for
+  `kvendra.shell.run` (binaries, cwd, argv templates, env injection),
+  `kvendra.git` (refs, tag patterns, repo alias), `kvendra.github`
+  (org/owner extraction, fields_allowed, forbidden_fields),
+  `kvendra.npm` / `kvendra.pypi` (packages/projects), and
+  `kvendra.http.request` (`forbidden_methods`, `endpoints` literal,
+  `url_pattern_regex`).
+- Closes the security gap that allowed the AC-M2-6 attacker trace
+  (`s3://attacker-bucket/...` reaching dispatch on a profile scoped to
+  `kvendra-com-prod`) and the symmetric paths through the other 18
+  fields. Threat model L2 (data exfil via mis-scoped allowlist) is now
+  structurally blocked at the enforcer.
+
+### Added
+
+- `regex` crate use in the enforcer for `url_pattern_regex`,
+  `tag_pattern`, and `cwd_pattern` (already a transitive dep — no new
+  Cargo dependency).
+- New helpers in `src/allowlist/enforcer.rs`: `regex_match`,
+  `regex_full_match`, `extract_bucket_from_s3_uri`,
+  `extract_owner_from_repo`, `argv_matches_template`.
+- D1..D8 decision register documented as module-level doc-comments in
+  `enforcer.rs` and as field-level doc-comments in `dsl.rs`.
+- `tests/integration_aws_allowlist_boundary.rs` — canonical regression
+  smoke for AC-M2-6 with two integration tests
+  (`aws_s3_sync_blocks_bucket_outside_allowlist` and
+  `aws_cloudfront_invalidate_blocks_distribution_outside_allowlist`).
+- ~50 net new in-line tests in `src/allowlist/enforcer.rs::tests` —
+  bloque A (3 fields previously enforced, but with the canonical MCP
+  envelope shape — PAT-KVD-004), bloque B (one happy + one violation
+  per new field), bloque D (defense-in-depth edges: missing inner
+  args, denylist precedence, malformed regex, envelope-meta keys not
+  visible to `fields_allowed`).
+
+### Caveats
+
+- The `url_pattern_regex` and `tag_pattern` regexes are still
+  evaluated at every `tools/call`. Pre-compiling them at YAML load
+  time is a follow-up perf optimisation; today's cost is acceptable
+  (single allowlist load per call already pays an HMAC verify and a
+  YAML parse).
+- `args_constraints` template matching is **strict-length** (D2): a
+  call with fewer or more argv slots than the template is a no-match.
+  Use the `*` wildcard token for any-single-slot, or declare multiple
+  templates of different lengths to cover variants.
+- `accept_broad_scope` is intentionally **not** enforced at runtime
+  (D7) — it remains a validator-time signal only. Operators who want
+  broad-scope rejection at YAML load are unaffected; the runtime
+  enforcer trusts the validator's previous gate.
+
 ## [0.1.0-alpha.9] — 2026-05-07
 
 E2E smoke regression fix uncovered while validating the alpha.7+ bundle

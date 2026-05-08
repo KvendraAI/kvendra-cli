@@ -85,6 +85,30 @@ fn default_reason_min() -> u32 {
 /// shape `- push: { repos: [...] }`.
 pub type Operation = BTreeMap<String, OperationConstraints>;
 
+/// Per-operation constraints. The semantics of every field below are enforced
+/// at runtime by [`crate::allowlist::enforcer::check`] against the canonical
+/// MCP envelope `{profile_id, operation, args:{...}}`.
+///
+/// # Decision register (D1..D8 — see also `enforcer.rs` module doc)
+///
+/// - **D1** `repo` (singular) is a literal-list alias for `repos` and unions
+///   with it (any-match, glob-style).
+/// - **D2** `args_constraints` is an array of allowed argv templates; the
+///   call's argv must match at least one template (any-match, strict length).
+/// - **D3** `forbidden_env_export_to_agent` denies env keys requested by the
+///   call BEFORE any exec. Defense-in-depth doubled with the existing scrub
+///   layer that sanitises env going OUT to the agent.
+/// - **D4** `forbidden_methods` AND'ed with `methods` (denylist beats
+///   allowlist; fail-closed — even if `methods` allows it).
+/// - **D5** `buckets` extracts the bucket name from the leading `s3://NAME/...`
+///   URI; bare bucket names also accepted.
+/// - **D6** `endpoints` is a literal exact-match alias for HTTP urls,
+///   union'd with `url_pattern_regex` (any-match).
+/// - **D7** `accept_broad_scope` is checked at validator time only — never
+///   in the enforcer.
+/// - **D8** Order of checks in the enforcer:
+///   `is_expired → primitive lookup → operation lookup → forbidden-first
+///   denylists → allow-list constraints`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OperationConstraints {
@@ -93,6 +117,7 @@ pub struct OperationConstraints {
     pub forbidden_args: Option<Vec<String>>,
     pub tag_pattern: Option<Vec<String>>,
     pub org: Option<Vec<String>>,
+    /// Singular alias for [`OperationConstraints::repos`] (D1 — union semantics).
     pub repo: Option<Vec<String>>,
     pub fields_allowed: Option<Vec<String>>,
     pub forbidden_fields: Option<Vec<String>>,
@@ -109,7 +134,11 @@ pub struct OperationConstraints {
     pub functions: Option<Vec<String>>,
     pub packages: Option<Vec<String>>,
     pub projects: Option<Vec<String>>,
+    /// Literal exact-match alias for HTTP url checks (D6 — union'd with
+    /// `url_pattern_regex`).
     pub endpoints: Option<Vec<String>>,
+    /// Validator-time gate (D7 — NOT enforced at runtime). Marks an
+    /// allowlist as opting in to broad-scope patterns at YAML load.
     pub accept_broad_scope: Option<bool>,
     /// Marca explícita de operación destructiva (REQ-KVD-003). Cuando es
     /// `true`, modo `ask-destructive` dispara prompt. Ausencia = `false`.
