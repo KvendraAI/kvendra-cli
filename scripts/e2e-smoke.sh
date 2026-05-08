@@ -164,8 +164,13 @@ echo "$E_AUDIT_VERIFY_OUT" | grep -q "Audit chain valid" \
 "$KVENDRA_BIN" audit --json > "$TMPHOME/audit.json"
 ROW_COUNT=$(grep -c '"id"' "$TMPHOME/audit.json" || true)
 [ "$ROW_COUNT" -ge 3 ] || fail E "expected >=3 audit rows, got $ROW_COUNT" 61
-grep -q 'allowlist_violation\|AllowlistViolation\|allowlist_denied' "$TMPHOME/audit.json" \
-  || fail E "no boundary-violation row in audit log" 62
+# Boundary-violation rows are emitted by the binary as combo
+# action="push" + status="error" + severity="warn" — there is no
+# `allowlist_violation` token in the audit JSON. Use jq to assert the
+# combo on the same row (jq is built-in on macOS and macos-latest CI).
+jq -e 'any(.action == "push" and .status == "error" and .severity == "warn")' \
+  "$TMPHOME/audit.json" >/dev/null \
+  || fail E "no boundary-violation row in audit log (action=push status=error severity=warn)" 62
 
 # ---------- F: cleanup (handled by trap) ----------
 phase F "cleanup (trap)"
