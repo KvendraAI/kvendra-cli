@@ -20,6 +20,7 @@ pub mod error;
 pub mod keychain_acl;
 pub mod mcp;
 pub mod primitives;
+pub mod protocol;
 pub mod tui;
 pub mod vault;
 
