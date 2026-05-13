@@ -94,6 +94,28 @@ pub async fn run(cmd: SecretCommand) -> KvendraResult<()> {
     let home = kvendra_home()?;
     let vault = Vault::new(home.clone());
 
+    // REQ-KVD-CLI-004 AC-RESOLVER-7 — in workspace mode, `secret add` and
+    // `secret rotate` are restricted to admin/owner. Members are bounced
+    // here with a clear hint pointing at `kvendra workspace add-secret`,
+    // which goes through the broker and respects server-side RBAC.
+    if is_workspace_mode(&home)? {
+        match &cmd {
+            SecretCommand::Add(_) | SecretCommand::Rotate(_) => {
+                return Err(KvendraError::InsufficientPrivilege(format!(
+                    "`kvendra secret {}` is local-only. \
+                     In workspace mode use `kvendra workspace add-secret` \
+                     (owner/admin only)",
+                    match &cmd {
+                        SecretCommand::Add(_) => "add",
+                        SecretCommand::Rotate(_) => "rotate",
+                        _ => "<op>",
+                    }
+                )));
+            }
+            _ => {}
+        }
+    }
+
     match cmd {
         SecretCommand::Add(args) => add(&vault, &home, args).await,
         SecretCommand::List => list(&vault),
@@ -103,6 +125,14 @@ pub async fn run(cmd: SecretCommand) -> KvendraResult<()> {
         SecretCommand::Validate(args) => validate_cmd(&vault, args),
         SecretCommand::SetAllowlist(args) => set_allowlist(&vault, &home, args),
     }
+}
+
+/// Returns true when at least one `~/.kvendra/sessions/*.token` file is
+/// present. The presence of a session is the canonical signal that the
+/// process is bound to a workspace (cf. REQ-KVD-CLI-004 AC-RESOLVER-4).
+fn is_workspace_mode(home: &Path) -> KvendraResult<bool> {
+    let sessions = crate::session::list_active_sessions(home)?;
+    Ok(!sessions.is_empty())
 }
 
 /// Resolve the master password and ensure the vault is unlocked in-process.
