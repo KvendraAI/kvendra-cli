@@ -1,7 +1,7 @@
 //! Binary entry point for `kvendra`.
 
 use clap::Parser;
-use kvendra::cli::{Cli, Commands};
+use kvendra::cli::{Cli, Commands, SessionCommand};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,6 +29,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init(args) => kvendra::cli::init::run(args).await?,
         Commands::Unlock(args) => kvendra::cli::unlock::run(args).await?,
         Commands::Lock => kvendra::cli::lock::run().await?,
+        Commands::Login(args) => kvendra::cli::login::run(args).await?,
+        Commands::Logout(args) => kvendra::cli::logout::run(args).await?,
+        Commands::Session(cmd) => match cmd {
+            SessionCommand::Info(args) => kvendra::cli::session_info::run(args).await?,
+        },
+        Commands::Workspace(cmd) => kvendra::cli::workspace::run(cmd).await?,
         Commands::Recover(args) => kvendra::cli::recover::run(args).await?,
         Commands::Secret(cmd) => kvendra::cli::secret::run(cmd).await?,
         Commands::Primitive(cmd) => kvendra::cli::primitive::run(cmd).await?,

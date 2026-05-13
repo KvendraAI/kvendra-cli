@@ -10,11 +10,15 @@ pub mod config_recovery_codes;
 pub mod dashboard;
 pub mod init;
 pub mod lock;
+pub mod login;
+pub mod logout;
 pub mod mcp;
 pub mod primitive;
 pub mod recover;
 pub mod secret;
+pub mod session_info;
 pub mod unlock;
+pub mod workspace;
 
 use clap::{Parser, Subcommand};
 
@@ -39,6 +43,16 @@ pub enum Commands {
     Unlock(unlock::UnlockArgs),
     /// Lock the vault (zeroize derived key).
     Lock,
+    /// Authenticate to a Kvendra workspace (OIDC PKCE) or alias for `unlock`.
+    Login(login::LoginArgs),
+    /// Clear workspace session or lock the local vault.
+    Logout(logout::LogoutArgs),
+    /// Show active mode (local vs workspace) and session details.
+    #[command(subcommand)]
+    Session(SessionCommand),
+    /// Workspace admin/member operations against the broker.
+    #[command(subcommand)]
+    Workspace(workspace::WorkspaceCommand),
     /// Reset the master password using the BIP-39 mnemonic (ADR-KVD-011).
     Recover(recover::RecoverArgs),
     /// Manage stored secret profiles.
@@ -59,4 +73,10 @@ pub enum Commands {
     /// Manage CLI configuration (keychain etc.).
     #[command(subcommand)]
     Config(config_cmd::ConfigCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionCommand {
+    /// Show mode + workspace + JWT TTL + (optionally) verbose claims.
+    Info(session_info::SessionInfoArgs),
 }
