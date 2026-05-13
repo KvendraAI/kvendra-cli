@@ -5,6 +5,104 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
+## [0.3.0-alpha.1] — 2026-05-13
+
+**Workspace mode (Team / Enterprise tier groundwork).** This release
+introduces the optional `RemoteBrokerResolver` and the OIDC PKCE login
+flow that backs it. The standalone (Free) tier path is preserved
+byte-for-byte: a binary upgraded to `0.3.0-alpha.1` with no workspace
+session on disk behaves exactly like `0.1.0`.
+
+Version note: `0.2.0` is reserved for the Apple Developer ID +
+notarization milestone tracked under `ROAD-KVD-CLI-002`. Workspace
+mode is intentionally minted as `0.3.0-alpha.N` so the two branches
+do not collide.
+
+### Added
+
+- **`SecretResolver` trait** with two implementations:
+  - `LocalVaultResolver` — wraps the existing zero-knowledge vault,
+    preserving pre-Sprint-4 semantics (`audit_id == None`,
+    `expires_at == now + 365d`).
+  - `RemoteBrokerResolver` — `POST /v1/profiles/{id}/tokens:issue`
+    against the broker behind `KVENDRA_BROKER_URL` (default
+    `https://api.kvendra.cloud`). Full HTTP error mapping:
+    `401 → WorkspaceMembershipRevoked`,
+    `403 → InsufficientPrivilege`, `410 → ProfileExpired`,
+    `429 → RateLimited`.
+- **OIDC Authorization Code + PKCE flow** (`auth/oidc.rs`) with a
+  loopback callback receiver bound in the port range `54321..54330`
+  (10 ports × {127.0.0.1, localhost} = 20 URLs configured in the
+  OIDC public client). PKCE per RFC 7636, state CSRF token,
+  constant-time comparison.
+- **Proactive JWT refresh** (`auth/refresh.rs`) — 5 min lead time,
+  cross-process flock on `~/.kvendra/sessions/<ws>.token.lock`,
+  `invalid_grant` re-mapped to `WorkspaceSessionExpired`. Runs in a
+  background tokio task while `mcp serve` is live.
+- **Allowlist sync** (`workspace/allowlist_sync.rs`) — pulls templates
+  from the broker on `login` and every 5 min thereafter; per-template
+  cache YAML under `~/.kvendra/cache/allowlists/<ws>/`, file mode
+  `0o400`. After 24 h without a successful sync the workspace is
+  marked `stale_blocked` and `tools/call` rejects with
+  `AllowlistCacheStale`.
+- **Audit DB migration v2** (`audit/migrations.rs`):
+  - New columns `remote_audit_id TEXT NULL` and
+    `hmac_version INTEGER NOT NULL DEFAULT 1`.
+  - Index `idx_audit_remote_id`.
+  - `schema_migrations` ledger tracks applied versions.
+  - **HMAC versioning per row** — historical rows keep `compute_hmac_v1`
+    (no `remote_audit_id`); new rows write `compute_hmac_v2` which
+    binds the ULID into the chain. `verify_chain` dispatches on the
+    row's `hmac_version` column.
+- **CLI subcommands**:
+  - `kvendra login --workspace <id>` — PKCE flow + persist session +
+    initial allowlist sync.
+  - `kvendra logout [--workspace <id>]` — delete session or lock vault.
+  - `kvendra session info [-v] [--json]` — show mode, workspace,
+    member, JWT TTL. Verbose adds refresh expiry, audience,
+    last_token_refresh_at, last_allowlist_sync_at, broker/auth URLs.
+  - `kvendra workspace add-secret` (admin/owner via broker RBAC).
+  - `kvendra workspace allowlist refresh`.
+  - `kvendra workspace members list`.
+  - `kvendra workspace profiles list`.
+- **Cloud-agnostic CI lint** — `scripts/ci-cloud-agnostic-check.sh`
+  greps `src/{secret_resolver,auth,protocol,workspace,session}/` for
+  vendor-specific strings and fails the build on any leak. Wired into
+  `.github/workflows/ci.yml` as the `cloud-agnostic` job.
+- **New error variants** (`error.rs`): `WorkspaceMembershipRevoked`,
+  `WorkspaceSessionExpired`, `RateLimited`, `BrokerUnreachable`,
+  `OidcCallbackPortRangeExhausted`, `OidcStateMismatch`,
+  `OidcDiscoveryFailed`, `OidcFlow`, `AuditMigrationHmacMismatch`,
+  `AuditMigrationAborted`, `InsufficientPrivilege`,
+  `MultipleWorkspaceSessionsAmbiguous`, `AllowlistCacheStale`,
+  `AllowlistDeniedByBroker`, `SessionStore`.
+
+### Changed
+
+- **`kvendra secret add` / `secret rotate`** now return
+  `InsufficientPrivilege` in workspace mode, pointing the user at
+  `kvendra workspace add-secret` (server-side RBAC).
+- **`AuditEvent`** gains `remote_audit_id: Option<String>`. Eight
+  in-tree construction sites updated.
+- **`ServerContext`** gains `resolver`, `session`, `workspace_id`.
+- **`Cargo.toml`** new deps: `async-trait`, `chrono`, `url`,
+  `urlencoding`, `fs2`, `tiny_http`, `webbrowser`.
+
+### Notes for upgraders
+
+- A binary upgraded to `0.3.0-alpha.1` with no workspace session on
+  disk behaves identically to `0.1.0`. The migration only adds columns
+  and indices to `audit.db`; existing rows keep their v1 HMACs.
+- Trust boundary: workspace `refresh_token` lives plaintext on disk at
+  `~/.kvendra/sessions/<ws>.token` (mode 0600). This matches
+  `ADR-KVD-ENTERPRISE-002` — a compromised laptop yields a JWT
+  revocable server-side within 5–15 min.
+
+### Trazabilidad
+
+- ISSUE-KVD-CLI-046 (parent), REQ-KVD-CLI-004/008/009/010,
+  ADR-KVD-ENTERPRISE-001/002, ROAD-KVD-ENTERPRISE-001 M1 Sprint 4.
+
 ## [0.1.0] — 2026-05-08
 
 **First stable release.** Multi-platform CLI (macOS / Linux / Windows)
