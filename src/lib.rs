@@ -13,6 +13,7 @@
 pub mod allowlist;
 pub mod approval;
 pub mod audit;
+pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod detection;
@@ -21,8 +22,11 @@ pub mod keychain_acl;
 pub mod mcp;
 pub mod primitives;
 pub mod protocol;
+pub mod secret_resolver;
+pub mod session;
 pub mod tui;
 pub mod vault;
+pub mod workspace;
 
 pub use error::{KvendraError, KvendraResult};
 

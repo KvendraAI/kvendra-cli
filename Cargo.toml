@@ -1,6 +1,6 @@
 [package]
 name = "kvendra"
-version = "0.1.0"
+version = "0.3.0-alpha.1"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -73,6 +73,14 @@ regex = "1"
 time = { version = "0.3.47", features = ["formatting", "macros", "parsing"] }
 hex = "0.4"
 base64 = "0.22"
+# M1 Sprint 4 — CLI workspace mode (REQ-KVD-CLI-004/008/009/010)
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+url = "2"
+urlencoding = "2"
+fs2 = "0.4"
+tiny_http = "0.12"
+webbrowser = "1"
 
 [features]
 default = ["tui"]
