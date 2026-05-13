@@ -26,9 +26,9 @@ pub const PORT_RANGE_LOW: u16 = 54321;
 /// Highest loopback port the CLI tries when binding the OIDC callback receiver.
 pub const PORT_RANGE_HIGH: u16 = 54330;
 
-/// Default Cognito User Pool client id for staging. Override via env
+/// Default OIDC `client_id` for staging. Override via env
 /// `KVENDRA_CLIENT_ID`. The constant is provider-agnostic by name (it is
-/// the canonical OIDC `client_id`, not a vendor-specific identifier).
+/// the canonical OIDC public client id, not a vendor-specific identifier).
 pub const DEFAULT_CLIENT_ID: &str = "5ab5mhjhv0l6akhiqndvt636b";
 
 /// PKCE proof carriers (RFC 7636).
@@ -284,9 +284,9 @@ async fn parse_token_response(resp: reqwest::Response) -> KvendraResult<TokenSet
         access_token: String,
         #[serde(default)]
         id_token: String,
-        // Cognito does NOT rotate refresh_tokens; the field may be absent on
-        // refresh responses. Keep a stable default so the caller can fall
-        // back to the previous refresh_token.
+        // Some IdPs do NOT rotate refresh_tokens; the field may be absent
+        // on refresh responses. Keep a stable default so the caller can
+        // fall back to the previously-cached refresh_token.
         #[serde(default)]
         refresh_token: String,
         #[serde(default)]

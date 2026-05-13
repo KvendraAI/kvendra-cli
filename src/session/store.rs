@@ -77,8 +77,8 @@ impl SessionState {
             jwt: token_set.access_token.clone(),
             jwt_expires_at,
             refresh_token,
-            // Cognito does not expose a refresh expiry claim by default; the
-            // pool-level TTL stays in the IdP. Leave None and let
+            // Some IdPs do not expose a refresh expiry claim by default;
+            // the TTL is governed server-side. Leave None and let
             // `session info` show "unknown" gracefully.
             refresh_token_expires_at: None,
             issuer: issuer.into(),

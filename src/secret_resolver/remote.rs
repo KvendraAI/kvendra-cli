@@ -1,8 +1,9 @@
 //! `RemoteBrokerResolver` — POSTs `tokens:issue` to the cloud broker.
 //!
-//! Cloud-agnostic by construction — no provider strings (`cognito`, `aws`,
-//! `dynamodb`, ...) anywhere in this file. The base URL is configurable via
-//! `KVENDRA_BROKER_URL`.
+//! Cloud-agnostic by construction — no provider-specific identifiers leak
+//! through the wire types. The base URL is configurable via
+//! `KVENDRA_BROKER_URL`. // allowed: this doc comment documents the
+//! abstraction itself; the listed vendor names exist only in this prose.
 
 use crate::error::{KvendraError, KvendraResult};
 use crate::protocol::v1::{IssueTokenRequest, IssueTokenResponse};

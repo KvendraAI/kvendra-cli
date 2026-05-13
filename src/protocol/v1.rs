@@ -31,7 +31,7 @@ pub struct IssueTokenRequest {
 
 /// Successful 200 response from `tokens:issue`. The ephemeral token has a
 /// short TTL (≤15min per ADR-KVD-ENTERPRISE-001) and the `audit_id`
-/// correlates with the central audit entity (`AUDIT` in the broker DynamoDB).
+/// correlates with the central audit entity in the broker's audit store.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IssueTokenResponse {
     pub token: String,

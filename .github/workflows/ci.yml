@@ -54,3 +54,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-features
+
+  cloud-agnostic:
+    name: cloud-agnostic-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cloud-agnostic check (REQ-KVD-CLI-004 AC-RESOLVER-8)
+        run: bash scripts/ci-cloud-agnostic-check.sh
