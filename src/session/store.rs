@@ -75,7 +75,7 @@ impl SessionState {
             tenant_id: tenant_id.into(),
             member_id: member_id.into(),
             member_email: member_email.into(),
-            jwt: token_set.access_token.clone(),
+            jwt: token_set.id_token.clone(),
             jwt_expires_at,
             refresh_token,
             // Some IdPs do not expose a refresh expiry claim by default;
