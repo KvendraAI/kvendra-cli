@@ -24,12 +24,15 @@ use crate::mcp::protocol::{
 };
 use crate::mcp::transport::StdioTransport;
 use crate::primitives::catalog;
+use crate::secret_resolver::{CallCtx, SecretResolver};
+use crate::session::{SessionState, list_active_sessions};
 use crate::vault::{SecretPlaintext, Vault};
+use chrono::Utc;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
@@ -60,6 +63,17 @@ pub struct ServerContext {
     /// Inicializado a `Transport::Mcp` desde `serve_with_vault`; tests
     /// pure-policy pueden construir un `ServerContext` con `Transport::Cli`.
     pub transport: Transport,
+    /// Secret resolver injected at startup (REQ-KVD-CLI-004 AC-RESOLVER-4).
+    /// `None` only when neither a workspace session nor an unlocked vault is
+    /// available — in that case `tools/call` short-circuits with the usual
+    /// VaultLocked / ProfileNotFound errors via the legacy path.
+    pub resolver: Option<Arc<dyn SecretResolver>>,
+    /// Shared session state when running in workspace mode. `None` in local
+    /// (standalone) mode. Cloned into the proactive refresh background task.
+    pub session: Option<Arc<RwLock<SessionState>>>,
+    /// Workspace identifier this server is bound to (mirrors
+    /// `session.workspace_id`). Used by allowlist sync + stale-blocked checks.
+    pub workspace_id: Option<String>,
 }
 
 /// Run the MCP server until the client disconnects (creates a fresh `Vault`
@@ -102,6 +116,81 @@ pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
         }
     };
 
+    // REQ-KVD-CLI-004 AC-RESOLVER-4 — pick Local vs Remote based on session
+    // presence. Multi-session ambiguity is resolved by KVENDRA_ACTIVE_WORKSPACE.
+    let (resolver, session_arc, workspace_id) = build_resolver(&home, &vault)?;
+
+    // REQ-KVD-CLI-008 AC-JWT-5 — proactive refresh in a tokio background
+    // task. Wakes every 60s; refreshes when the cached JWT is within 5min
+    // of expiry. Errors are logged; the next tools/call surfaces
+    // WorkspaceSessionExpired explicitly.
+    if let Some(session) = session_arc.clone() {
+        let home_bg = home.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match crate::auth::refresh::refresh_if_needed(&home_bg, &session).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "kvendra::auth",
+                            error = %e,
+                            "background refresh failed"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    // REQ-KVD-CLI-009 AC-ALLOWSYNC-1 — full sync on startup + periodic ticks
+    // every N minutes (default 5).
+    if let (Some(session), Some(ws_id)) = (session_arc.clone(), workspace_id.clone()) {
+        let home_bg = home.clone();
+        let ws_id_owned = ws_id.clone();
+        tokio::spawn(async move {
+            // Initial full sync — best effort.
+            let jwt = session.read().await.jwt.clone();
+            if let Err(e) =
+                crate::workspace::allowlist_sync::sync_once(&home_bg, &ws_id_owned, &jwt, true)
+                    .await
+            {
+                tracing::warn!(
+                    target: "kvendra::workspace",
+                    workspace = %ws_id_owned,
+                    error = %e,
+                    "initial allowlist sync failed"
+                );
+            }
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                u64::from(crate::workspace::allowlist_sync::DEFAULT_SYNC_INTERVAL_MINUTES) * 60,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // consume immediate tick
+            loop {
+                ticker.tick().await;
+                let jwt = session.read().await.jwt.clone();
+                match crate::workspace::allowlist_sync::sync_once(
+                    &home_bg, &ws_id_owned, &jwt, false,
+                )
+                .await
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "kvendra::workspace",
+                            workspace = %ws_id_owned,
+                            error = %e,
+                            "allowlist sync tick failed"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     let ctx = Arc::new(ServerContext {
         vault,
         config,
@@ -109,6 +198,9 @@ pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
         approval_cache: Arc::new(ApprovalCache::new()),
         approval_prompt_lock: Arc::new(Mutex::new(())),
         transport: Transport::Mcp,
+        resolver,
+        session: session_arc,
+        workspace_id,
     });
     let mut transport = StdioTransport::new();
 
@@ -120,6 +212,71 @@ pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
         w.shutdown().await;
     }
     Ok(())
+}
+
+/// Select the [`SecretResolver`] implementation based on the presence of
+/// workspace session tokens under `~/.kvendra/sessions/`. Per
+/// REQ-KVD-CLI-004 AC-RESOLVER-4:
+///  - 0 sessions → `LocalVaultResolver`.
+///  - 1 session  → `RemoteBrokerResolver` bound to that workspace.
+///  - ≥2 sessions → require `KVENDRA_ACTIVE_WORKSPACE`; else error.
+#[allow(clippy::type_complexity)]
+fn build_resolver(
+    home: &std::path::Path,
+    vault: &Vault,
+) -> KvendraResult<(
+    Option<Arc<dyn SecretResolver>>,
+    Option<Arc<RwLock<SessionState>>>,
+    Option<String>,
+)> {
+    let active = list_active_sessions(home)?;
+    match active.len() {
+        0 => {
+            let resolver = Arc::new(crate::secret_resolver::local::LocalVaultResolver::new(
+                vault.clone(),
+            ));
+            Ok((Some(resolver as Arc<dyn SecretResolver>), None, None))
+        }
+        1 => {
+            let ws_id = active.into_iter().next().expect("len==1");
+            let Some(state) = SessionState::load(home, &ws_id)? else {
+                // Race: the file disappeared between list+load. Fall back to local.
+                let resolver = Arc::new(
+                    crate::secret_resolver::local::LocalVaultResolver::new(vault.clone()),
+                );
+                return Ok((Some(resolver as Arc<dyn SecretResolver>), None, None));
+            };
+            let session_arc = Arc::new(RwLock::new(state));
+            let resolver = Arc::new(crate::secret_resolver::remote::RemoteBrokerResolver::new(
+                session_arc.clone(),
+            )?);
+            Ok((
+                Some(resolver as Arc<dyn SecretResolver>),
+                Some(session_arc),
+                Some(ws_id),
+            ))
+        }
+        _ => {
+            let pick = std::env::var("KVENDRA_ACTIVE_WORKSPACE").ok();
+            let Some(ws_id) = pick else {
+                return Err(KvendraError::MultipleWorkspaceSessionsAmbiguous);
+            };
+            let Some(state) = SessionState::load(home, &ws_id)? else {
+                return Err(KvendraError::SessionStore(format!(
+                    "KVENDRA_ACTIVE_WORKSPACE points to '{ws_id}' but no session token found"
+                )));
+            };
+            let session_arc = Arc::new(RwLock::new(state));
+            let resolver = Arc::new(crate::secret_resolver::remote::RemoteBrokerResolver::new(
+                session_arc.clone(),
+            )?);
+            Ok((
+                Some(resolver as Arc<dyn SecretResolver>),
+                Some(session_arc),
+                Some(ws_id),
+            ))
+        }
+    }
 }
 
 /// Dispatch a single JSON-RPC request against an existing [`ServerContext`].
@@ -215,7 +372,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             Decision::Error => {
                 flags.push("detection_error".into());
                 let _ =
-                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true).await;
+                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true, None).await;
                 return JsonRpcResponse::error(
                     id,
                     codes::APPLICATION_ERROR,
@@ -231,7 +388,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
                     let _ = ctx.vault.mark_quarantined(&profile_id);
                 }
                 let _ =
-                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true).await;
+                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true, None).await;
                 return JsonRpcResponse::error(
                     id,
                     codes::APPLICATION_ERROR,
@@ -252,7 +409,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             Err(KvendraError::AllowlistTampered(pid)) => {
                 flags.push("allowlist_tampered_detected".into());
                 let _ =
-                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true).await;
+                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true, None).await;
                 let data = serde_json::json!({
                     "error_type": "allowlist_tampered",
                     "hint": "re-run `kvendra secret set-allowlist <profile> --file <yaml>` or restore from backup",
@@ -273,7 +430,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
                     flags.push(canonical_flag.into());
                 }
                 let _ =
-                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true).await;
+                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true, None).await;
                 // AC-MCP-3 defence in depth: the error string can include the
                 // primitive's argv / parsed YAML on certain code paths, which
                 // could carry leaked tokens. Always scrub before returning.
@@ -292,7 +449,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         flags.push(flag.into());
     }
     if approval_decision.blocks_dispatch() {
-        let _ = record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true).await;
+        let _ = record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true, None).await;
         let error_type = approval_decision.error_type().unwrap_or("approval_failed");
         let hint = approval::hint_for(approval_decision, ctx.config.approval.timeout_seconds);
         let data = serde_json::json!({
@@ -307,17 +464,79 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         );
     }
 
-    // Started event. `0` indicates audit was disabled (vault locked).
-    let event_id: i64 = record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, false)
-        .await
-        .unwrap_or_default();
+    // REQ-KVD-CLI-009 AC-ALLOWSYNC-3 — if the allowlist cache has been stale
+    // for >24h, refuse the call before talking to the resolver.
+    if let Some(ws_id) = ctx.workspace_id.as_deref() {
+        if crate::workspace::allowlist_sync::is_stale_blocked(ctx.vault.home(), ws_id) {
+            flags.push("allowlist_cache_stale".into());
+            let _ =
+                record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true, None)
+                    .await;
+            return JsonRpcResponse::error(
+                id,
+                codes::APPLICATION_ERROR,
+                KvendraError::AllowlistCacheStale.to_string(),
+            );
+        }
+    }
 
-    // Load secret plaintext if vault unlocked + profile exists.
-    let secret = if !profile_id.is_empty() && ctx.vault.is_unlocked() {
-        ctx.vault.get_secret(&profile_id).ok()
+    // Resolve the secret via the configured SecretResolver. In local mode
+    // this is the existing vault path; in workspace mode the resolver POSTs
+    // tokens:issue to the broker. The 8 primitives stay untouched — they
+    // consume `Option<&SecretPlaintext>` exactly as before.
+    //
+    // We resolve BEFORE writing the Started audit row so the remote
+    // `audit_id` correlation rides on the same row.
+    let mut remote_audit_id_for_event: Option<String> = None;
+    let secret: Option<SecretPlaintext> = if profile_id.is_empty() {
+        None
+    } else if let Some(resolver) = ctx.resolver.as_ref() {
+        let ctx_call = CallCtx {
+            primitive: name.to_string(),
+            op: action.clone(),
+            args_hash_hex: args_hash_hex(&arguments),
+            requested_at: Utc::now(),
+        };
+        match resolver.resolve(&profile_id, &ctx_call).await {
+            Ok(eph) => {
+                remote_audit_id_for_event = eph.audit_id.clone();
+                Some(eph.token)
+            }
+            Err(KvendraError::ProfileNotFound) | Err(KvendraError::VaultLocked) => None,
+            Err(other) => {
+                // Fail the call early with a sanitized message — the
+                // resolver-level errors (WorkspaceMembershipRevoked,
+                // BrokerUnreachable, RateLimited, ...) carry user-friendly
+                // text and never include secret material.
+                let msg = crate::detection::sanitize_output(&other.to_string());
+                let _ =
+                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true, None)
+                        .await;
+                return JsonRpcResponse::error(id, codes::APPLICATION_ERROR, msg);
+            }
+        }
     } else {
+        // Resolver not constructed (vault locked + no workspace session) —
+        // legacy fall-through. Primitives that do not require a profile
+        // still execute.
         None
     };
+
+    // Started event. `0` indicates audit was disabled (vault locked). The
+    // `remote_audit_id` (when present) commits to the chain via the v2
+    // HMAC, materializing the cross-component audit correlation.
+    let event_id: i64 = record_audit(
+        &ctx,
+        &arguments,
+        name,
+        &profile_id,
+        &action,
+        &flags,
+        false,
+        remote_audit_id_for_event.as_deref(),
+    )
+    .await
+    .unwrap_or_default();
 
     let outcome = invoke_primitive(name, &arguments, &ctx.vault, secret.as_ref()).await;
     drop(secret); // explicit drop → ZeroizeOnDrop fires.
@@ -410,6 +629,7 @@ async fn record_audit(
     action: &str,
     flags: &[String],
     failed_pre_dispatch: bool,
+    remote_audit_id: Option<&str>,
 ) -> KvendraResult<i64> {
     let Some(w) = &ctx.writer else {
         return Err(KvendraError::Audit("audit disabled (vault locked)".into()));
@@ -431,7 +651,7 @@ async fn record_audit(
             Severity::Info
         },
         flags: flags.join(","),
-        remote_audit_id: None,
+        remote_audit_id: remote_audit_id.map(str::to_string),
     };
     w.record(event).await
 }
@@ -638,6 +858,9 @@ mod tests {
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
             transport: Transport::Mcp,
+            resolver: None,
+            session: None,
+            workspace_id: None,
         };
         (dir, ctx)
     }
@@ -758,6 +981,9 @@ mod tests {
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
             transport: Transport::Mcp,
+            resolver: None,
+            session: None,
+            workspace_id: None,
         };
         let res = enforce_allowlist(
             &ctx,

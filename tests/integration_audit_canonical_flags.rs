@@ -83,6 +83,9 @@ async fn bootstrap_ctx(yaml: &str, profile_id: &str) -> (TempDir, Arc<ServerCont
         approval_cache: Arc::new(ApprovalCache::new()),
         approval_prompt_lock: Arc::new(Mutex::new(())),
         transport: Transport::Mcp,
+        resolver: None,
+        session: None,
+        workspace_id: None,
     });
     (dir, ctx)
 }
