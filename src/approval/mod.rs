@@ -333,6 +333,7 @@ pub fn build_pre_dispatch_event(
             Severity::Info
         },
         flags: flags.join(","),
+        remote_audit_id: None,
     }
 }
 

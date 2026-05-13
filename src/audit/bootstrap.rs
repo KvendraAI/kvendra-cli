@@ -33,6 +33,7 @@ pub async fn write_vault_created_event(
         status: Status::Ok,
         severity: Severity::Info,
         flags: String::new(),
+        remote_audit_id: None,
     };
     writer.record(event).await?;
     writer.shutdown().await;

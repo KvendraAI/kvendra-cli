@@ -4,8 +4,13 @@
 //! and feed it via `tokio::sync::mpsc`. This serializes writes, removes
 //! contention, and lets async callers `await` enqueue without blocking the
 //! reactor.
+//!
+//! Post-v2 migration every new row writes with `hmac_version = 2` and the
+//! HMAC includes `remote_audit_id` (NULL canonicalized to the empty
+//! string). The `update_event_status` path re-hashes under v2 as well to
+//! keep the row's HMAC in sync with the post-update status/severity.
 
-use crate::audit::hmac::compute_hmac;
+use crate::audit::hmac::compute_hmac_v2;
 use crate::audit::schema::init;
 use crate::audit::{AuditEvent, Severity, Status};
 use crate::error::{KvendraError, KvendraResult};
@@ -117,8 +122,8 @@ fn record_event(conn: &Connection, hmac_key: &[u8], event: &AuditEvent) -> Kvend
     // Insert with placeholder hmac to obtain the autoincrement id.
     conn.execute(
         "INSERT INTO audit_events (ts_unix_ms, profile_id, primitive, action, args_hash_hex,
-         status, severity, flags, prev_hmac_hex, hmac_hex)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+         status, severity, flags, prev_hmac_hex, hmac_hex, remote_audit_id, hmac_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         rusqlite::params![
             event.ts_unix_ms,
             event.profile_id,
@@ -130,11 +135,13 @@ fn record_event(conn: &Connection, hmac_key: &[u8], event: &AuditEvent) -> Kvend
             event.flags,
             prev,
             "",
+            event.remote_audit_id,
+            2_i64,
         ],
     )?;
     let id = conn.last_insert_rowid();
 
-    let mac = compute_hmac(
+    let mac = compute_hmac_v2(
         hmac_key,
         id,
         event.ts_unix_ms,
@@ -146,6 +153,7 @@ fn record_event(conn: &Connection, hmac_key: &[u8], event: &AuditEvent) -> Kvend
         event.severity.as_str(),
         &event.flags,
         &prev,
+        event.remote_audit_id.as_deref(),
     );
 
     conn.execute(
@@ -168,15 +176,22 @@ fn update_event_status(
         rusqlite::params![status.as_str(), severity.as_str(), id],
     )?;
 
-    // 2) Re-compute HMAC over the updated row and persist.
-    //
-    // Without this, the chain breaks when `verify` recomputes the row's
-    // HMAC using the post-update status/severity (e.g. "ok") while the
-    // stored HMAC was signed over the pre-update values (e.g. "started").
-    // Since the writer task is serial (mpsc + dedicated thread), the next
-    // INSERT always observes the post-UPDATE HMAC as `prev_hmac`, so the
-    // chain remains consistent.
-    let (ts_unix_ms, profile_id, primitive, action, args_hash_hex, flags, prev_hmac): (
+    // 2) Re-compute HMAC over the updated row and persist. We pull
+    // `hmac_version` and `remote_audit_id` so the function can dispatch to
+    // the right HMAC layout. Without this the chain breaks when `verify`
+    // recomputes the row's HMAC using post-update values while the stored
+    // HMAC was signed over pre-update ones.
+    let (
+        ts_unix_ms,
+        profile_id,
+        primitive,
+        action,
+        args_hash_hex,
+        flags,
+        prev_hmac,
+        remote_audit_id,
+        hmac_version,
+    ): (
         i64,
         String,
         String,
@@ -184,8 +199,11 @@ fn update_event_status(
         String,
         String,
         String,
+        Option<String>,
+        i64,
     ) = conn.query_row(
-        "SELECT ts_unix_ms, profile_id, primitive, action, args_hash_hex, flags, prev_hmac_hex
+        "SELECT ts_unix_ms, profile_id, primitive, action, args_hash_hex, flags, prev_hmac_hex,
+                remote_audit_id, hmac_version
          FROM audit_events WHERE id = ?1",
         [id],
         |r| {
@@ -197,23 +215,42 @@ fn update_event_status(
                 r.get(4)?,
                 r.get(5)?,
                 r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
             ))
         },
     )?;
 
-    let mac = compute_hmac(
-        hmac_key,
-        id,
-        ts_unix_ms,
-        &profile_id,
-        &primitive,
-        &action,
-        &args_hash_hex,
-        status.as_str(),
-        severity.as_str(),
-        &flags,
-        &prev_hmac,
-    );
+    let mac = if hmac_version >= 2 {
+        compute_hmac_v2(
+            hmac_key,
+            id,
+            ts_unix_ms,
+            &profile_id,
+            &primitive,
+            &action,
+            &args_hash_hex,
+            status.as_str(),
+            severity.as_str(),
+            &flags,
+            &prev_hmac,
+            remote_audit_id.as_deref(),
+        )
+    } else {
+        crate::audit::hmac::compute_hmac_v1(
+            hmac_key,
+            id,
+            ts_unix_ms,
+            &profile_id,
+            &primitive,
+            &action,
+            &args_hash_hex,
+            status.as_str(),
+            severity.as_str(),
+            &flags,
+            &prev_hmac,
+        )
+    };
 
     conn.execute(
         "UPDATE audit_events SET hmac_hex = ?1 WHERE id = ?2",

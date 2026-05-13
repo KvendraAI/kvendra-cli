@@ -217,6 +217,7 @@ pub async fn regenerate_inner(
                 status: Status::Error,
                 severity: Severity::Warn,
                 flags: "recovery_codes_regenerate_aborted_acknowledge_mismatch".to_string(),
+                remote_audit_id: None,
             })
             .await?;
         writer.shutdown().await;
@@ -286,6 +287,7 @@ pub async fn regenerate_inner(
             flags: format!(
                 "recovery_codes_regenerated,previous_used_count_{previous_used_count}"
             ),
+            remote_audit_id: None,
         })
         .await?;
     writer.shutdown().await;

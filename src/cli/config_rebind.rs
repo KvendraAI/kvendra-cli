@@ -220,6 +220,7 @@ pub async fn rebind_inner(
                 status: Status::Error,
                 severity: Severity::Warn,
                 flags: format!("recovery_code_replay_attempted,slot_{slot}"),
+                remote_audit_id: None,
             };
             writer.record(event).await?;
             writer.shutdown().await;
@@ -287,6 +288,7 @@ pub async fn rebind_inner(
         status: Status::Ok,
         severity: Severity::Warn,
         flags: format!("home_rebound,recovery_code_consumed:slot_{slot_idx}"),
+        remote_audit_id: None,
     };
     writer.record(event).await?;
     writer.shutdown().await;

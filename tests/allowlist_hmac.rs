@@ -109,6 +109,7 @@ async fn audit_chain_remains_intact_when_tampering_event_appended() {
         profile_id: "p".into(),
         args_hash_hex: kvendra::audit::reader::args_hash_hex(&serde_json::json!({})),
         flags: "allowlist_tampered_detected".into(),
+        remote_audit_id: None,
     };
     let row_id = writer.record(event).await.unwrap();
     writer

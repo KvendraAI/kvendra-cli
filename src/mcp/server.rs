@@ -431,6 +431,7 @@ async fn record_audit(
             Severity::Info
         },
         flags: flags.join(","),
+        remote_audit_id: None,
     };
     w.record(event).await
 }
@@ -515,6 +516,7 @@ async fn enforce_allowlist(
                     status: Status::Ok,
                     severity: Severity::Info,
                     flags: "allowlist_hmac_migrated".to_string(),
+                    remote_audit_id: None,
                 };
                 writer.record(event).await?;
             }
