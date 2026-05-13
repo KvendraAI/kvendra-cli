@@ -69,6 +69,14 @@ impl SessionState {
         };
         let jwt_expires_at =
             now + ChronoDuration::seconds(token_set.expires_in.try_into().unwrap_or(900));
+        // OAuth2 refresh_token TTL is governed server-side and not echoed
+        // in the standard `oauth2/token` response. We surface a best-effort
+        // expiry derived from `KVENDRA_REFRESH_TOKEN_TTL_DAYS` (default 30),
+        // so `session info -v` can show a usable value instead of "unknown".
+        let refresh_ttl_days: i64 = std::env::var("KVENDRA_REFRESH_TOKEN_TTL_DAYS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
         Self {
             schema_version: SCHEMA_VERSION,
             workspace_id: workspace_id.into(),
@@ -78,10 +86,7 @@ impl SessionState {
             jwt: token_set.id_token.clone(),
             jwt_expires_at,
             refresh_token,
-            // Some IdPs do not expose a refresh expiry claim by default;
-            // the TTL is governed server-side. Leave None and let
-            // `session info` show "unknown" gracefully.
-            refresh_token_expires_at: None,
+            refresh_token_expires_at: Some(now + ChronoDuration::days(refresh_ttl_days)),
             issuer: issuer.into(),
             audience: audience.into(),
             last_refresh_at: now,

@@ -8,7 +8,7 @@
 //!    session token under `~/.kvendra/sessions/`, and runs the initial
 //!    allowlist sync so the next `mcp serve` starts hot.
 
-use crate::auth::discovery::auth_base_from_env;
+use crate::auth::discovery::{auth_base_from_env, discovery_url_from_env};
 use crate::auth::oidc::{client_id_from_env, login_workspace};
 use crate::config::kvendra_home;
 use crate::error::KvendraResult;
@@ -43,11 +43,12 @@ fn standalone_hint() -> KvendraResult<()> {
 
 async fn workspace_login(workspace_id: &str) -> KvendraResult<()> {
     let home = kvendra_home()?;
+    let discovery_url = discovery_url_from_env()?;
     let auth_base = auth_base_from_env()?;
     let client_id = client_id_from_env();
 
     eprintln!("Starting workspace login for '{workspace_id}'...");
-    let token_set = login_workspace(workspace_id, &auth_base, &client_id).await?;
+    let token_set = login_workspace(workspace_id, &discovery_url, &client_id).await?;
     eprintln!("Authorization code exchanged successfully.");
 
     // Decode the id_token (or access_token) payload — we only need

@@ -92,10 +92,10 @@ pub fn bind_loopback_in_range(range: RangeInclusive<u16>) -> KvendraResult<(TcpL
 /// browser, accept callback, exchange code for tokens.
 pub async fn login_workspace(
     _workspace_id: &str,
-    auth_base: &Url,
+    discovery_url: &Url,
     client_id: &str,
 ) -> KvendraResult<TokenSet> {
-    let oidc = discover(auth_base).await?;
+    let oidc = discover(discovery_url).await?;
     let (listener, port) = bind_loopback_in_range(PORT_RANGE_LOW..=PORT_RANGE_HIGH)?;
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     let pkce = PkceFlow::generate()?;

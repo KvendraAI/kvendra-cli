@@ -8,7 +8,7 @@
 //!  - `invalid_grant` → delete the session file, return
 //!    [`KvendraError::WorkspaceSessionExpired`].
 
-use crate::auth::discovery::{auth_base_from_env, discover};
+use crate::auth::discovery::{discover, discovery_url_from_env};
 use crate::auth::oidc::{client_id_from_env, exchange_refresh_token, is_invalid_grant};
 use crate::error::{KvendraError, KvendraResult};
 use crate::session::SessionState;
@@ -28,17 +28,29 @@ pub enum RefreshOutcome {
     SkippedRefreshedByPeer,
 }
 
-/// Lead time before expiry at which we proactively refresh.
-pub const REFRESH_LEAD: ChronoDuration = ChronoDuration::minutes(5);
+/// Default lead time before expiry at which we proactively refresh.
+pub const DEFAULT_REFRESH_LEAD: ChronoDuration = ChronoDuration::minutes(5);
 
-/// Refresh the cached session if it is within [`REFRESH_LEAD`] of expiry.
+/// Read the configured lead time from `KVENDRA_JWT_REFRESH_LEAD_SECONDS`,
+/// falling back to [`DEFAULT_REFRESH_LEAD`]. Required by SPEC §V17 for
+/// E2E tests against shortened TTLs.
+fn refresh_lead() -> ChronoDuration {
+    std::env::var("KVENDRA_JWT_REFRESH_LEAD_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(ChronoDuration::seconds)
+        .unwrap_or(DEFAULT_REFRESH_LEAD)
+}
+
+/// Refresh the cached session if it is within [`refresh_lead`] of expiry.
 pub async fn refresh_if_needed(
     home: &Path,
     session: &Arc<RwLock<SessionState>>,
 ) -> KvendraResult<RefreshOutcome> {
     let now = Utc::now();
+    let lead = refresh_lead();
     let snapshot = session.read().await.clone();
-    if snapshot.jwt_expires_at - now > REFRESH_LEAD {
+    if snapshot.jwt_expires_at - now > lead {
         return Ok(RefreshOutcome::NotNeeded);
     }
 
@@ -48,14 +60,14 @@ pub async fn refresh_if_needed(
 
     // Re-read disk: a peer may have refreshed while we were waiting.
     if let Some(fresh) = SessionState::load(home, &snapshot.workspace_id)? {
-        if fresh.jwt_expires_at - now > REFRESH_LEAD {
+        if fresh.jwt_expires_at - now > lead {
             *session.write().await = fresh;
             return Ok(RefreshOutcome::SkippedRefreshedByPeer);
         }
     }
 
-    let auth_base = auth_base_from_env()?;
-    let oidc = discover(&auth_base).await?;
+    let discovery_url = discovery_url_from_env()?;
+    let oidc = discover(&discovery_url).await?;
     let client_id = client_id_from_env();
 
     let new_tokens =

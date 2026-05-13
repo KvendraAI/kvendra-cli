@@ -103,7 +103,30 @@ pub async fn run(args: SessionInfoArgs) -> KvendraResult<()> {
     };
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&view)?);
+        // JSON output is machine-readable and always carries the full
+        // payload — the caller filters fields, not us. Build a verbose
+        // view regardless of the `-v` flag.
+        let full = match sessions.len() {
+            0 => SessionView {
+                broker_url: Some(
+                    std::env::var("KVENDRA_BROKER_URL")
+                        .unwrap_or_else(|_| crate::workspace::client::DEFAULT_BROKER_BASE.into()),
+                ),
+                auth_url: Some(
+                    std::env::var("KVENDRA_AUTH_URL").unwrap_or_else(|_| DEFAULT_AUTH_BASE.into()),
+                ),
+                ..view
+            },
+            _ => {
+                let pick = std::env::var("KVENDRA_ACTIVE_WORKSPACE")
+                    .ok()
+                    .filter(|p| sessions.contains(p))
+                    .unwrap_or_else(|| sessions[0].clone());
+                let state = SessionState::load(&home, &pick)?.expect("present, just listed");
+                build_workspace_view(state, true)
+            }
+        };
+        println!("{}", serde_json::to_string_pretty(&full)?);
     } else {
         print_human(&view, args.verbose);
     }

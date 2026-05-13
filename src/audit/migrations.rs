@@ -16,10 +16,41 @@
 
 use crate::error::{KvendraError, KvendraResult};
 use rusqlite::Connection;
+use std::path::Path;
 use time::OffsetDateTime;
 
 /// Current schema version this binary writes.
 pub const CURRENT_VERSION: i64 = 2;
+
+/// Copy `audit.db` to `audit.db.backup.<unix_ts>` before a destructive
+/// migration. Best-effort — failure to backup does not abort the migration
+/// (the SQLite ALTER itself is transactional), but a warning is emitted.
+fn backup_audit_db(audit_db_path: &Path) -> Option<std::path::PathBuf> {
+    if !audit_db_path.exists() {
+        return None;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup_name = format!(
+        "{}.backup.{}",
+        audit_db_path.file_name()?.to_string_lossy(),
+        ts
+    );
+    let backup_path = audit_db_path.with_file_name(backup_name);
+    match std::fs::copy(audit_db_path, &backup_path) {
+        Ok(_) => Some(backup_path),
+        Err(e) => {
+            tracing::warn!(
+                source = %audit_db_path.display(),
+                error = %e,
+                "audit.db pre-migration backup failed (continuing — ALTER is transactional)"
+            );
+            None
+        }
+    }
+}
 
 /// Read the current schema version. Returns `0` when the table is fresh
 /// (no rows yet) — callers treat that as "needs baseline v1 insert".
@@ -76,6 +107,9 @@ fn audit_events_has_remote_audit_id(conn: &Connection) -> KvendraResult<bool> {
 }
 
 /// Apply every pending migration up to [`CURRENT_VERSION`]. Idempotent.
+/// When the [`Connection`] is backed by an on-disk file, the file is
+/// copied to `<path>.backup.<unix_ts>` before any destructive step runs.
+/// In-memory connections (tests) skip the backup.
 pub fn apply_pending(conn: &Connection) -> KvendraResult<()> {
     bootstrap_schema_migrations_table(conn)?;
     let applied = current_version(conn)?;
@@ -94,6 +128,17 @@ pub fn apply_pending(conn: &Connection) -> KvendraResult<()> {
 
     let applied = current_version(conn)?;
     if applied < 2 {
+        if let Some(db_path) = conn.path().filter(|p| !p.is_empty()) {
+            let p = Path::new(db_path);
+            if p.is_file() {
+                if let Some(backup) = backup_audit_db(p) {
+                    tracing::info!(
+                        backup = %backup.display(),
+                        "audit.db backed up before v1→v2 migration"
+                    );
+                }
+            }
+        }
         apply_v2(conn)?;
     }
     Ok(())

@@ -40,8 +40,16 @@ impl OidcConfig {
     }
 }
 
-/// Default IdP base URL. Override via env `KVENDRA_AUTH_URL`.
+/// Default IdP base URL exposed to the user (Hosted UI / authorize / token
+/// endpoints live here). Override via env `KVENDRA_AUTH_URL`.
 pub const DEFAULT_AUTH_BASE: &str = "https://auth.kvendra.cloud";
+
+/// Default OIDC discovery URL — proxied by the Kvendra broker so clients
+/// never need to know which IdP backs the deployment. Override via env
+/// `KVENDRA_OIDC_DISCOVERY_URL` to point at any IdP's
+/// `.well-known/openid-configuration` for self-hosted setups.
+pub const DEFAULT_OIDC_DISCOVERY_URL: &str =
+    "https://api.kvendra.cloud/v1/oidc/openid-configuration";
 
 /// Read the IdP base URL from `KVENDRA_AUTH_URL`, falling back to
 /// [`DEFAULT_AUTH_BASE`]. The URL is normalized to include a trailing `/`.
@@ -55,12 +63,28 @@ pub fn auth_base_from_env() -> KvendraResult<Url> {
     Url::parse(&s).map_err(|e| KvendraError::OidcDiscoveryFailed(format!("KVENDRA_AUTH_URL: {e}")))
 }
 
-/// Fetch the OIDC discovery document for `auth_base`. The endpoint is
-/// `<auth_base>/.well-known/openid-configuration`.
+/// Read the discovery URL from `KVENDRA_OIDC_DISCOVERY_URL`, falling back
+/// to [`DEFAULT_OIDC_DISCOVERY_URL`].
+pub fn discovery_url_from_env() -> KvendraResult<Url> {
+    let raw = std::env::var("KVENDRA_OIDC_DISCOVERY_URL")
+        .unwrap_or_else(|_| DEFAULT_OIDC_DISCOVERY_URL.to_string());
+    Url::parse(&raw)
+        .map_err(|e| KvendraError::OidcDiscoveryFailed(format!("KVENDRA_OIDC_DISCOVERY_URL: {e}")))
+}
+
+/// Fetch the OIDC discovery document. When `auth_base` ends in a path that
+/// already targets the discovery document (e.g. the brand-owned proxy
+/// `https://api.kvendra.cloud/v1/oidc/openid-configuration`), it is used
+/// verbatim. Otherwise the path `.well-known/openid-configuration` is
+/// joined onto the base URL.
 pub async fn discover(auth_base: &Url) -> KvendraResult<OidcConfig> {
-    let url = auth_base
-        .join(".well-known/openid-configuration")
-        .map_err(|e| KvendraError::OidcDiscoveryFailed(format!("join discovery: {e}")))?;
+    let url = if auth_base.path().ends_with("openid-configuration") {
+        auth_base.clone()
+    } else {
+        auth_base
+            .join(".well-known/openid-configuration")
+            .map_err(|e| KvendraError::OidcDiscoveryFailed(format!("join discovery: {e}")))?
+    };
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
