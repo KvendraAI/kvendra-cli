@@ -621,6 +621,7 @@ pub fn build_sanitized_payload(name: &str, value: Value) -> (String, Value) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_audit(
     ctx: &ServerContext,
     arguments: &Value,

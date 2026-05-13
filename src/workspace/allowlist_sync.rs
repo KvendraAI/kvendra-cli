@@ -129,20 +129,11 @@ pub async fn sync_once(
     full: bool,
 ) -> KvendraResult<SyncReport> {
     let client = WorkspaceClient::new(jwt.to_string())?;
-    let prior_etag = if full {
-        None
-    } else {
-        let cache_dir = cache_root(home, workspace_id);
-        std::fs::read_dir(&cache_dir)
-            .ok()
-            .and_then(|mut it| it.next())
-            .and_then(|first| first.ok())
-            .and_then(|_| {
-                // We use a per-template ETag below; this top-level value is
-                // mostly informational. Forward as None.
-                None::<String>
-            })
-    };
+    // Top-level ETag is informational — per-template ETags are written
+    // below as sidecars. `prior_etag` stays None for now; IF-002 v1.2.0
+    // will populate it via the list endpoint's `ETag` header.
+    let prior_etag: Option<String> = None;
+    let _ = full; // keep the signature stable until IF-002 v1.2.0
 
     let resp = client.list_templates(workspace_id, prior_etag.as_deref()).await?;
     let mut report = SyncReport {

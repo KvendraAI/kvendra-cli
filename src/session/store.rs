@@ -50,6 +50,7 @@ fn default_schema_version() -> u32 {
 
 impl SessionState {
     /// Construct a [`SessionState`] from a freshly obtained [`TokenSet`].
+    #[allow(clippy::too_many_arguments)]
     pub fn from_token_set(
         workspace_id: &str,
         tenant_id: &str,
