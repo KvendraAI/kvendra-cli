@@ -55,11 +55,21 @@ pub struct Config {
     pub vault: VaultConfig,
     pub detection: DetectionConfig,
     pub approval: ApprovalConfig,
+    pub telemetry: TelemetryConfig,
     /// HMAC trailer captured on load. Never serialized — written by
     /// [`Config::save`] after computing the HMAC over the rest of the
     /// document. See module docs.
     #[serde(default, skip_serializing, rename = "_hmac")]
     pub hmac_hex: Option<String>,
+}
+
+/// Telemetry preferences (M2.5 D9). Default `enabled = false` — opt-in per
+/// ROAD-KVD-007 hardening. The collector endpoint is M3+; in M2.5 only the
+/// toggle is persisted so future binaries can honour it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelemetryConfig {
+    pub enabled: bool,
 }
 
 /// Configuración del approval layer (REQ-KVD-003).

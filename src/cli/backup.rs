@@ -193,8 +193,8 @@ async fn run_list(args: ListArgs) -> KvendraResult<()> {
         return Ok(());
     }
     println!(
-        "{:<24}  {:<15}  {:<12}  {:>12}  {}",
-        "BACKUP_ID", "CREATED_AT", "VERSION", "SIZE_BYTES", "LABEL"
+        "{:<24}  {:<15}  {:<12}  {:>12}  LABEL",
+        "BACKUP_ID", "CREATED_AT", "VERSION", "SIZE_BYTES"
     );
     for it in items {
         println!(

@@ -23,6 +23,28 @@ pub enum WorkspaceCommand {
     /// Profiles subcommands.
     #[command(subcommand)]
     Profiles(ProfilesCommand),
+    /// Metadata sync subcommands (periodic background loop).
+    #[command(subcommand, name = "metadata-sync")]
+    MetadataSync(MetadataSyncCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MetadataSyncCommand {
+    /// Run the metadata sync loop (POST /v1/profiles/metadata:sync).
+    Daemon(MetadataSyncArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct MetadataSyncArgs {
+    /// Override the active workspace (defaults to the only session present).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Sync interval in seconds (default 300 = 5 min).
+    #[arg(long, default_value_t = 300)]
+    pub interval_secs: u64,
+    /// Run a single iteration and exit (for tests / one-shot scripts).
+    #[arg(long)]
+    pub once: bool,
 }
 
 #[derive(Debug, Args)]
@@ -82,7 +104,19 @@ pub async fn run(cmd: WorkspaceCommand) -> KvendraResult<()> {
         WorkspaceCommand::Allowlist(AllowlistCommand::Refresh(args)) => refresh_allowlists(args).await,
         WorkspaceCommand::Members(MembersCommand::List(args)) => list_members(args).await,
         WorkspaceCommand::Profiles(ProfilesCommand::List(args)) => list_profiles(args).await,
+        WorkspaceCommand::MetadataSync(MetadataSyncCommand::Daemon(args)) => metadata_sync_daemon(args).await,
     }
+}
+
+async fn metadata_sync_daemon(args: MetadataSyncArgs) -> KvendraResult<()> {
+    let (ws_id, state) = resolve_workspace_id(args.workspace)?;
+    let opts = crate::workspace::metadata_sync::DaemonOpts {
+        interval_secs: args.interval_secs,
+        once: args.once,
+        jwt: state.jwt.clone(),
+        workspace_id: ws_id,
+    };
+    crate::workspace::metadata_sync::run_daemon(opts).await
 }
 
 fn resolve_workspace_id(override_ws: Option<String>) -> KvendraResult<(String, SessionState)> {

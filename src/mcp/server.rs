@@ -745,7 +745,7 @@ async fn enforce_allowlist(
         }
     }
 
-    let spec: ProfileSpec = serde_yml::from_str(&raw)?;
+    let spec: ProfileSpec = serde_yaml_ng::from_str(&raw)?;
     allowlist_validate(&spec)?;
     allowlist_check(&spec, primitive, operation, arguments)?;
     Ok(migration_outcome)

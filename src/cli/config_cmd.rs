@@ -12,6 +12,7 @@ use crate::cli::config_approval::{ApprovalCommand, run as run_approval};
 use crate::cli::config_mcp_password::{McpPasswordCommand, run as run_mcp_password};
 use crate::cli::config_rebind::RebindHomeArgs;
 use crate::cli::config_recovery_codes::{RecoveryCodesCommand, run as run_recovery_codes};
+use crate::cli::config_telemetry::{TelemetryArgs, run as run_telemetry};
 use crate::config::{Config, MasterPasswordCache, ensure_layout, kvendra_home};
 use crate::error::{KvendraError, KvendraResult};
 use crate::vault::Vault;
@@ -41,6 +42,8 @@ pub enum ConfigCommand {
     /// acknowledge `REGENERATE-RECOVERY-CODES`).
     #[command(subcommand, name = "recovery-codes")]
     RecoveryCodes(RecoveryCodesCommand),
+    /// Toggle telemetry opt-in (M2.5 D9 / ROAD-KVD-007).
+    Telemetry(TelemetryArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -105,6 +108,7 @@ pub async fn run(cmd: ConfigCommand) -> KvendraResult<()> {
             return crate::cli::config_rebind::run(args).await;
         }
         ConfigCommand::RecoveryCodes(c) => return run_recovery_codes(c).await,
+        ConfigCommand::Telemetry(args) => return run_telemetry(args).await,
     }
     Ok(())
 }

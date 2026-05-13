@@ -10,12 +10,14 @@ yanked = "deny"
 #  - RUSTSEC-2024-0436: `paste` is unmaintained but pulled in transitively
 #    by `ratatui`. Replacement requires upstream `ratatui` to swap to the
 #    maintained `pastey` fork. Tracked as a Pase C task.
-#  - RUSTSEC-2025-0068: `serde_yml` is unsound. We use it only for
-#    parsing the on-disk allowlist YAML (read-only). Migrating to
-#    `serde_yaml_ng` is a Pase C task.
+#  - RUSTSEC-2026-0002: `lru` IterMut soundness — pulled in transitively
+#    by `ratatui`. We never call `IterMut` in our codebase; resolution
+#    deferred until ratatui ships an updated `lru` dependency.
+# RUSTSEC-2025-0068 (serde_yml unsound) resolved via M2.5 migration to
+# `serde_yaml_ng`.
 ignore = [
   "RUSTSEC-2024-0436",
-  "RUSTSEC-2025-0068",
+  "RUSTSEC-2026-0002",
 ]
 
 [licenses]

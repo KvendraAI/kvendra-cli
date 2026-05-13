@@ -1,17 +1,19 @@
-//! `kvendra login [--workspace <id>]` — REQ-KVD-CLI-004 AC-RESOLVER-5.
+//! `kvendra login [--workspace <id> | --pro]` — REQ-KVD-CLI-004 AC-RESOLVER-5
+//! + REQ-KVD-CLI-005 AC-BACKUP-7.
 //!
-//! Two modes:
-//!  - **standalone** (no `--workspace`): legacy vault unlock. The subcommand
-//!    is a thin alias around `kvendra unlock` that allows scripts to use a
-//!    single verb regardless of the active tier.
+//! Three modes:
+//!  - **standalone** (no flags): legacy vault unlock alias.
 //!  - **workspace**: full OIDC PKCE flow against the IdP, persists a
 //!    session token under `~/.kvendra/sessions/`, and runs the initial
-//!    allowlist sync so the next `mcp serve` starts hot.
+//!    allowlist sync.
+//!  - **pro** (M2.5 D8): OIDC PKCE flow without workspace_id; persists the
+//!    raw JWT bearer to `~/.kvendra/sessions/pro.token` (mode 0600) for use
+//!    by `kvendra backup {push,pull,list,restore,prune}`.
 
 use crate::auth::discovery::{auth_base_from_env, discovery_url_from_env};
 use crate::auth::oidc::{client_id_from_env, login_workspace};
-use crate::config::kvendra_home;
-use crate::error::KvendraResult;
+use crate::config::{kvendra_home, set_file_mode_secure};
+use crate::error::{KvendraError, KvendraResult};
 use crate::session::SessionState;
 use chrono::Utc;
 use clap::Args;
@@ -22,21 +24,31 @@ use std::path::Path;
 pub struct LoginArgs {
     /// Switch to workspace mode and start an OIDC PKCE flow against the
     /// IdP (KVENDRA_AUTH_URL, default https://auth.kvendra.cloud).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "pro")]
     pub workspace: Option<String>,
+
+    /// Authenticate as a Pro tier user (no workspace) for `kvendra backup`.
+    /// Persists the bearer JWT to `~/.kvendra/sessions/pro.token` (mode 0600).
+    #[arg(long, conflicts_with = "workspace")]
+    pub pro: bool,
 }
 
 pub async fn run(args: LoginArgs) -> KvendraResult<()> {
-    match args.workspace {
-        None => standalone_hint(),
-        Some(ws_id) => workspace_login(&ws_id).await,
+    match (args.workspace, args.pro) {
+        (None, false) => standalone_hint(),
+        (Some(ws_id), false) => workspace_login(&ws_id).await,
+        (None, true) => pro_login().await,
+        (Some(_), true) => Err(KvendraError::InvalidArgs(
+            "--workspace and --pro are mutually exclusive".into(),
+        )),
     }
 }
 
 fn standalone_hint() -> KvendraResult<()> {
     eprintln!(
         "Standalone login is the existing `kvendra unlock` subcommand.\n\
-         For workspace mode, run `kvendra login --workspace <id>`."
+         For workspace mode, run `kvendra login --workspace <id>`.\n\
+         For Pro tier (cloud backup), run `kvendra login --pro`."
     );
     Ok(())
 }
@@ -80,6 +92,46 @@ async fn workspace_login(workspace_id: &str) -> KvendraResult<()> {
     initial_allowlist_sync(&home, workspace_id, &token_set.access_token).await;
 
     eprintln!("Login successful. Next `kvendra mcp serve` will run in workspace mode.");
+    Ok(())
+}
+
+/// `kvendra login --pro` — REQ-KVD-CLI-005 AC-BACKUP-7.
+///
+/// Pro tier does not bind to a workspace. The OIDC PKCE flow uses the
+/// canonical IdP (KVENDRA_AUTH_URL) but persists only the raw `access_token`
+/// at `~/.kvendra/sessions/pro.token` (plain text, mode 0600). `kvendra
+/// backup` reads that file directly via [`backup::load_pro_jwt`].
+///
+/// M2.5 D8 trade-off: no refresh-token background daemon. The owner re-runs
+/// `kvendra login --pro` when the JWT expires (30d window typical).
+async fn pro_login() -> KvendraResult<()> {
+    let home = kvendra_home()?;
+    let discovery_url = discovery_url_from_env()?;
+    let client_id = client_id_from_env();
+
+    eprintln!("Starting Pro tier login (cloud backup)...");
+    // We reuse `login_workspace` because the PKCE flow itself is
+    // workspace-agnostic — the workspace_id param is currently unused inside
+    // `login_workspace` (verified in oidc.rs:93). Passing "pro" as a label
+    // makes the loopback success page slightly clearer in logs.
+    let token_set = login_workspace("pro", &discovery_url, &client_id).await?;
+    eprintln!("Authorization code exchanged successfully.");
+
+    let sessions_dir = home.join("sessions");
+    std::fs::create_dir_all(&sessions_dir)
+        .map_err(|e| KvendraError::SessionStore(format!("mkdir sessions: {e}")))?;
+    let path = sessions_dir.join("pro.token");
+    std::fs::write(&path, token_set.access_token.as_bytes())
+        .map_err(|e| KvendraError::SessionStore(format!("write pro.token: {e}")))?;
+    set_file_mode_secure(&path)?;
+    eprintln!(
+        "Pro session JWT persisted at {} (mode 0600).",
+        path.display()
+    );
+    eprintln!(
+        "Note: refresh background is not active for --pro in M2.5; re-run\n\
+         `kvendra login --pro` if `kvendra backup` returns 401."
+    );
     Ok(())
 }
 
@@ -174,5 +226,22 @@ mod tests {
         assert!(decode_jwt_payload("totally-broken").is_none());
         // Two parts with invalid base64 in the payload also returns None.
         assert!(decode_jwt_payload("aaa.!!!.ccc").is_none());
+    }
+
+    #[test]
+    fn login_args_pro_and_workspace_conflict() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: LoginArgs,
+        }
+        let r = Cli::try_parse_from([
+            "kvendra",
+            "--workspace",
+            "acme/frontend",
+            "--pro",
+        ]);
+        assert!(r.is_err(), "expected --workspace + --pro to conflict");
     }
 }

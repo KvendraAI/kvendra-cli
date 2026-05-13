@@ -213,8 +213,8 @@ impl From<serde_json::Error> for KvendraError {
     }
 }
 
-impl From<serde_yml::Error> for KvendraError {
-    fn from(err: serde_yml::Error) -> Self {
+impl From<serde_yaml_ng::Error> for KvendraError {
+    fn from(err: serde_yaml_ng::Error) -> Self {
         KvendraError::Serialization(err.to_string())
     }
 }

@@ -155,12 +155,12 @@ pub struct ArgvConstraint {
 }
 
 impl ProfileSpec {
-    pub fn from_yaml(s: &str) -> Result<Self, serde_yml::Error> {
-        serde_yml::from_str(s)
+    pub fn from_yaml(s: &str) -> Result<Self, serde_yaml_ng::Error> {
+        serde_yaml_ng::from_str(s)
     }
 
-    pub fn to_yaml(&self) -> Result<String, serde_yml::Error> {
-        serde_yml::to_string(self)
+    pub fn to_yaml(&self) -> Result<String, serde_yaml_ng::Error> {
+        serde_yaml_ng::to_string(self)
     }
 }
 

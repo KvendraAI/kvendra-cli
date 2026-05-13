@@ -176,7 +176,7 @@ allowlist:
             buckets: ["b"]
             accept_destructive: true
 "#;
-        let spec: ProfileSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: ProfileSpec = serde_yaml_ng::from_str(yaml).unwrap();
         // Catalog: s3_sync con delete=true → Destructive (sin necesidad de
         // user-declared field).
         let args_with_delete = serde_json::json!({ "delete": true });
@@ -211,7 +211,7 @@ allowlist:
             repos: ["owner/repo"]
             destructive: true
 "#;
-        let spec: ProfileSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: ProfileSpec = serde_yaml_ng::from_str(yaml).unwrap();
         // read_issue NO está en el catálogo, pero el user declaró destructive: true.
         assert!(lookup_destructive(
             &spec,
@@ -248,7 +248,7 @@ allowlist:
             functions: ["fn"]
             accept_destructive: true
 "#;
-        let spec: ProfileSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: ProfileSpec = serde_yaml_ng::from_str(yaml).unwrap();
         // lambda_invoke siempre destructive según catálogo, aunque args sea null.
         assert!(lookup_destructive(
             &spec,

@@ -8,12 +8,14 @@ pub mod config_cmd;
 pub mod config_mcp_password;
 pub mod config_rebind;
 pub mod config_recovery_codes;
+pub mod config_telemetry;
 pub mod dashboard;
 pub mod init;
 pub mod lock;
 pub mod login;
 pub mod logout;
 pub mod mcp;
+pub mod notifs;
 pub mod primitive;
 pub mod recover;
 pub mod secret;
@@ -77,6 +79,9 @@ pub enum Commands {
     /// Vault cloud backup (Pro tier) — REQ-KVD-CLI-005.
     #[command(subcommand)]
     Backup(backup::BackupCommand),
+    /// Notification preferences (REQ-KVD-CLI-006).
+    #[command(subcommand)]
+    Notifs(notifs::NotifsCommand),
 }
 
 #[derive(Debug, Subcommand)]

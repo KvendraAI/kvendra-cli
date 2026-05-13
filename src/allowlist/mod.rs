@@ -1,6 +1,6 @@
 //! Allowlist DSL — YAML per-profile capability constraint.
 //!
-//! Per ADR-KVD-008 we use `serde_yml`. Defaults are restrictive (REQ-KVD-002
+//! Per ADR-KVD-008 we use `serde_yaml_ng`. Defaults are restrictive (REQ-KVD-002
 //! AC-ALLOW-1): empty methods or wildcard endpoints without `accept_broad_scope`
 //! are rejected.
 

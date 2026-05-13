@@ -6,5 +6,6 @@
 
 pub mod allowlist_sync;
 pub mod client;
+pub mod metadata_sync;
 
 pub use client::{WorkspaceClient, broker_base_from_env};

@@ -280,7 +280,7 @@ fn load_profile_spec(ctx: &ServerContext, profile_id: &str) -> Option<ProfileSpe
         return None;
     }
     let raw = std::fs::read_to_string(&path).ok()?;
-    serde_yml::from_str(&raw).ok()
+    serde_yaml_ng::from_str(&raw).ok()
 }
 
 /// Hint estructurado a devolver en el `data` del error MCP cuando la decisión

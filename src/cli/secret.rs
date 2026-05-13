@@ -265,7 +265,7 @@ fn set_allowlist(vault: &Vault, home: &Path, args: SetAllowlistArgs) -> KvendraR
     ensure_unlocked(vault, home, args.password_stdin)?;
 
     let raw = std::fs::read_to_string(&args.file)?;
-    let spec: ProfileSpec = serde_yml::from_str(&raw)?;
+    let spec: ProfileSpec = serde_yaml_ng::from_str(&raw)?;
     if spec.profile_id != args.profile_id {
         return Err(KvendraError::AllowlistParse(format!(
             "allowlist profile_id '{}' does not match argument '{}'",
@@ -347,7 +347,7 @@ fn print_validation(vault: &Vault, profile_id: &str) -> bool {
             return false;
         }
     };
-    let spec: ProfileSpec = match serde_yml::from_str(&raw) {
+    let spec: ProfileSpec = match serde_yaml_ng::from_str(&raw) {
         Ok(s) => s,
         Err(e) => {
             println!("Status: REJECTED");
