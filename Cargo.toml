@@ -57,7 +57,7 @@ core-foundation-sys = "0.8"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 # HTTP
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
 # TUI (Pase B placeholder)
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
@@ -81,6 +81,14 @@ urlencoding = "2"
 fs2 = "0.4"
 tiny_http = "0.12"
 webbrowser = "1"
+# M2 Sprint 4 — Audit export firmado (REQ-KVD-CLI-007)
+serde_jcs = "0.1"
+csv = "1.3"
+printpdf = "0.7"
+# M2 Sprint 5 — Vault cloud backup (REQ-KVD-CLI-005)
+tar = "0.4"
+# HKDF (already implemented manually in vault/session, but reuse for backup_crypto)
+hkdf = "0.12"
 
 [features]
 default = ["tui"]

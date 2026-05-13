@@ -1,6 +1,7 @@
 //! CLI surface — clap derive enums + dispatch.
 
 pub mod audit;
+pub mod backup;
 pub mod completion;
 pub mod config_approval;
 pub mod config_cmd;
@@ -73,6 +74,9 @@ pub enum Commands {
     /// Manage CLI configuration (keychain etc.).
     #[command(subcommand)]
     Config(config_cmd::ConfigCommand),
+    /// Vault cloud backup (Pro tier) — REQ-KVD-CLI-005.
+    #[command(subcommand)]
+    Backup(backup::BackupCommand),
 }
 
 #[derive(Debug, Subcommand)]

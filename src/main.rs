@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Dashboard => kvendra::cli::dashboard::run().await?,
         Commands::Completion(args) => kvendra::cli::completion::run(args)?,
         Commands::Config(cmd) => kvendra::cli::config_cmd::run(cmd).await?,
+        Commands::Backup(cmd) => kvendra::cli::backup::run(cmd).await?,
     }
     Ok(())
 }
