@@ -16,6 +16,10 @@
 //! - `os-keychain` (per ADR-KVD-012): sentinel-presence flag is updated
 //!   after a successful unlock for the legacy interactive path.
 
+use crate::audit::{
+    AuditEvent, AuditWriter, FLAG_UNLOCK_EXTENDED, FLAG_UNLOCK_SUCCEEDED, PRIMITIVE_SYSTEM,
+    Severity, Status, reader::args_hash_hex,
+};
 use crate::captured_env::ensure_real_terminal;
 use crate::cli::config_cmd::store_derived_key_in_keychain;
 use crate::config::{Config, MasterPasswordCache, kvendra_home};
@@ -29,7 +33,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use chrono::{DateTime, Utc};
 use clap::Args;
+use std::path::Path;
 use std::time::Duration;
+use time::OffsetDateTime;
 
 #[derive(Debug, Args)]
 pub struct UnlockArgs {
@@ -68,6 +74,17 @@ pub async fn run(args: UnlockArgs) -> KvendraResult<()> {
 
     if args.extend {
         let new_expires = session_extend_ttl(&home, ttl)?;
+        // Audit FLAG_UNLOCK_EXTENDED — requires a temporary unlock to obtain
+        // the HMAC sub-key. The blob carries the derived key by design, so
+        // we can install it cheaply without paying the Argon2id cost.
+        let _ = audit_session_event(
+            &home,
+            cfg.vault.idle_timeout_minutes,
+            FLAG_UNLOCK_EXTENDED,
+            Severity::Info,
+            "session_extended",
+        )
+        .await;
         println!(
             "Session extended. New TTL: {} (expires {}).",
             format_ttl(ttl),
@@ -82,6 +99,15 @@ pub async fn run(args: UnlockArgs) -> KvendraResult<()> {
         match ensure_real_terminal() {
             Ok(h) => Some(h),
             Err(rejection) => {
+                // Pre-unlock: the HMAC sub-key is not yet available, so we
+                // cannot persist this row in `audit.db`. Surface the flag
+                // via tracing so it lands in stderr / log aggregators —
+                // same gap pattern as ADR-KVD-020 AC-USE-KEYCHAIN-8.
+                tracing::warn!(
+                    target: "kvendra::unlock",
+                    flag = rejection.audit_flag(),
+                    "unlock rejected (pre-unlock audit gap)"
+                );
                 eprintln!("{}", rejection.render());
                 return Err(KvendraError::Vault(format!(
                     "unlock refused: {}",
@@ -126,11 +152,74 @@ pub async fn run(args: UnlockArgs) -> KvendraResult<()> {
         let _ = store_derived_key_in_keychain(&B64.encode(b"kvendra-keychain-sentinel-v1"));
     }
 
+    // Audit FLAG_UNLOCK_SUCCEEDED. We have a live SessionKey, so we can
+    // pull the audit HMAC sub-key directly from the vault we just unlocked.
+    if let Ok(hmac_key) = vault.audit_hmac_key() {
+        let _ = record_event(
+            &home,
+            hmac_key,
+            FLAG_UNLOCK_SUCCEEDED,
+            Severity::Info,
+            "unlock",
+        )
+        .await;
+    }
+
     println!(
         "Vault unlocked. Session TTL: {} (expires {}).",
         format_ttl(ttl),
         format_human_iso(expires_at)
     );
+    Ok(())
+}
+
+/// Bring up a short-lived `AuditWriter`, append a single row tagged with
+/// `flag`, and shut down cleanly. Mirrors the pattern in
+/// `audit::bootstrap::write_vault_created_event` so the flushed `.db` /
+/// `.db-wal` files stay coherent.
+async fn record_event(
+    home: &Path,
+    hmac_key: Vec<u8>,
+    flag: &str,
+    severity: Severity,
+    action: &str,
+) -> KvendraResult<()> {
+    let writer = AuditWriter::spawn(home.join("audit.db"), hmac_key)?;
+    let event = AuditEvent {
+        ts_unix_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 / 1_000_000,
+        profile_id: PRIMITIVE_SYSTEM.into(),
+        primitive: PRIMITIVE_SYSTEM.into(),
+        action: action.into(),
+        args_hash_hex: args_hash_hex(&serde_json::json!({})),
+        status: Status::Ok,
+        severity,
+        flags: flag.into(),
+        remote_audit_id: None,
+    };
+    writer.record(event).await?;
+    writer.shutdown().await;
+    Ok(())
+}
+
+/// `--extend` cannot reuse the `record_event` path directly because the
+/// vault was never unlocked in this process — we only touched the on-disk
+/// blob. Take a short-lived unlock from the same blob to fetch the HMAC
+/// sub-key, write the row, and let the vault Drop wipe the in-RAM copy.
+async fn audit_session_event(
+    home: &Path,
+    idle_timeout_minutes: u32,
+    flag: &str,
+    severity: Severity,
+    action: &str,
+) -> KvendraResult<()> {
+    let vault = Vault::new(home.to_path_buf());
+    let state =
+        crate::session::local::load(home).map_err(crate::session::local::map_reject_to_error)?;
+    vault.unlock_from_derived_key(&state.derived_key, idle_timeout_minutes)?;
+    if let Ok(hmac_key) = vault.audit_hmac_key() {
+        record_event(home, hmac_key, flag, severity, action).await?;
+    }
+    vault.lock();
     Ok(())
 }
 

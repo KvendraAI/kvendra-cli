@@ -19,6 +19,43 @@ use serde::{Deserialize, Serialize};
 /// events without enumerating each action.
 pub const PRIMITIVE_SYSTEM: &str = "kvendra.system";
 
+// ─── Canonical flag strings for the local session model (REQ-KVD-CLI-011 /
+//     AC-SESSION-14). Defined here so callers cannot drift on the wire and
+//     downstream dashboards / `audit verify` filters can match exact bytes.
+
+/// `kvendra unlock` finished successfully and a session blob was written.
+pub const FLAG_UNLOCK_SUCCEEDED: &str = "unlock_succeeded";
+
+/// `kvendra unlock` was rejected because `/dev/tty` (or `CONIN$`) could not
+/// be opened — almost always a captured-stdio MCP subprocess.
+pub const FLAG_UNLOCK_REJECTED_NO_CONTROLLING_TTY: &str = "unlock_rejected_no_controlling_tty";
+
+/// `kvendra unlock` was rejected by the triple `isatty` + foreground pgrp
+/// check (second layer of the captured-env defense).
+pub const FLAG_UNLOCK_REJECTED_STDIO_NOT_OWNED: &str = "unlock_rejected_stdio_not_owned";
+
+/// `kvendra unlock --extend` bumped the TTL of an existing session.
+pub const FLAG_UNLOCK_EXTENDED: &str = "unlock_extended";
+
+/// `kvendra unlock --recovery` consumed one recovery code and reset the
+/// master password (chains to REQ-KVD-CLI-003 / ADR-KVD-012).
+pub const FLAG_UNLOCK_RECOVERY_CODE_CONSUMED: &str = "unlock_recovery_code_consumed";
+
+/// `kvendra lock` deleted the active session blob.
+pub const FLAG_UNLOCK_LOCKED_MANUAL: &str = "unlock_locked_manual";
+
+/// `kvendra mcp serve` read the session blob but its TTL had already
+/// expired.
+pub const FLAG_SESSION_EXPIRED_AT_READ: &str = "session_expired_at_read";
+
+/// The HMAC sidecar did not match the encrypted blob — either tamper or
+/// a key mismatch from a different machine that copied the file.
+pub const FLAG_SESSION_BLOB_TAMPERED: &str = "session_blob_tampered";
+
+/// Blob loaded successfully but its `hostname` / `uid` / `kvendra_home`
+/// do not match the current machine.
+pub const FLAG_SESSION_BLOB_MACHINE_MISMATCH: &str = "session_blob_machine_mismatch";
+
 /// Status field of an audit row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

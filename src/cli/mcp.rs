@@ -21,10 +21,13 @@
 //! If none of the three sources above is available, the server refuses
 //! to start with an actionable error pointing to `kvendra unlock`.
 
+use crate::audit::{
+    FLAG_SESSION_BLOB_MACHINE_MISMATCH, FLAG_SESSION_BLOB_TAMPERED, FLAG_SESSION_EXPIRED_AT_READ,
+};
 use crate::config::{Config, kvendra_home};
 use crate::error::{KvendraError, KvendraResult};
 use crate::keychain_acl::{self, BiometricError};
-use crate::session::local::load as load_local_session;
+use crate::session::local::{SessionLoadReject, load as load_local_session};
 use crate::vault::Vault;
 use clap::{Args, Subcommand};
 use std::path::Path;
@@ -89,19 +92,54 @@ async fn attach_session_key(
     idle_timeout_minutes: u32,
 ) -> KvendraResult<()> {
     // 1) Local session blob — canonical cross-platform path.
-    if let Ok(state) = load_local_session(home) {
-        // `state` carries the derived key (zeroized on Drop). We feed it
-        // into the vault and let `state` go out of scope at the end of
-        // this function so the local copy is wiped from the stack.
-        if vault
-            .unlock_from_derived_key(&state.derived_key, idle_timeout_minutes)
-            .is_ok()
-        {
-            return Ok(());
+    match load_local_session(home) {
+        Ok(state) => {
+            // `state` carries the derived key (zeroized on Drop). We feed it
+            // into the vault and let `state` go out of scope at the end of
+            // this function so the local copy is wiped from the stack.
+            if vault
+                .unlock_from_derived_key(&state.derived_key, idle_timeout_minutes)
+                .is_ok()
+            {
+                return Ok(());
+            }
+            // Sentinel mismatch means the blob is from a different vault —
+            // fall through to the legacy paths so the user can still recover
+            // with --password-env / --use-keychain.
         }
-        // Sentinel mismatch means the blob is from a different vault —
-        // fall through to the legacy paths so the user can still recover
-        // with --password-env / --use-keychain.
+        // Map each reject variant to its canonical audit flag (REQ-KVD-CLI-011
+        // AC-SESSION-14). Pre-unlock: no HMAC sub-key available, so the flag
+        // surfaces via tracing — same gap pattern as ADR-KVD-020.
+        Err(SessionLoadReject::NotInitialized) => { /* no blob → just fall through */ }
+        Err(SessionLoadReject::Expired { expired_at }) => {
+            tracing::warn!(
+                target: "kvendra::mcp",
+                flag = FLAG_SESSION_EXPIRED_AT_READ,
+                %expired_at,
+                "session blob TTL elapsed"
+            );
+        }
+        Err(SessionLoadReject::HmacMismatch) => {
+            tracing::error!(
+                target: "kvendra::mcp",
+                flag = FLAG_SESSION_BLOB_TAMPERED,
+                "session blob HMAC mismatch — possible tamper"
+            );
+        }
+        Err(SessionLoadReject::MachineMismatch { field }) => {
+            tracing::warn!(
+                target: "kvendra::mcp",
+                flag = FLAG_SESSION_BLOB_MACHINE_MISMATCH,
+                mismatched_field = field,
+                "session blob from a different machine"
+            );
+        }
+        Err(other) => {
+            tracing::warn!(
+                target: "kvendra::mcp",
+                "session blob unreadable: {other:?}"
+            );
+        }
     }
 
     // 2) Legacy explicit unlock paths (REQ-KVD-005 / mcp-password env var).
