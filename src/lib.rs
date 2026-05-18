@@ -15,6 +15,7 @@ pub mod approval;
 pub mod audit;
 pub mod auth;
 pub mod backup;
+pub mod captured_env;
 pub mod cli;
 pub mod config;
 pub mod detection;
