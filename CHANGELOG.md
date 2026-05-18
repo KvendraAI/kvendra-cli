@@ -5,6 +5,65 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
+## [Unreleased] — cross-platform session model (REQ-KVD-CLI-011)
+
+Path to `0.2.0` re-scoped on 2026-05-18 (consultancy-v3 / TXN-KVD-20260518-002):
+the macOS-only Apple Developer ID + Touch ID Keychain ACL path is replaced by
+a cross-platform session model that works on macOS, Linux and Windows without
+any signing dependency. Foundational decisions in `PAT-KVD-CLI-008`
+(strategic + technical lessons) and `ADR-KVD-029` (session blob storage).
+
+### Added
+
+- **`src/session/local.rs`** — local master-session blob at
+  `~/.kvendra/sessions/active.blob` (AES-256-GCM, machine-bound wrap key,
+  HMAC-SHA256 sidecar, advisory flock, mode 0600). HKDF sub-key
+  `kvendra/session-wrap/v1` (fourth alive sub-key under the
+  `ADR-KVD-022` convention, after audit / allowlist / config).
+- **`src/captured_env/`** — three-layer anti-captured-env defense for
+  `kvendra unlock`: `/dev/tty` / `CONIN$` open + triple `isatty` +
+  parent ancestry enrichment. Validated empirically against Claude Code
+  Bash tool and `!` shell escape on 2026-05-18.
+- **`Vault::unlock_from_derived_key`** — install a pre-derived key,
+  verifying it against the sentinel. `kvendra mcp serve` uses this to
+  avoid paying the Argon2id cost on every startup.
+- **CLI surface**:
+  - `kvendra unlock --extend` — refresh TTL without re-typing.
+  - `kvendra unlock --ttl <duration>` — override TTL, capped by config.
+  - `kvendra lock` — now also deletes the session blob + HMAC sidecar.
+  - `kvendra session info` — local session row coexists with the
+    Sprint 4 workspace JWT row in both human and JSON output.
+- **Config**: new `[session]` block with `default_ttl_seconds`
+  (default 4h), `max_ttl_seconds` (default 24h, hard ceiling 7d) and
+  `renew_on_activity` (default false).
+- **Audit flag constants** (AC-SESSION-14) — the nine canonical strings
+  for the local session lifecycle are now `pub const` in
+  `src/audit/mod.rs`.
+
+### Changed
+
+- **`kvendra mcp serve`** — the local session blob is the canonical
+  unlock path. Order: session blob → `--use-keychain` (legacy) →
+  `--password-env` / `KVENDRA_MCP_PASSWORD`. The interactive TTY
+  prompt fallback was removed because an MCP subprocess never has a
+  usable terminal.
+
+### Deprecated
+
+- **`kvendra config mcp-password enable`** / `--use-keychain`
+  (REQ-KVD-005, macOS Keychain ACL) — feature-preserved for users with
+  an Apple Developer ID but no longer required. Returns as a
+  `v0.3.0+` nice-to-have alongside Touch ID 1-tap UX once the Apple
+  Developer ID + notarization pipeline lands.
+
+### Zero new external crates
+
+Everything reuses what was already in `Cargo.toml`. Windows uses
+`std::io::IsTerminal` from the standard library; the ancestry walker
+shells out to `ps`. Full `CONIN$` + `GetConsoleProcessList` enforcement
+on Windows is staged for the physical PoC tracked under the related
+ISSUE.
+
 ## [0.3.0-alpha.1] — 2026-05-13
 
 **Workspace mode (Team / Enterprise tier groundwork).** This release

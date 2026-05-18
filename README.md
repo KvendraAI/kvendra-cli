@@ -101,6 +101,74 @@ recognised. Use the table:
 `kvendra audit --verify` also accepts `--password-stdin` (recommended for
 scripts: pipe the password on stdin, no env var pollution).
 
+## Cross-platform session model (v0.2.0)
+
+`kvendra unlock` runs **in your own terminal** (iTerm, Terminal.app,
+gnome-terminal, Windows Terminal — never inside an MCP client like Claude
+Code or Cursor). It derives the master key via Argon2id and writes a
+session blob to `~/.kvendra/sessions/active.blob` encrypted with a
+machine-bound wrap key + HMAC sidecar + TTL. Every subsequent
+`kvendra mcp serve` subprocess reads the blob to install the derived
+key — the master password never enters the MCP client's transcript or
+the LLM's context.
+
+```bash
+# Once per working session (default TTL: 4h)
+$ kvendra unlock
+Enter the master password (will not echo):
+Vault unlocked. Session TTL: 4h (expires 2026-05-18 18:30:00 UTC).
+
+# Now use Claude Code / Cursor / your MCP client normally.
+
+# When the TTL approaches, refresh without re-typing the password:
+$ kvendra unlock --extend
+
+# When you're done, terminate the session (also deletes the blob):
+$ kvendra lock
+Session terminated. Active blob removed.
+
+# Inspect at any time:
+$ kvendra session status
+```
+
+Same pattern as `aws sso login`, `gcloud auth login`, `gh auth login`,
+`op signin`. The blob is machine-bound (hostname + uid +
+`kvendra_home_canonical`), so copying it to another machine fails the
+load check immediately. The HMAC sidecar detects tamper, and the TTL
+gates the *next* `mcp serve` start.
+
+### Anti-captured-env defense
+
+`kvendra unlock` refuses to run inside an MCP client subprocess. Three
+layers (PAT-KVD-CLI-008), evaluated in order:
+
+1. **`/dev/tty` (POSIX) / `CONIN$` (Windows)** — direct open. A captured
+   subprocess has no controlling terminal, so this fails with `ENXIO`
+   and the command stops before the password prompt.
+2. **Triple `isatty(stdin/stdout/stderr)` + foreground process group
+   match** — defence in depth.
+3. **Parent ancestry walk** — flags known MCP client binaries
+   (`claude`, `cursor`, `cline`, `continue`) in the error message so
+   you know exactly why the command refused.
+
+If you ever see `kvendra unlock: no controlling terminal detected.`
+inside Claude Code, that's the guard doing its job. Open a real
+terminal and run `kvendra unlock` there instead.
+
+### Configuring TTL
+
+The `[session]` block of `~/.kvendra/config.toml`:
+
+```toml
+[session]
+default_ttl_seconds = 14400   # 4h (default)
+max_ttl_seconds     = 86400   # 24h (default; hard cap accepted by --ttl)
+renew_on_activity   = false   # absolute TTL by default (sudo-style available)
+```
+
+The hard ceiling is 7 days (`MAX_CONFIGURABLE_TTL_SECONDS`); anything
+larger is rejected with a clear error.
+
 ## MCP transport — approval gate (v0.1.0)
 
 When the broker runs under MCP transport (spawned by Claude Code, Cursor,

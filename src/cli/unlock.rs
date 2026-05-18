@@ -27,7 +27,7 @@ use crate::error::{KvendraError, KvendraResult};
 use crate::session::local::{
     build_state_for_current_machine, extend_ttl as session_extend_ttl, persist_atomic,
 };
-use crate::session::ttl::{DEFAULT_TTL_SECONDS, format_ttl, parse_ttl};
+use crate::session::ttl::{cap_ttl, format_ttl, parse_ttl};
 use crate::vault::Vault;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -70,7 +70,7 @@ pub async fn run(args: UnlockArgs) -> KvendraResult<()> {
         ));
     }
 
-    let ttl = resolve_ttl(args.ttl.as_deref())?;
+    let ttl = resolve_ttl(args.ttl.as_deref(), &cfg.session)?;
 
     if args.extend {
         let new_expires = session_extend_ttl(&home, ttl)?;
@@ -223,10 +223,14 @@ async fn audit_session_event(
     Ok(())
 }
 
-fn resolve_ttl(flag: Option<&str>) -> KvendraResult<Duration> {
+fn resolve_ttl(
+    flag: Option<&str>,
+    session_cfg: &crate::config::SessionConfig,
+) -> KvendraResult<Duration> {
+    let max = Duration::from_secs(session_cfg.max_ttl_seconds);
     match flag {
-        Some(raw) => parse_ttl(raw),
-        None => Ok(Duration::from_secs(DEFAULT_TTL_SECONDS)),
+        Some(raw) => cap_ttl(parse_ttl(raw)?, max),
+        None => Ok(Duration::from_secs(session_cfg.default_ttl_seconds)),
     }
 }
 

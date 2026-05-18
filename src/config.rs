@@ -56,6 +56,10 @@ pub struct Config {
     pub detection: DetectionConfig,
     pub approval: ApprovalConfig,
     pub telemetry: TelemetryConfig,
+    /// Local-session settings (REQ-KVD-CLI-011 / ADR-KVD-029). Controls
+    /// the default and maximum TTL of `~/.kvendra/sessions/active.blob`
+    /// and whether the TTL slides on activity.
+    pub session: SessionConfig,
     /// HMAC trailer captured on load. Never serialized — written by
     /// [`Config::save`] after computing the HMAC over the rest of the
     /// document. See module docs.
@@ -124,6 +128,34 @@ impl Default for VaultConfig {
 #[serde(default)]
 pub struct DetectionConfig {
     pub severity: DetectionSeverity,
+}
+
+/// `[session]` block of `~/.kvendra/config.toml` — REQ-KVD-CLI-011 /
+/// ADR-KVD-029. All three keys have safe defaults so existing configs
+/// keep working without an explicit `[session]` block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// TTL applied to a fresh `kvendra unlock` (default `4h`).
+    pub default_ttl_seconds: u64,
+    /// Hard cap accepted by `kvendra unlock --ttl <duration>` (default
+    /// `24h`). Anything larger requires raising this value first.
+    pub max_ttl_seconds: u64,
+    /// When `true`, every successful `tools/call` bumps `expires_at` by
+    /// `default_ttl_seconds`, sliding-window style (like `sudo`).
+    /// Default `false` — absolute TTL preserves the gate against an
+    /// idle attacker.
+    pub renew_on_activity: bool,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            default_ttl_seconds: crate::session::ttl::DEFAULT_TTL_SECONDS,
+            max_ttl_seconds: crate::session::ttl::DEFAULT_MAX_TTL_SECONDS,
+            renew_on_activity: false,
+        }
+    }
 }
 
 impl Config {
