@@ -5,7 +5,17 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
-## [Unreleased] — cross-platform session model (REQ-KVD-CLI-011)
+## [0.4.0-alpha.1] — 2026-05-18 — cross-platform session model (REQ-KVD-CLI-011)
+
+Version note: this release intentionally skips the original `0.2.0` slot
+(which was reserved for the Apple Developer ID + Touch ID path now
+deprecated by this release) and jumps to `0.4.0-alpha.1` so the semver
+ordering on crates.io stays monotonically increasing after the published
+`0.3.0-alpha.1` (workspace mode). The `0.2.0` slot is permanently
+unused; see `ROAD-KVD-CLI-002` re-scope decision (consultancy-v3
+2026-05-18 / TXN-KVD-20260518-002).
+
+
 
 Path to `0.2.0` re-scoped on 2026-05-18 (consultancy-v3 / TXN-KVD-20260518-002):
 the macOS-only Apple Developer ID + Touch ID Keychain ACL path is replaced by

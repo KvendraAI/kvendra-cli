@@ -101,7 +101,7 @@ recognised. Use the table:
 `kvendra audit --verify` also accepts `--password-stdin` (recommended for
 scripts: pipe the password on stdin, no env var pollution).
 
-## Cross-platform session model (v0.2.0)
+## Cross-platform session model (v0.4.0-alpha.1)
 
 `kvendra unlock` runs **in your own terminal** (iTerm, Terminal.app,
 gnome-terminal, Windows Terminal — never inside an MCP client like Claude
