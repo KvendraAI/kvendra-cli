@@ -255,6 +255,43 @@ impl Vault {
         *g = None;
     }
 
+    /// Unlock the vault directly with a pre-derived 32-byte key
+    /// (REQ-KVD-CLI-011 / ADR-KVD-029). Used by `kvendra mcp serve` when
+    /// reading the active session blob — avoids paying the Argon2id cost
+    /// a second time on every MCP server startup.
+    ///
+    /// The key is verified by decrypting the sentinel. A wrong key
+    /// surfaces as `InvalidMasterPassword` (same variant the
+    /// password-based path returns) so callers can recover identically.
+    pub fn unlock_from_derived_key(
+        &self,
+        derived_key: &[u8; 32],
+        idle_timeout_minutes: u32,
+    ) -> KvendraResult<()> {
+        let path = self.sentinel_path();
+        if !path.exists() {
+            return Err(KvendraError::Vault(
+                "vault not initialized (run `kvendra init` first)".into(),
+            ));
+        }
+        let raw = std::fs::read_to_string(&path)?;
+        let blob = Blob::from_json(&raw)?;
+        let mut nonce = [0u8; NONCE_LEN];
+        if blob.nonce.len() != NONCE_LEN {
+            return Err(KvendraError::Vault("sentinel nonce length invalid".into()));
+        }
+        nonce.copy_from_slice(&blob.nonce);
+        let pt = aes_open(derived_key, &nonce, &blob.ciphertext)?;
+        if pt != b"kvendra-sentinel-v1" {
+            return Err(KvendraError::InvalidMasterPassword);
+        }
+        let derived = crate::vault::kdf::DerivedKey(*derived_key);
+        let session = SessionKey::new(derived, idle_timeout_minutes);
+        let mut g = self.session.lock().expect("session mutex poisoned");
+        *g = Some(session);
+        Ok(())
+    }
+
     /// Copy the active session's derived key out as a fresh `[u8; 32]`.
     /// Used by `kvendra unlock` to write the local session blob
     /// (REQ-KVD-CLI-011 / ADR-KVD-029). Caller is responsible for
