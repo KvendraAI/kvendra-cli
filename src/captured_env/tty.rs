@@ -2,9 +2,9 @@
 //! `tty_windows` and exposes a single `TtyHandle` the caller (`cli::unlock`)
 //! reads the master password from.
 
+use crate::captured_env::ancestry::AncestorInfo;
 #[cfg(not(any(unix, windows)))]
 use crate::captured_env::ancestry::walk_ancestors;
-use crate::captured_env::ancestry::AncestorInfo;
 use std::io::Write;
 
 /// Reason `ensure_real_terminal` refused. Each variant maps to one canonical
@@ -112,27 +112,66 @@ impl TtyHandle {
     pub fn read_password(&self, prompt: &str) -> std::io::Result<String> {
         #[cfg(unix)]
         {
-            use std::io::BufReader;
+            use std::io::{BufRead, BufReader};
+            use std::os::unix::io::AsRawFd;
+
+            let fd = self.inner.file.as_raw_fd();
+
+            // Save original termios so we can restore on Drop (including
+            // panic / Ctrl-C). `rpassword::read_password()` does this for
+            // stdin, but `read_password_from_bufread` does NOT — it just
+            // reads bytes, leaving local echo on. Manual `tcsetattr` is
+            // required when we feed it `/dev/tty`.
+            let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: `fd` is a valid open file descriptor (we own it).
+            let rc = unsafe { libc::tcgetattr(fd, &mut orig) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut quiet = orig;
+            quiet.c_lflag &= !(libc::ECHO);
+            let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            struct TermiosGuard {
+                fd: std::os::unix::io::RawFd,
+                orig: libc::termios,
+            }
+            impl Drop for TermiosGuard {
+                fn drop(&mut self) {
+                    // SAFETY: same fd we got from `tcgetattr` originally.
+                    unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig) };
+                }
+            }
+            let _guard = TermiosGuard { fd, orig };
+
             // Write prompt directly to the tty so it does not pollute
             // stdout (which the parent may have captured).
-            {
-                let mut w = std::io::BufWriter::new(
-                    self.inner.file.try_clone().map_err(std::io::Error::other)?,
-                );
-                w.write_all(prompt.as_bytes())?;
-                w.flush()?;
-            }
-            // rpassword reads from a BufRead with echo disabled when the
-            // underlying fd is a tty (which we've already verified).
+            let mut writer = self.inner.file.try_clone().map_err(std::io::Error::other)?;
+            writer.write_all(prompt.as_bytes())?;
+            writer.flush()?;
+
+            // Read a single line from the tty.
             let reader = self.inner.file.try_clone().map_err(std::io::Error::other)?;
             let mut buf = BufReader::new(reader);
-            // `read_password_from_bufread` is the documented way to read
-            // a password from an arbitrary fd in rpassword 7.x. The 8.x
-            // builder API is not yet released as stable; allowing the
-            // deprecation here keeps the call site explicit and minimal.
-            #[allow(deprecated)]
-            let pass = rpassword::read_password_from_bufread(&mut buf);
-            pass
+            let mut password = String::new();
+            buf.read_line(&mut password)?;
+
+            // Echo is off, so the user's Enter was swallowed silently —
+            // print a newline so the next prompt does not glue to the cursor.
+            writer.write_all(b"\n")?;
+            writer.flush().ok();
+
+            // Strip the trailing newline (and the CR if the tty uses CRLF).
+            if password.ends_with('\n') {
+                password.pop();
+            }
+            if password.ends_with('\r') {
+                password.pop();
+            }
+            Ok(password)
         }
         #[cfg(windows)]
         {
