@@ -255,6 +255,22 @@ impl Vault {
         *g = None;
     }
 
+    /// Copy the active session's derived key out as a fresh `[u8; 32]`.
+    /// Used by `kvendra unlock` to write the local session blob
+    /// (REQ-KVD-CLI-011 / ADR-KVD-029). Caller is responsible for
+    /// `zeroize`ing the returned bytes when finished — usually by feeding
+    /// them into `LocalSessionState` whose `Drop` does this.
+    ///
+    /// Returns `VaultLocked` when the session is missing or expired.
+    pub fn peek_session_derived_key(&self) -> KvendraResult<[u8; 32]> {
+        let g = self.session.lock().expect("session mutex poisoned");
+        let session = g.as_ref().ok_or(KvendraError::VaultLocked)?;
+        if session.is_expired() {
+            return Err(KvendraError::VaultLocked);
+        }
+        Ok(*session.peek_key()?)
+    }
+
     /// Reset the master password using the BIP-39 mnemonic. Pase B simplified
     /// flow: the mnemonic re-seeds the sentinel ciphertext deterministically
     /// (we encrypt the marker under a fresh KDF derived from `new_password`).
