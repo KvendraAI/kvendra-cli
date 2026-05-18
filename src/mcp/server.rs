@@ -173,7 +173,10 @@ pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
                 ticker.tick().await;
                 let jwt = session.read().await.jwt.clone();
                 match crate::workspace::allowlist_sync::sync_once(
-                    &home_bg, &ws_id_owned, &jwt, false,
+                    &home_bg,
+                    &ws_id_owned,
+                    &jwt,
+                    false,
                 )
                 .await
                 {
@@ -241,9 +244,9 @@ fn build_resolver(
             let ws_id = active.into_iter().next().expect("len==1");
             let Some(state) = SessionState::load(home, &ws_id)? else {
                 // Race: the file disappeared between list+load. Fall back to local.
-                let resolver = Arc::new(
-                    crate::secret_resolver::local::LocalVaultResolver::new(vault.clone()),
-                );
+                let resolver = Arc::new(crate::secret_resolver::local::LocalVaultResolver::new(
+                    vault.clone(),
+                ));
                 return Ok((Some(resolver as Arc<dyn SecretResolver>), None, None));
             };
             let session_arc = Arc::new(RwLock::new(state));
@@ -328,7 +331,60 @@ fn tools_list(id: Option<Value>) -> JsonRpcResponse {
     JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
 }
 
+/// Self-healing unlock attempt (REQ-KVD-CLI-011 / closes PAT-KVD-009 fix
+/// path). If the in-RAM `SessionKey` expired by `idle_timeout_minutes`
+/// (default 30 min) but the on-disk session blob is still valid (TTL
+/// 4–24h depending on `session.default_ttl_seconds`), re-inject the
+/// derived key into the vault so the subprocess survives without a
+/// Claude Code restart.
+///
+/// Silent on the happy path. On failure (blob absent / expired /
+/// tampered / wrong machine) leaves the vault locked so the next
+/// `get_secret` returns `VaultLocked` as usual.
+fn try_self_heal_vault(ctx: &ServerContext) {
+    if ctx.vault.is_unlocked() {
+        return;
+    }
+    let home = ctx.vault.home();
+    match crate::session::local::load(home) {
+        Ok(state) => {
+            let idle_timeout = ctx.config.vault.idle_timeout_minutes;
+            match ctx
+                .vault
+                .unlock_from_derived_key(&state.derived_key, idle_timeout)
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        target: "kvendra::mcp",
+                        flag = "session_self_healed",
+                        "vault locked → re-unlocked from active session blob"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "kvendra::mcp",
+                        flag = "session_self_heal_failed",
+                        error = %e,
+                        "blob load OK but derived key did not match sentinel"
+                    );
+                }
+            }
+        }
+        Err(_) => {
+            // Blob also missing / expired / tampered. Leave the vault
+            // locked so the primitive surfaces its canonical
+            // VaultLocked error and the user is told to re-run unlock.
+        }
+    }
+}
+
 async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -> JsonRpcResponse {
+    // Self-healing — if our in-RAM SessionKey expired (idle timeout) but
+    // the on-disk session blob is still inside its TTL, recover the
+    // derived key transparently. Closes PAT-KVD-009 ("Cmd+Q + restart
+    // Claude Code is the canonical fix"). See try_self_heal_vault above.
+    try_self_heal_vault(&ctx);
+
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
 
@@ -371,8 +427,17 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             }
             Decision::Error => {
                 flags.push("detection_error".into());
-                let _ =
-                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true, None).await;
+                let _ = record_audit(
+                    &ctx,
+                    &arguments,
+                    name,
+                    &profile_id,
+                    &action,
+                    &flags,
+                    true,
+                    None,
+                )
+                .await;
                 return JsonRpcResponse::error(
                     id,
                     codes::APPLICATION_ERROR,
@@ -387,8 +452,17 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
                 if !profile_id.is_empty() {
                     let _ = ctx.vault.mark_quarantined(&profile_id);
                 }
-                let _ =
-                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true, None).await;
+                let _ = record_audit(
+                    &ctx,
+                    &arguments,
+                    name,
+                    &profile_id,
+                    &action,
+                    &flags,
+                    true,
+                    None,
+                )
+                .await;
                 return JsonRpcResponse::error(
                     id,
                     codes::APPLICATION_ERROR,
@@ -408,8 +482,17 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             Ok(MigrationOutcome::Unchanged) | Ok(MigrationOutcome::Migrated) => {}
             Err(KvendraError::AllowlistTampered(pid)) => {
                 flags.push("allowlist_tampered_detected".into());
-                let _ =
-                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true, None).await;
+                let _ = record_audit(
+                    &ctx,
+                    &arguments,
+                    name,
+                    &profile_id,
+                    &action,
+                    &flags,
+                    true,
+                    None,
+                )
+                .await;
                 let data = serde_json::json!({
                     "error_type": "allowlist_tampered",
                     "hint": "re-run `kvendra secret set-allowlist <profile> --file <yaml>` or restore from backup",
@@ -429,8 +512,17 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
                 if let Some(canonical_flag) = audit_flag_for_error(&e) {
                     flags.push(canonical_flag.into());
                 }
-                let _ =
-                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true, None).await;
+                let _ = record_audit(
+                    &ctx,
+                    &arguments,
+                    name,
+                    &profile_id,
+                    &action,
+                    &flags,
+                    true,
+                    None,
+                )
+                .await;
                 // AC-MCP-3 defence in depth: the error string can include the
                 // primitive's argv / parsed YAML on certain code paths, which
                 // could carry leaked tokens. Always scrub before returning.
@@ -449,7 +541,17 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         flags.push(flag.into());
     }
     if approval_decision.blocks_dispatch() {
-        let _ = record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true, None).await;
+        let _ = record_audit(
+            &ctx,
+            &arguments,
+            name,
+            &profile_id,
+            &action,
+            &flags,
+            true,
+            None,
+        )
+        .await;
         let error_type = approval_decision.error_type().unwrap_or("approval_failed");
         let hint = approval::hint_for(approval_decision, ctx.config.approval.timeout_seconds);
         let data = serde_json::json!({
@@ -469,9 +571,17 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
     if let Some(ws_id) = ctx.workspace_id.as_deref() {
         if crate::workspace::allowlist_sync::is_stale_blocked(ctx.vault.home(), ws_id) {
             flags.push("allowlist_cache_stale".into());
-            let _ =
-                record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true, None)
-                    .await;
+            let _ = record_audit(
+                &ctx,
+                &arguments,
+                name,
+                &profile_id,
+                &action,
+                &flags,
+                true,
+                None,
+            )
+            .await;
             return JsonRpcResponse::error(
                 id,
                 codes::APPLICATION_ERROR,
@@ -509,9 +619,17 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
                 // BrokerUnreachable, RateLimited, ...) carry user-friendly
                 // text and never include secret material.
                 let msg = crate::detection::sanitize_output(&other.to_string());
-                let _ =
-                    record_audit(&ctx, &arguments, name, &profile_id, &action, &flags, true, None)
-                        .await;
+                let _ = record_audit(
+                    &ctx,
+                    &arguments,
+                    name,
+                    &profile_id,
+                    &action,
+                    &flags,
+                    true,
+                    None,
+                )
+                .await;
                 return JsonRpcResponse::error(id, codes::APPLICATION_ERROR, msg);
             }
         }
@@ -728,8 +846,7 @@ async fn enforce_allowlist(
             // boundary call row to also carry the flag.
             if let Some(writer) = ctx.writer.as_ref() {
                 let event = AuditEvent {
-                    ts_unix_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() as i64
-                        / 1_000_000,
+                    ts_unix_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 / 1_000_000,
                     profile_id: profile_id.to_string(),
                     primitive: PRIMITIVE_SYSTEM.to_string(),
                     action: "allowlist_hmac_migrated".to_string(),
@@ -1046,6 +1163,88 @@ mod tests {
         assert!(
             s.contains(secret),
             "escape hatch unexpectedly redacted: {s}"
+        );
+    }
+
+    /// REQ-KVD-CLI-011 self-healing (PAT-KVD-009 closure): an unlocked
+    /// vault that gets locked mid-flight (idle timeout) recovers
+    /// transparently when `try_self_heal_vault` is called, provided the
+    /// session blob is still valid on disk.
+    #[test]
+    fn self_heal_recovers_locked_vault_from_active_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-self-heal", fast_params())
+            .unwrap();
+        v.unlock(b"hunter2-self-heal", 30).unwrap();
+
+        // Write the local session blob using the vault's current derived
+        // key (same flow `kvendra unlock` follows in production).
+        let derived = v.peek_session_derived_key().unwrap();
+        let state = crate::session::local::build_state_for_current_machine(
+            derived,
+            std::time::Duration::from_secs(3600),
+            home,
+        )
+        .unwrap();
+        crate::session::local::persist_atomic(&state, home).unwrap();
+
+        // Simulate idle expiry by force-locking the in-RAM session.
+        v.lock();
+        assert!(!v.is_unlocked(), "precondition: vault must be locked");
+
+        let ctx = ServerContext {
+            vault: v,
+            config: Config::default(),
+            writer: None,
+            approval_cache: Arc::new(ApprovalCache::new()),
+            approval_prompt_lock: Arc::new(Mutex::new(())),
+            transport: Transport::Mcp,
+            resolver: None,
+            session: None,
+            workspace_id: None,
+        };
+
+        super::try_self_heal_vault(&ctx);
+
+        assert!(
+            ctx.vault.is_unlocked(),
+            "self-healing should re-unlock the vault from the active blob"
+        );
+    }
+
+    /// Negative path: with no session blob on disk, the vault stays
+    /// locked and the call is a no-op (will surface as VaultLocked
+    /// downstream so the primitive returns a clean error).
+    #[test]
+    fn self_heal_is_noop_when_no_active_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-no-blob", fast_params())
+            .unwrap();
+        // Never unlock + never persist a blob.
+        assert!(!v.is_unlocked());
+
+        let ctx = ServerContext {
+            vault: v,
+            config: Config::default(),
+            writer: None,
+            approval_cache: Arc::new(ApprovalCache::new()),
+            approval_prompt_lock: Arc::new(Mutex::new(())),
+            transport: Transport::Mcp,
+            resolver: None,
+            session: None,
+            workspace_id: None,
+        };
+
+        super::try_self_heal_vault(&ctx);
+        assert!(
+            !ctx.vault.is_unlocked(),
+            "no blob → vault must remain locked"
         );
     }
 }
