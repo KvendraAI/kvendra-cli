@@ -13,9 +13,10 @@ use crate::error::{KvendraError, KvendraResult};
 use crate::vault::blob::Blob;
 use crate::vault::crypto::{NONCE_LEN, open as aes_open, random_nonce, seal as aes_seal};
 use crate::vault::kdf::{KdfParams, derive, random_salt};
-use crate::vault::session::SessionKey;
+use crate::vault::session::{SessionKey, VaultStateKind};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -76,6 +77,12 @@ pub struct Vault {
     home: PathBuf,
     /// Active session key when unlocked (RAM-only, ZeroizeOnDrop).
     session: Arc<Mutex<Option<SessionKey>>>,
+    /// REQ-KVD-CLI-42CB74 — `true` when the MCP server booted without any
+    /// credential material (no session blob, no env var, no keychain) and
+    /// the vault has never been unlocked in this process lifetime.
+    /// Distinguishes `LockedPendingUnlock` from steady-state `Locked`
+    /// (session existed but expired by idle timeout).
+    pending_unlock: Arc<AtomicBool>,
 }
 
 impl Clone for Vault {
@@ -83,6 +90,7 @@ impl Clone for Vault {
         Self {
             home: self.home.clone(),
             session: Arc::clone(&self.session),
+            pending_unlock: Arc::clone(&self.pending_unlock),
         }
     }
 }
@@ -92,6 +100,7 @@ impl Vault {
         Self {
             home,
             session: Arc::new(Mutex::new(None)),
+            pending_unlock: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -194,6 +203,34 @@ impl Vault {
         g.as_ref().is_some_and(|s| !s.is_expired())
     }
 
+    /// Discriminator of the current vault state (REQ-KVD-CLI-42CB74).
+    /// Cheaper than reaching into the full [`crate::vault::session::VaultState`]
+    /// when callers only need to branch on the variant.
+    ///
+    /// - `Unlocked`            — in-RAM session present and not expired.
+    /// - `LockedPendingUnlock` — process booted without credentials and
+    ///                           no unlock has happened yet.
+    /// - `Locked`              — neither of the above (session expired,
+    ///                           explicitly locked, or never armed).
+    pub fn state(&self) -> VaultStateKind {
+        if self.is_unlocked() {
+            return VaultStateKind::Unlocked;
+        }
+        if self.pending_unlock.load(Ordering::Acquire) {
+            return VaultStateKind::LockedPendingUnlock;
+        }
+        VaultStateKind::Locked
+    }
+
+    /// Mark this vault as `LockedPendingUnlock` (REQ-KVD-CLI-42CB74).
+    /// Called by `kvendra mcp serve` when no session blob / env var /
+    /// keychain credential is available at boot, so the dispatcher can
+    /// gate vault-dependent tool calls with a distinguishable error
+    /// instead of refusing to start.
+    pub fn mark_pending_unlock(&self) {
+        self.pending_unlock.store(true, Ordering::Release);
+    }
+
     /// Initialize the vault: write the sentinel blob (so `unlock` can verify
     /// the master password). Idempotent if the sentinel already exists.
     pub fn create(&self, password: &[u8]) -> KvendraResult<()> {
@@ -246,6 +283,8 @@ impl Vault {
         let session = SessionKey::new(derived, idle_timeout_minutes);
         let mut g = self.session.lock().expect("session mutex poisoned");
         *g = Some(session);
+        // REQ-KVD-CLI-42CB74 — a successful unlock supersedes pending state.
+        self.pending_unlock.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -289,6 +328,8 @@ impl Vault {
         let session = SessionKey::new(derived, idle_timeout_minutes);
         let mut g = self.session.lock().expect("session mutex poisoned");
         *g = Some(session);
+        // REQ-KVD-CLI-42CB74 — a successful unlock supersedes pending state.
+        self.pending_unlock.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -628,6 +669,79 @@ mod tests {
         let b = compute_config_hmac(&key, raw);
         assert_eq!(a, b);
         assert_eq!(a.len(), 64, "SHA-256 hex digest is 64 chars");
+    }
+
+    /// REQ-KVD-CLI-42CB74 AC-BOOT-2 — vault state machine transitions:
+    /// `Locked` (default) → `LockedPendingUnlock` (via `mark_pending_unlock`)
+    /// → `Unlocked` (via `unlock`). On unlock, the `pending_unlock` flag
+    /// must be cleared so a subsequent idle-expiry returns to `Locked`,
+    /// not back to `LockedPendingUnlock`.
+    #[test]
+    fn vault_state_machine_locked_pending_unlock() {
+        let (_dir, v) = open_test_vault();
+        v.create_with_params(b"hunter2-statemachine", fast_params())
+            .unwrap();
+
+        // Initial state — Vault::new() yields Locked (no session, no pending).
+        assert_eq!(
+            v.state(),
+            VaultStateKind::Locked,
+            "fresh Vault must start Locked"
+        );
+
+        // Mark pending — boot path #4 of REQ-KVD-CLI-42CB74.
+        v.mark_pending_unlock();
+        assert_eq!(
+            v.state(),
+            VaultStateKind::LockedPendingUnlock,
+            "mark_pending_unlock must transition to LockedPendingUnlock"
+        );
+
+        // Unlock — must supersede the pending flag.
+        v.unlock(b"hunter2-statemachine", 30).unwrap();
+        assert_eq!(
+            v.state(),
+            VaultStateKind::Unlocked,
+            "successful unlock must transition to Unlocked"
+        );
+        assert!(
+            !v.pending_unlock.load(Ordering::Acquire),
+            "unlock must clear the pending_unlock flag (else future idle-expiry would mis-classify as LockedPendingUnlock)"
+        );
+
+        // After explicit lock, the flag stays clear (not pending) — this
+        // is the steady-state `Locked` the dispatcher distinguishes from
+        // tolerant-boot.
+        v.lock();
+        assert_eq!(
+            v.state(),
+            VaultStateKind::Locked,
+            "post-unlock lock must return to plain Locked, NOT LockedPendingUnlock"
+        );
+    }
+
+    /// REQ-KVD-CLI-42CB74 AC-BOOT-2 corner — `unlock_from_derived_key` must
+    /// also clear the pending flag (the canonical boot-path #1 uses this
+    /// codepath when self-healing from the active session blob).
+    #[test]
+    fn unlock_from_derived_key_clears_pending_unlock() {
+        let (_dir, v) = open_test_vault();
+        v.create_with_params(b"hunter2-pending-derived", fast_params())
+            .unwrap();
+        // Prime with a password-based unlock so we can extract a derived key.
+        v.unlock(b"hunter2-pending-derived", 30).unwrap();
+        let derived = v.peek_session_derived_key().unwrap();
+        v.lock();
+
+        v.mark_pending_unlock();
+        assert_eq!(v.state(), VaultStateKind::LockedPendingUnlock);
+
+        v.unlock_from_derived_key(&derived, 30).unwrap();
+        assert_eq!(v.state(), VaultStateKind::Unlocked);
+        assert!(
+            !v.pending_unlock.load(Ordering::Acquire),
+            "unlock_from_derived_key must also clear the pending flag"
+        );
     }
 
     /// REQ-KVD-008 — different sub-keys must yield different HMACs even on

@@ -79,7 +79,7 @@ async fn bootstrap_ctx(yaml: &str, profile_id: &str) -> (TempDir, Arc<ServerCont
     let ctx = Arc::new(ServerContext {
         vault: v,
         config,
-        writer: Some(writer),
+        writer: std::sync::RwLock::new(Some(writer)),
         approval_cache: Arc::new(ApprovalCache::new()),
         approval_prompt_lock: Arc::new(Mutex::new(())),
         transport: Transport::Mcp,
@@ -92,7 +92,7 @@ async fn bootstrap_ctx(yaml: &str, profile_id: &str) -> (TempDir, Arc<ServerCont
 
 /// Convenience — drain the writer and re-open the audit DB for inspection.
 async fn collect_flags(ctx: &Arc<ServerContext>) -> Vec<(String, String, String, String)> {
-    if let Some(w) = &ctx.writer {
+    if let Some(w) = ctx.audit_writer() {
         w.shutdown().await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -334,7 +334,7 @@ async fn hmac_chain_intact_after_canonical_flags_added() {
     let _ = dispatch(req2, ctx.clone()).await;
 
     // Drain.
-    if let Some(w) = &ctx.writer {
+    if let Some(w) = ctx.audit_writer() {
         w.shutdown().await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;

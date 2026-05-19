@@ -44,6 +44,14 @@ pub mod codes {
     pub const INTERNAL_ERROR: i32 = -32603;
     /// Application-level error (broker-side rejection like AllowlistViolation).
     pub const APPLICATION_ERROR: i32 = -32000;
+    /// REQ-KVD-CLI-42CB74 — the MCP server is alive but the vault is in
+    /// `LockedPendingUnlock` state and the requested tool needs vault
+    /// material. The `data` payload carries `{state, tool_call_blocked,
+    /// help.topic = "vault-locked-pending-unlock"}` so the client can
+    /// surface an actionable message without retrying. Distinguishable
+    /// from `APPLICATION_ERROR` (`-32000`) so dashboards and clients can
+    /// special-case this transient boot state.
+    pub const VAULT_LOCKED_PENDING_UNLOCK: i32 = -32002;
 }
 
 impl JsonRpcResponse {

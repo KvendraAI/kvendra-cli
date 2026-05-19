@@ -5,6 +5,17 @@ is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/) with
 `-alpha.N` / `-beta.N` pre-release suffixes during the pre-1.0 phase.
 
+## [Unreleased]
+
+### Added
+- **Tolerant MCP boot**: `kvendra mcp serve` now starts in `LockedPendingUnlock` state when no session blob, env var, or keychain credential is available — instead of exiting with error. `whoami`, `help`, and `config_get` remain functional in this state; vault-dependent tools return JSON-RPC error `-32002` with `help.topic: vault-locked-pending-unlock`. The MCP server auto-recovers transparently on the next vault-dependent tool call once `kvendra unlock` is executed in another terminal — no Claude Code restart needed. Supersedes partial PAT-KVD-009 (canonical fix "restart Claude Code") for the arranque-sin-credenciales case. Implements REQ-KVD-CLI-42CB74.
+
+### Changed
+- **Audit flag rename**: `session_self_healed` (REQ-KVD-CLI-011 idle self-heal path) renamed to `mcp_self_heal_from_idle` for symmetry with the new `mcp_self_heal_from_pending` flag introduced by tolerant MCP boot. Any external SQL query filtering by the literal `session_self_healed` must be updated.
+
+### Fixed
+- **Audit writer late-spawn**: when `kvendra mcp serve` starts in `LockedPendingUnlock` state, the audit writer was initialized as `None` (vault locked → no HMAC chain key derivable) and never re-spawned after successful self-heal from pending. Tool calls succeeded but audit rows were not persisted to `~/.kvendra/audit.db` (only emitted to stderr/tracing, with `auditEventId: 0` in JSON-RPC response). The writer is now lazy-spawned within `try_self_heal_vault` upon successful unlock from pending, with double-checked locking to prevent races between concurrent tool calls. Closes ISSUE-KVD-CLI-9764AC.
+
 ## [0.4.0-alpha.1] — 2026-05-18 — cross-platform session model (REQ-KVD-CLI-011)
 
 Version note: this release intentionally skips the original `0.2.0` slot

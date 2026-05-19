@@ -148,17 +148,31 @@ async fn attach_session_key(
         return vault.unlock(password.as_bytes(), idle_timeout_minutes);
     }
 
-    // 3) Nothing available — refuse with an actionable error.
+    // 3) REQ-KVD-CLI-42CB74 — tolerant boot. Nothing available, but we no
+    // longer refuse to start: the MCP server boots in `LockedPendingUnlock`
+    // state. `whoami` / `help` / `config_get` (when present) keep working;
+    // every vault-dependent tool call returns JSON-RPC `-32002` with
+    // `help.topic:"vault-locked-pending-unlock"` until the user runs
+    // `kvendra unlock` in their own terminal. The dispatcher's self-heal
+    // loop transitions the vault to `Unlocked` on the next tool call once
+    // the session blob lands on disk — no Claude Code restart needed.
+    // Supersedes the partial PAT-KVD-009 fix ("restart Claude Code").
+    eprintln!("[kvendra mcp serve] Started in locked-pending-unlock state.");
     eprintln!(
-        "kvendra mcp serve: no active session found.\n\n\
-         Run `kvendra unlock` in YOUR OWN terminal first, then retry your\n\
-         operation in Claude Code / Cursor / your MCP client.\n\n\
-         The master password must NOT be entered inside an MCP client's\n\
-         terminal — see https://docs.kvendra.com/cli/unlock-security\n"
+        "[kvendra mcp serve] Vault-dependent tool calls will fail until 'kvendra unlock' is executed."
     );
-    Err(KvendraError::Vault(
-        "no active session — run `kvendra unlock` first".into(),
-    ))
+    eprintln!(
+        "[kvendra mcp serve] The MCP server will auto-recover transparently — no restart needed."
+    );
+
+    tracing::warn!(
+        target: "kvendra::mcp",
+        flag = "mcp_boot_locked_pending_unlock",
+        "MCP server booted without active session"
+    );
+
+    vault.mark_pending_unlock();
+    Ok(())
 }
 
 async fn resolve_password(args: &ServeArgs) -> KvendraResult<String> {
@@ -173,6 +187,137 @@ async fn resolve_password(args: &ServeArgs) -> KvendraResult<String> {
                 .map_err(|e| KvendraError::Vault(format!("read password: {e}")))
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vault::kdf::KdfParams;
+    use crate::vault::session::VaultStateKind;
+
+    fn fast_params() -> KdfParams {
+        KdfParams {
+            m_cost_kib: 19_456,
+            t_cost: 2,
+            p_cost: 1,
+            salt: vec![1u8; 16],
+        }
+    }
+
+    /// REQ-KVD-CLI-42CB74 AC-BOOT-1 + AC-UX-2 — when `attach_session_key`
+    /// is invoked without ANY credential material (no session blob, no
+    /// env var, no keychain), it MUST return `Ok(())` and leave the
+    /// vault in `LockedPendingUnlock` state, instead of failing the
+    /// boot. This is the core behavioural change of REQ-KVD-CLI-42CB74.
+    ///
+    /// We do not assert on the stderr lines here — capturing stderr from
+    /// within an async test requires gag/serial_test or process-level
+    /// redirection that adds fragility for marginal benefit. The
+    /// behaviour-observable outcome is the vault state + Ok return.
+    #[tokio::test]
+    async fn attach_session_key_returns_ok_without_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        // Initialise sentinel so attach_session_key reaches the real branches.
+        v.create_with_params(b"hunter2-pending-boot", fast_params())
+            .unwrap();
+
+        let args = ServeArgs {
+            password_env: None,
+            use_keychain: false,
+            no_unlock: false,
+        };
+        // No session blob, no env var, no keychain → path #4.
+        let res = super::attach_session_key(&v, home, &args, 30).await;
+        assert!(
+            res.is_ok(),
+            "attach_session_key must Ok(()) when no creds available — got {res:?}"
+        );
+        assert_eq!(
+            v.state(),
+            VaultStateKind::LockedPendingUnlock,
+            "vault must end in LockedPendingUnlock after tolerant boot"
+        );
+    }
+
+    /// REQ-KVD-CLI-42CB74 AC-REGRESSION-1 — boot path #1 (local session
+    /// blob) must continue to fully unlock the vault, NOT leave it in
+    /// pending state. Mirrors the canonical `kvendra unlock` flow from
+    /// REQ-KVD-CLI-011.
+    #[tokio::test]
+    async fn boot_path_1_active_blob_unchanged_regression() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-path1", fast_params())
+            .unwrap();
+
+        // Write a valid session blob using the canonical helpers.
+        v.unlock(b"hunter2-path1", 30).unwrap();
+        let derived = v.peek_session_derived_key().unwrap();
+        let state = crate::session::local::build_state_for_current_machine(
+            derived,
+            std::time::Duration::from_secs(3600),
+            home,
+        )
+        .unwrap();
+        crate::session::local::persist_atomic(&state, home).unwrap();
+        v.lock();
+        assert_eq!(v.state(), VaultStateKind::Locked);
+
+        let args = ServeArgs {
+            password_env: None,
+            use_keychain: false,
+            no_unlock: false,
+        };
+        let res = super::attach_session_key(&v, home, &args, 30).await;
+        assert!(res.is_ok());
+        assert_eq!(
+            v.state(),
+            VaultStateKind::Unlocked,
+            "boot path #1 must fully unlock from active.blob (no pending state)"
+        );
+    }
+
+    /// REQ-KVD-CLI-42CB74 AC-REGRESSION-1 — boot path #2 (env var) must
+    /// continue to fully unlock the vault using the master password
+    /// supplied via `KVENDRA_MCP_PASSWORD` / `--password-env`.
+    #[tokio::test]
+    async fn boot_path_2_password_env_unchanged_regression() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-path2", fast_params())
+            .unwrap();
+        // No session blob on disk — path #1 falls through to #2.
+        assert_eq!(v.state(), VaultStateKind::Locked);
+
+        let args = ServeArgs {
+            password_env: Some("hunter2-path2".to_string()),
+            use_keychain: false,
+            no_unlock: false,
+        };
+        let res = super::attach_session_key(&v, home, &args, 30).await;
+        assert!(
+            res.is_ok(),
+            "env-var boot path must succeed with correct password, got {res:?}"
+        );
+        assert_eq!(
+            v.state(),
+            VaultStateKind::Unlocked,
+            "boot path #2 (env var) must fully unlock — no pending state"
+        );
+    }
+
+    // Boot path #3 (`--use-keychain`) is NOT covered here: it requires
+    // macOS keychain ACL hardware that is unavailable in CI / non-Apple
+    // builds. Validator FASE 5 (winking-owl-skills:validator) MUST exercise
+    // path #3 manually on a Mac box, asserting the vault transitions to
+    // Unlocked (no pending) when biometric/presence ACL succeeds.
 }
 
 fn read_keychain_password() -> KvendraResult<String> {

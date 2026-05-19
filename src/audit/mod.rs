@@ -56,6 +56,13 @@ pub const FLAG_SESSION_BLOB_TAMPERED: &str = "session_blob_tampered";
 /// do not match the current machine.
 pub const FLAG_SESSION_BLOB_MACHINE_MISMATCH: &str = "session_blob_machine_mismatch";
 
+/// REQ-KVD-CLI-42CB74 — a vault-dependent `tools/call` was blocked because
+/// the MCP server is in `LockedPendingUnlock` state (booted without
+/// credentials and the user has not yet run `kvendra unlock`). The
+/// dispatcher returns JSON-RPC `-32002` with `help.topic =
+/// vault-locked-pending-unlock` and records this flag at severity `warn`.
+pub const FLAG_TOOL_CALL_BLOCKED_PENDING_UNLOCK: &str = "tool_call_blocked_pending_unlock";
+
 /// Status field of an audit row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

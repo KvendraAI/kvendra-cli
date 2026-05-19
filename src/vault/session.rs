@@ -146,9 +146,32 @@ impl SessionKey {
 }
 
 /// State shared by the running process: locked vs unlocked.
+///
+/// `LockedPendingUnlock` (REQ-KVD-CLI-42CB74) distinguishes the boot path
+/// where `kvendra mcp serve` started without any credential material —
+/// no session blob, no env var, no keychain — from the steady-state
+/// `Locked` (the session existed and expired). The MCP dispatcher treats
+/// the two states identically for self-heal purposes but emits distinct
+/// audit flags so a forensic query can tell them apart.
 pub enum VaultState {
     Locked,
     Unlocked(SessionKey),
+    LockedPendingUnlock,
+}
+
+/// Lightweight `Copy` discriminator for [`VaultState`] that does NOT carry
+/// the in-RAM [`SessionKey`]. Used by [`crate::vault::Vault::state`] so
+/// callers can `match` against the vault state without holding the
+/// session mutex or paying lifetime gymnastics on the live key.
+///
+/// Introduced for REQ-KVD-CLI-42CB74 ("tolerant MCP boot") so the
+/// dispatcher can branch on `LockedPendingUnlock` vs `Locked` without
+/// reaching into the full enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultStateKind {
+    Locked,
+    Unlocked,
+    LockedPendingUnlock,
 }
 
 #[cfg(test)]

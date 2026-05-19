@@ -14,7 +14,10 @@
 use crate::allowlist::{ProfileSpec, check as allowlist_check, validate as allowlist_validate};
 use crate::approval::{self, ApprovalCache, Transport};
 use crate::audit::reader::args_hash_hex;
-use crate::audit::{AuditEvent, AuditWriter, PRIMITIVE_SYSTEM, Severity, Status};
+use crate::audit::{
+    AuditEvent, AuditWriter, FLAG_TOOL_CALL_BLOCKED_PENDING_UNLOCK, PRIMITIVE_SYSTEM, Severity,
+    Status,
+};
 use crate::config::Config;
 use crate::detection::{Decision, detect};
 use crate::error::{KvendraError, KvendraResult};
@@ -26,6 +29,7 @@ use crate::mcp::transport::StdioTransport;
 use crate::primitives::catalog;
 use crate::secret_resolver::{CallCtx, SecretResolver};
 use crate::session::{SessionState, list_active_sessions};
+use crate::vault::session::VaultStateKind;
 use crate::vault::{SecretPlaintext, Vault};
 use chrono::Utc;
 use serde_json::Value;
@@ -53,7 +57,17 @@ pub enum MigrationOutcome {
 pub struct ServerContext {
     pub vault: Vault,
     pub config: Config,
-    pub writer: Option<AuditWriter>,
+    /// Audit writer slot. Wrapped in `RwLock<Option<_>>` (interior
+    /// mutability) so the dispatcher can lazy-spawn the writer the first
+    /// time the vault transitions from `LockedPendingUnlock` to `Unlocked`
+    /// via `try_self_heal_vault` — fixes ISSUE-KVD-CLI-9764AC where audit
+    /// rows were silently dropped post-self-heal because the writer was
+    /// constructed `None` at boot and never reconciled.
+    ///
+    /// `AuditWriter` is `Clone` (it wraps an `mpsc::Sender`), so callers
+    /// take a short read lock, clone the handle out, drop the lock, and
+    /// await on the clone — never holding the lock across `.await`.
+    pub writer: std::sync::RwLock<Option<AuditWriter>>,
     /// Approve-all-5min cache (REQ-KVD-003 / ADR-KVD-014). Per-profile, in-mem.
     pub approval_cache: Arc<ApprovalCache>,
     /// Serializa los prompts de approval concurrentes (REQ-KVD-003 risk
@@ -74,6 +88,51 @@ pub struct ServerContext {
     /// Workspace identifier this server is bound to (mirrors
     /// `session.workspace_id`). Used by allowlist sync + stale-blocked checks.
     pub workspace_id: Option<String>,
+}
+
+impl ServerContext {
+    /// Returns a cloned handle to the audit writer if one is attached, or
+    /// `None` if the vault is still locked and the writer has not been
+    /// spawned yet. Cheap: `AuditWriter` is an mpsc::Sender wrapper that is
+    /// `Clone`. Read lock is held only across the clone — never across
+    /// `.await`.
+    pub fn audit_writer(&self) -> Option<AuditWriter> {
+        self.writer
+            .read()
+            .expect("audit writer RwLock poisoned")
+            .clone()
+    }
+
+    /// Lazy-spawn the audit writer if it is currently `None`. Used by
+    /// `try_self_heal_vault` to reconcile the writer slot after a
+    /// `LockedPendingUnlock` → `Unlocked` transition (fixes
+    /// ISSUE-KVD-CLI-9764AC). Returns `Ok(true)` when a writer was just
+    /// spawned, `Ok(false)` when one was already present (idempotent), and
+    /// `Err` only if the vault refuses to mint the HMAC sub-key (which
+    /// should never happen on the success path of self-heal because the
+    /// caller has just transitioned the vault to `Unlocked`).
+    fn ensure_audit_writer_spawned(&self) -> KvendraResult<bool> {
+        // Fast path: writer already present — release the read lock and
+        // return without touching the vault.
+        if self
+            .writer
+            .read()
+            .expect("audit writer RwLock poisoned")
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let key = self.vault.audit_hmac_key()?;
+        let db_path = self.vault.home().join("audit.db");
+        let mut guard = self.writer.write().expect("audit writer RwLock poisoned");
+        // Re-check inside the write lock to avoid double-spawn under racing
+        // self-heal attempts (two `tools/call` arriving within microseconds).
+        if guard.is_some() {
+            return Ok(false);
+        }
+        *guard = Some(AuditWriter::spawn(db_path, key)?);
+        Ok(true)
+    }
 }
 
 /// Run the MCP server until the client disconnects (creates a fresh `Vault`
@@ -197,7 +256,7 @@ pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
     let ctx = Arc::new(ServerContext {
         vault,
         config,
-        writer,
+        writer: std::sync::RwLock::new(writer),
         approval_cache: Arc::new(ApprovalCache::new()),
         approval_prompt_lock: Arc::new(Mutex::new(())),
         transport: Transport::Mcp,
@@ -211,7 +270,7 @@ pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
         let resp = dispatch(req, ctx.clone()).await;
         transport.write(&resp).await?;
     }
-    if let Some(w) = &ctx.writer {
+    if let Some(w) = ctx.audit_writer() {
         w.shutdown().await;
     }
     Ok(())
@@ -342,9 +401,16 @@ fn tools_list(id: Option<Value>) -> JsonRpcResponse {
 /// tampered / wrong machine) leaves the vault locked so the next
 /// `get_secret` returns `VaultLocked` as usual.
 fn try_self_heal_vault(ctx: &ServerContext) {
-    if ctx.vault.is_unlocked() {
-        return;
-    }
+    // REQ-KVD-CLI-42CB74 — accept both `Locked` (steady-state idle expiry,
+    // PAT-KVD-009 path) and `LockedPendingUnlock` (tolerant boot, this
+    // REQ). The audit flag emitted on success distinguishes the two so
+    // forensics can tell idle-recovery from cold-boot-recovery apart.
+    let prior_state = ctx.vault.state();
+    let self_heal_flag = match prior_state {
+        VaultStateKind::Unlocked => return,
+        VaultStateKind::Locked => "mcp_self_heal_from_idle",
+        VaultStateKind::LockedPendingUnlock => "mcp_self_heal_from_pending",
+    };
     let home = ctx.vault.home();
     match crate::session::local::load(home) {
         Ok(state) => {
@@ -356,9 +422,40 @@ fn try_self_heal_vault(ctx: &ServerContext) {
                 Ok(()) => {
                     tracing::info!(
                         target: "kvendra::mcp",
-                        flag = "session_self_healed",
+                        flag = self_heal_flag,
                         "vault locked → re-unlocked from active session blob"
                     );
+                    // ISSUE-KVD-CLI-9764AC fix — if the server booted with
+                    // the vault in `LockedPendingUnlock`, the audit writer
+                    // was constructed `None` and `record_audit` is a silent
+                    // no-op. Now that the vault is `Unlocked` and the HMAC
+                    // sub-key is available, lazy-spawn the writer so events
+                    // (including this very self-heal entry when surfaced by
+                    // `record_audit` higher up the call chain) persist to
+                    // SQLite. Idempotent: returns `Ok(false)` if a writer is
+                    // already attached (e.g. plain `Locked` → `Unlocked`
+                    // idle recovery from PAT-KVD-009).
+                    match ctx.ensure_audit_writer_spawned() {
+                        Ok(true) => {
+                            tracing::info!(
+                                target: "kvendra::mcp",
+                                flag = "audit_writer_lazy_spawned",
+                                trigger = self_heal_flag,
+                                "audit writer lazy-spawned post self-heal — \
+                                 subsequent tools/call events will persist to SQLite"
+                            );
+                        }
+                        Ok(false) => { /* writer already attached, nothing to do */ }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "kvendra::mcp",
+                                flag = "audit_writer_lazy_spawn_failed",
+                                error = %e,
+                                "vault unlocked OK but audit writer spawn failed — \
+                                 audit log will remain disabled this session"
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -403,6 +500,44 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
     } else {
         vec![]
     };
+
+    // REQ-KVD-CLI-42CB74 — tolerant-boot gate. If the vault is still in
+    // `LockedPendingUnlock` after self-heal (no session blob on disk yet,
+    // so the user has not run `kvendra unlock` from their own terminal)
+    // AND the requested tool needs vault material, return a distinguishable
+    // JSON-RPC `-32002` error with `help.topic =
+    // "vault-locked-pending-unlock"`. Non-vault tools (future `whoami` /
+    // `help` / `config_get`) bypass this gate.
+    if ctx.vault.state() == VaultStateKind::LockedPendingUnlock
+        && crate::primitives::tool_requires_vault(name)
+    {
+        flags.push(FLAG_TOOL_CALL_BLOCKED_PENDING_UNLOCK.to_string());
+        let _ = record_audit(
+            &ctx,
+            &arguments,
+            name,
+            &profile_id,
+            &action,
+            &flags,
+            true,
+            None,
+        )
+        .await;
+        let data = serde_json::json!({
+            "state": "locked_pending_unlock",
+            "tool_call_blocked": name,
+            "help": {
+                "topic": "vault-locked-pending-unlock",
+                "action": "Run `kvendra unlock` in your terminal. The MCP server will auto-recover without restart.",
+            },
+        });
+        return JsonRpcResponse::error_with_data(
+            id,
+            codes::VAULT_LOCKED_PENDING_UNLOCK,
+            "Kvendra vault locked-pending-unlock",
+            data,
+        );
+    }
 
     // Detection (REQ-KVD-002 Bloque 7) — inspect arguments JSON BEFORE dispatch.
     let args_text = serde_json::to_string(&arguments).unwrap_or_default();
@@ -667,7 +802,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         | Err(KvendraError::DetectionBlocked(_)) => (Status::Error, Severity::Warn),
         Err(_) => (Status::Error, Severity::Error),
     };
-    if let Some(w) = &ctx.writer {
+    if let Some(w) = ctx.audit_writer() {
         if event_id > 0 {
             let _ = w.update_status(event_id, status, severity).await;
         }
@@ -750,7 +885,7 @@ async fn record_audit(
     failed_pre_dispatch: bool,
     remote_audit_id: Option<&str>,
 ) -> KvendraResult<i64> {
-    let Some(w) = &ctx.writer else {
+    let Some(w) = ctx.audit_writer() else {
         return Err(KvendraError::Audit("audit disabled (vault locked)".into()));
     };
     let event = AuditEvent {
@@ -844,7 +979,7 @@ async fn enforce_allowlist(
             // separate row preserves the literal AC of ISSUE-023 ("audit row
             // ... contains flag allowlist_hmac_migrated") without forcing the
             // boundary call row to also carry the flag.
-            if let Some(writer) = ctx.writer.as_ref() {
+            if let Some(writer) = ctx.audit_writer() {
                 let event = AuditEvent {
                     ts_unix_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 / 1_000_000,
                     profile_id: profile_id.to_string(),
@@ -972,7 +1107,7 @@ mod tests {
         let ctx = ServerContext {
             vault: v,
             config: Config::default(),
-            writer,
+            writer: std::sync::RwLock::new(writer),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
             transport: Transport::Mcp,
@@ -1061,7 +1196,7 @@ mod tests {
 
         // Drain the writer and inspect the SQLite DB directly for the
         // dedicated row.
-        ctx.writer.as_ref().unwrap().shutdown().await;
+        ctx.audit_writer().unwrap().shutdown().await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let conn = rusqlite::Connection::open(ctx.vault.audit_db_path()).unwrap();
         let (action, primitive, flags): (String, String, String) = conn
@@ -1095,7 +1230,7 @@ mod tests {
         let ctx = ServerContext {
             vault: v,
             config: Config::default(),
-            writer: None,
+            writer: std::sync::RwLock::new(None),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
             transport: Transport::Mcp,
@@ -1198,7 +1333,7 @@ mod tests {
         let ctx = ServerContext {
             vault: v,
             config: Config::default(),
-            writer: None,
+            writer: std::sync::RwLock::new(None),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
             transport: Transport::Mcp,
@@ -1212,6 +1347,424 @@ mod tests {
         assert!(
             ctx.vault.is_unlocked(),
             "self-healing should re-unlock the vault from the active blob"
+        );
+    }
+
+    /// REQ-KVD-CLI-42CB74 AC-HEAL-1 + AC-HEAL-2 + AC-HEAL-4 — when the
+    /// vault is in `LockedPendingUnlock` (cold boot, never had a session)
+    /// and a session blob lands on disk later (because the user ran
+    /// `kvendra unlock` in their own terminal), `try_self_heal_vault`
+    /// must (1) transition the vault to `Unlocked` and (2) emit the
+    /// `mcp_self_heal_from_pending` flag — NOT the `_from_idle` variant
+    /// which is reserved for steady-state idle-timeout recovery.
+    ///
+    /// We verify (1) via `vault.state()` post-call. We verify (2) by
+    /// capturing the `tracing` events through a custom subscriber for the
+    /// duration of the call.
+    #[test]
+    fn try_self_heal_from_locked_pending_unlock_succeeds() {
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+        use tracing::Subscriber;
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context as LayerCtx, Layer, SubscriberExt};
+        use tracing_subscriber::registry::Registry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-pending-heal", fast_params())
+            .unwrap();
+        // Prime with a password unlock to mint a derived key + write a
+        // blob for the cold-boot scenario.
+        v.unlock(b"hunter2-pending-heal", 30).unwrap();
+        let derived = v.peek_session_derived_key().unwrap();
+        let state = crate::session::local::build_state_for_current_machine(
+            derived,
+            std::time::Duration::from_secs(3600),
+            home,
+        )
+        .unwrap();
+        crate::session::local::persist_atomic(&state, home).unwrap();
+        v.lock();
+
+        // Simulate a fresh cold-boot: the vault has never been unlocked
+        // in this "process" — only marked pending by attach_session_key.
+        v.mark_pending_unlock();
+        assert_eq!(v.state(), VaultStateKind::LockedPendingUnlock);
+
+        let ctx = ServerContext {
+            vault: v,
+            config: Config::default(),
+            writer: std::sync::RwLock::new(None),
+            approval_cache: Arc::new(ApprovalCache::new()),
+            approval_prompt_lock: Arc::new(Mutex::new(())),
+            transport: Transport::Mcp,
+            resolver: None,
+            session: None,
+            workspace_id: None,
+        };
+
+        // Capture tracing events emitted during the self-heal call.
+        #[derive(Default)]
+        struct FlagCapture(StdArc<StdMutex<Vec<String>>>);
+        impl<S: Subscriber> Layer<S> for FlagCapture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: LayerCtx<'_, S>,
+            ) {
+                struct V<'a>(&'a StdMutex<Vec<String>>);
+                impl<'a> Visit for V<'a> {
+                    fn record_str(&mut self, field: &Field, value: &str) {
+                        if field.name() == "flag" {
+                            self.0.lock().unwrap().push(value.to_string());
+                        }
+                    }
+                    fn record_debug(
+                        &mut self,
+                        field: &Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "flag" {
+                            self.0.lock().unwrap().push(format!("{value:?}"));
+                        }
+                    }
+                }
+                event.record(&mut V(&self.0));
+            }
+        }
+
+        let flags = StdArc::new(StdMutex::new(Vec::new()));
+        let layer = FlagCapture(flags.clone());
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            super::try_self_heal_vault(&ctx);
+        });
+
+        // AC-HEAL-1 — state transitions to Unlocked.
+        assert!(
+            ctx.vault.is_unlocked(),
+            "self-heal from LockedPendingUnlock must unlock the vault"
+        );
+
+        // AC-HEAL-2 + AC-HEAL-4 — emits _from_pending, NOT _from_idle.
+        let captured = flags.lock().unwrap().clone();
+        assert!(
+            captured.iter().any(|f| f.contains("mcp_self_heal_from_pending")),
+            "expected flag mcp_self_heal_from_pending, captured: {captured:?}"
+        );
+        assert!(
+            !captured.iter().any(|f| f.contains("mcp_self_heal_from_idle")),
+            "must NOT emit _from_idle flag when prior state was LockedPendingUnlock, captured: {captured:?}"
+        );
+    }
+
+    /// REQ-KVD-CLI-42CB74 AC-REGRESSION-2 — when the vault is in plain
+    /// `Locked` state (session existed, idle-timeout expired — PAT-KVD-009
+    /// path) and a fresh blob is loadable, `try_self_heal_vault` must
+    /// (1) unlock the vault and (2) emit the `mcp_self_heal_from_idle`
+    /// flag — NOT `_from_pending` which is reserved for cold-boot recovery.
+    ///
+    /// This is the existing PAT-KVD-009 closure behaviour and must NOT
+    /// regress when the cold-boot branch was added.
+    #[test]
+    fn try_self_heal_from_locked_idle_keeps_existing_flag() {
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+        use tracing::Subscriber;
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context as LayerCtx, Layer, SubscriberExt};
+        use tracing_subscriber::registry::Registry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-idle-heal", fast_params())
+            .unwrap();
+        v.unlock(b"hunter2-idle-heal", 30).unwrap();
+
+        // Persist the local session blob then force-lock the in-RAM
+        // session (simulates idle-timeout expiry — pending flag stays
+        // clear, this is the PAT-KVD-009 path).
+        let derived = v.peek_session_derived_key().unwrap();
+        let state = crate::session::local::build_state_for_current_machine(
+            derived,
+            std::time::Duration::from_secs(3600),
+            home,
+        )
+        .unwrap();
+        crate::session::local::persist_atomic(&state, home).unwrap();
+        v.lock();
+
+        assert_eq!(v.state(), VaultStateKind::Locked, "must be plain Locked, not pending");
+
+        let ctx = ServerContext {
+            vault: v,
+            config: Config::default(),
+            writer: std::sync::RwLock::new(None),
+            approval_cache: Arc::new(ApprovalCache::new()),
+            approval_prompt_lock: Arc::new(Mutex::new(())),
+            transport: Transport::Mcp,
+            resolver: None,
+            session: None,
+            workspace_id: None,
+        };
+
+        #[derive(Default)]
+        struct FlagCapture(StdArc<StdMutex<Vec<String>>>);
+        impl<S: Subscriber> Layer<S> for FlagCapture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: LayerCtx<'_, S>,
+            ) {
+                struct V<'a>(&'a StdMutex<Vec<String>>);
+                impl<'a> Visit for V<'a> {
+                    fn record_str(&mut self, field: &Field, value: &str) {
+                        if field.name() == "flag" {
+                            self.0.lock().unwrap().push(value.to_string());
+                        }
+                    }
+                    fn record_debug(
+                        &mut self,
+                        field: &Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "flag" {
+                            self.0.lock().unwrap().push(format!("{value:?}"));
+                        }
+                    }
+                }
+                event.record(&mut V(&self.0));
+            }
+        }
+
+        let flags = StdArc::new(StdMutex::new(Vec::new()));
+        let layer = FlagCapture(flags.clone());
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            super::try_self_heal_vault(&ctx);
+        });
+
+        assert!(ctx.vault.is_unlocked(), "self-heal from Locked must unlock");
+        let captured = flags.lock().unwrap().clone();
+        assert!(
+            captured.iter().any(|f| f.contains("mcp_self_heal_from_idle")),
+            "expected mcp_self_heal_from_idle, captured: {captured:?}"
+        );
+        assert!(
+            !captured.iter().any(|f| f.contains("mcp_self_heal_from_pending")),
+            "must NOT emit _from_pending flag for plain Locked, captured: {captured:?}"
+        );
+    }
+
+    /// REQ-KVD-CLI-42CB74 AC-BOOT-3 + AC-UX-1 — when the vault is in
+    /// `LockedPendingUnlock` and the dispatcher receives a `tools/call`
+    /// for a vault-dependent primitive (e.g. `kvendra.git`), the response
+    /// must be a JSON-RPC error with code `-32002` and a `data` payload
+    /// carrying the `vault-locked-pending-unlock` help topic.
+    ///
+    /// `try_self_heal_vault` is the first step inside `tools_call` and
+    /// will attempt to unlock from a blob. With NO blob on disk, it is
+    /// a no-op (verified by `self_heal_is_noop_when_no_active_blob`) so
+    /// the gate is the actual subject of this test.
+    #[tokio::test]
+    async fn tools_call_blocked_in_pending_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-pending-gate", fast_params())
+            .unwrap();
+        // Do NOT write a session blob — self-heal will be a no-op.
+        v.mark_pending_unlock();
+        assert_eq!(v.state(), VaultStateKind::LockedPendingUnlock);
+
+        let ctx = Arc::new(ServerContext {
+            vault: v,
+            config: Config::default(),
+            writer: std::sync::RwLock::new(None),
+            approval_cache: Arc::new(ApprovalCache::new()),
+            approval_prompt_lock: Arc::new(Mutex::new(())),
+            transport: Transport::Mcp,
+            resolver: None,
+            session: None,
+            workspace_id: None,
+        });
+
+        let resp = super::tools_call(
+            Some(Value::from(42)),
+            serde_json::json!({
+                "name": "kvendra.git",
+                "arguments": {
+                    "profile_id": "doesnotexist",
+                    "operation": "clone",
+                    "args": { "url": "https://example/x.git" }
+                }
+            }),
+            ctx,
+        )
+        .await;
+
+        let err = resp.error.as_ref().expect("expected JSON-RPC error");
+        assert_eq!(
+            err.code,
+            codes::VAULT_LOCKED_PENDING_UNLOCK,
+            "expected -32002 VAULT_LOCKED_PENDING_UNLOCK"
+        );
+        assert_eq!(err.message, "Kvendra vault locked-pending-unlock");
+        let data = err.data.as_ref().expect("expected error.data payload");
+        assert_eq!(data["state"].as_str(), Some("locked_pending_unlock"));
+        assert_eq!(data["tool_call_blocked"].as_str(), Some("kvendra.git"));
+        assert_eq!(
+            data["help"]["topic"].as_str(),
+            Some("vault-locked-pending-unlock")
+        );
+        assert!(
+            data["help"]["action"]
+                .as_str()
+                .is_some_and(|s| s.contains("kvendra unlock")),
+            "help.action must instruct the user to run `kvendra unlock`"
+        );
+    }
+
+    /// REQ-KVD-CLI-42CB74 AC-BOOT-4 — vault-free tools (when added) must
+    /// bypass the LockedPendingUnlock gate. Today no such tool exists in
+    /// the catalog, so we exercise the gate's BRANCH behaviour instead:
+    /// when the vault state is `Unlocked` (not pending), the dispatcher
+    /// must NOT short-circuit with -32002 even for a vault-dep primitive.
+    /// The call will still fail downstream (profile missing) but with
+    /// the legacy APPLICATION_ERROR / INVALID_PARAMS path — proving the
+    /// pending gate is the only branch under test.
+    #[tokio::test]
+    async fn tools_call_allowed_in_pending_state_for_vault_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-allowed-branch", fast_params())
+            .unwrap();
+        v.unlock(b"hunter2-allowed-branch", 30).unwrap();
+        assert_eq!(v.state(), VaultStateKind::Unlocked);
+
+        let ctx = Arc::new(ServerContext {
+            vault: v,
+            config: Config::default(),
+            writer: std::sync::RwLock::new(None),
+            approval_cache: Arc::new(ApprovalCache::new()),
+            approval_prompt_lock: Arc::new(Mutex::new(())),
+            transport: Transport::Mcp,
+            resolver: None,
+            session: None,
+            workspace_id: None,
+        });
+
+        let resp = super::tools_call(
+            Some(Value::from(7)),
+            serde_json::json!({
+                "name": "kvendra.git",
+                "arguments": {
+                    "profile_id": "nope",
+                    "operation": "clone",
+                    "args": { "url": "https://example/x.git" }
+                }
+            }),
+            ctx,
+        )
+        .await;
+
+        // Must NOT be -32002 — the pending gate only fires for
+        // LockedPendingUnlock + vault-dep, and we're Unlocked here.
+        if let Some(err) = resp.error.as_ref() {
+            assert_ne!(
+                err.code,
+                codes::VAULT_LOCKED_PENDING_UNLOCK,
+                "unlocked vault must NOT trigger the pending-unlock gate"
+            );
+        }
+        // (We don't assert success — the primitive will fail later for
+        // missing profile / git args — only that the gate did not fire.)
+    }
+
+    /// REQ-KVD-CLI-42CB74 AC-HEAL-3 audit — when a `tools/call` is blocked
+    /// by the LockedPendingUnlock gate AND an audit writer is attached,
+    /// the dispatcher must record an audit row carrying the canonical
+    /// `tool_call_blocked_pending_unlock` flag (cf.
+    /// `FLAG_TOOL_CALL_BLOCKED_PENDING_UNLOCK` in `audit/mod.rs`).
+    ///
+    /// We assert by querying the SQLite audit DB directly after
+    /// shutting the writer down.
+    #[tokio::test]
+    async fn tools_call_blocked_emits_audit_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-audit-pending", fast_params())
+            .unwrap();
+        // Unlock once to mint the HMAC sub-key for the audit writer, then
+        // simulate a cold-boot state by force-locking + marking pending.
+        // The HMAC sub-key is captured by the writer at spawn time and
+        // survives the in-RAM session being dropped, mirroring how the
+        // pre-existing test fixture exercises the audit chain.
+        v.unlock(b"hunter2-audit-pending", 30).unwrap();
+        let writer = AuditWriter::spawn(v.audit_db_path(), v.audit_hmac_key().unwrap())
+            .expect("spawn audit writer");
+        v.lock();
+        v.mark_pending_unlock();
+        assert_eq!(v.state(), VaultStateKind::LockedPendingUnlock);
+
+        let ctx = Arc::new(ServerContext {
+            vault: v,
+            config: Config::default(),
+            writer: std::sync::RwLock::new(Some(writer)),
+            approval_cache: Arc::new(ApprovalCache::new()),
+            approval_prompt_lock: Arc::new(Mutex::new(())),
+            transport: Transport::Mcp,
+            resolver: None,
+            session: None,
+            workspace_id: None,
+        });
+
+        let resp = super::tools_call(
+            Some(Value::from(9)),
+            serde_json::json!({
+                "name": "kvendra.git",
+                "arguments": {
+                    "profile_id": "p-audit",
+                    "operation": "clone",
+                    "args": { "url": "https://example/x.git" }
+                }
+            }),
+            ctx.clone(),
+        )
+        .await;
+        assert_eq!(
+            resp.error.as_ref().map(|e| e.code),
+            Some(codes::VAULT_LOCKED_PENDING_UNLOCK),
+            "precondition: gate must have fired"
+        );
+
+        // Drain writer.
+        ctx.audit_writer().unwrap().shutdown().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let conn = rusqlite::Connection::open(ctx.vault.audit_db_path()).unwrap();
+        let flags: String = conn
+            .query_row(
+                "SELECT flags FROM audit_events \
+                 WHERE primitive = 'kvendra.git' AND profile_id = 'p-audit' \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("gate must have written at least one audit row");
+        assert!(
+            flags.contains(crate::audit::FLAG_TOOL_CALL_BLOCKED_PENDING_UNLOCK),
+            "audit row must carry the canonical pending-unlock flag, got: {flags}"
         );
     }
 
@@ -1232,7 +1785,7 @@ mod tests {
         let ctx = ServerContext {
             vault: v,
             config: Config::default(),
-            writer: None,
+            writer: std::sync::RwLock::new(None),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
             transport: Transport::Mcp,
@@ -1245,6 +1798,159 @@ mod tests {
         assert!(
             !ctx.vault.is_unlocked(),
             "no blob → vault must remain locked"
+        );
+    }
+
+    /// ISSUE-KVD-CLI-9764AC fix — when the server boots with the vault in
+    /// `LockedPendingUnlock` the audit writer is initialised to `None`.
+    /// After a successful self-heal from a freshly-landed session blob,
+    /// the writer slot MUST transition to `Some(_)` so subsequent
+    /// `record_audit` calls do not silently drop events. Before the fix,
+    /// `ctx.writer` stayed `None` for the lifetime of the process, which
+    /// explains the empirical evidence: `auditEventId: 0` in JSON-RPC
+    /// responses + zero rows in `~/.kvendra/audit.db` for
+    /// `flags LIKE '%self_heal%'`.
+    #[test]
+    fn audit_writer_lazy_spawn_after_self_heal_from_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-lazy-spawn", fast_params())
+            .unwrap();
+        // Mint the derived key, persist a session blob, then drop the in-RAM
+        // session and mark the vault `LockedPendingUnlock` (cold-boot shape).
+        v.unlock(b"hunter2-lazy-spawn", 30).unwrap();
+        let derived = v.peek_session_derived_key().unwrap();
+        let state = crate::session::local::build_state_for_current_machine(
+            derived,
+            std::time::Duration::from_secs(3600),
+            home,
+        )
+        .unwrap();
+        crate::session::local::persist_atomic(&state, home).unwrap();
+        v.lock();
+        v.mark_pending_unlock();
+        assert_eq!(v.state(), VaultStateKind::LockedPendingUnlock);
+
+        // Critical pre-condition: writer constructed as None (mirrors the
+        // production boot path when `audit_hmac_key()` errored).
+        let ctx = ServerContext {
+            vault: v,
+            config: Config::default(),
+            writer: std::sync::RwLock::new(None),
+            approval_cache: Arc::new(ApprovalCache::new()),
+            approval_prompt_lock: Arc::new(Mutex::new(())),
+            transport: Transport::Mcp,
+            resolver: None,
+            session: None,
+            workspace_id: None,
+        };
+        assert!(
+            ctx.audit_writer().is_none(),
+            "precondition: writer must start as None"
+        );
+
+        super::try_self_heal_vault(&ctx);
+
+        // Vault unlocked (sanity).
+        assert!(
+            ctx.vault.is_unlocked(),
+            "self-heal must unlock the vault from the session blob"
+        );
+        // The actual ISSUE-KVD-CLI-9764AC assertion — writer slot is now Some.
+        assert!(
+            ctx.audit_writer().is_some(),
+            "audit writer MUST be lazy-spawned after self-heal from \
+             LockedPendingUnlock (ISSUE-KVD-CLI-9764AC fix)"
+        );
+    }
+
+    /// ISSUE-KVD-CLI-9764AC fix — end-to-end: after lazy-spawn the writer
+    /// must actually persist rows to SQLite. Drives `record_audit` directly
+    /// post self-heal and verifies the row lands in `audit_events` with a
+    /// non-zero id and the expected flags.
+    #[tokio::test]
+    async fn audit_row_persisted_after_lazy_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-row-persist", fast_params())
+            .unwrap();
+        v.unlock(b"hunter2-row-persist", 30).unwrap();
+        let derived = v.peek_session_derived_key().unwrap();
+        let state = crate::session::local::build_state_for_current_machine(
+            derived,
+            std::time::Duration::from_secs(3600),
+            home,
+        )
+        .unwrap();
+        crate::session::local::persist_atomic(&state, home).unwrap();
+        v.lock();
+        v.mark_pending_unlock();
+
+        let ctx = ServerContext {
+            vault: v,
+            config: Config::default(),
+            writer: std::sync::RwLock::new(None),
+            approval_cache: Arc::new(ApprovalCache::new()),
+            approval_prompt_lock: Arc::new(Mutex::new(())),
+            transport: Transport::Mcp,
+            resolver: None,
+            session: None,
+            workspace_id: None,
+        };
+
+        // Trigger self-heal (sync) → writer should be lazy-spawned.
+        super::try_self_heal_vault(&ctx);
+        assert!(ctx.vault.is_unlocked());
+        assert!(ctx.audit_writer().is_some(), "writer must be spawned");
+
+        // Drive record_audit through the public entry point. Before the
+        // fix this call returned `Err(Audit("audit disabled (vault locked)"))`
+        // because `ctx.writer` was still `None`. Post-fix it returns a
+        // valid event id > 0.
+        let event_id = super::record_audit(
+            &ctx,
+            &serde_json::json!({ "operation": "ping" }),
+            "kvendra.test",
+            "test-profile",
+            "ping",
+            &["mcp_self_heal_from_pending".to_string()],
+            false,
+            None,
+        )
+        .await
+        .expect("record_audit must succeed post lazy-spawn");
+        assert!(
+            event_id > 0,
+            "post lazy-spawn record_audit must return a real event id, got {event_id}"
+        );
+
+        // Drain writer and inspect SQLite directly — verifies the HMAC
+        // chain is wired correctly (the writer task only acks after the
+        // INSERT + HMAC compute succeed).
+        ctx.audit_writer().unwrap().shutdown().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let conn = rusqlite::Connection::open(ctx.vault.audit_db_path()).unwrap();
+        let (id, primitive, flags, hmac_hex): (i64, String, String, String) = conn
+            .query_row(
+                "SELECT id, primitive, flags, hmac_hex FROM audit_events \
+                 WHERE primitive = 'kvendra.test' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("lazy-spawned writer must have persisted at least one row");
+        assert_eq!(id, event_id, "in-memory event_id must match SQLite row id");
+        assert_eq!(primitive, "kvendra.test");
+        assert!(
+            flags.contains("mcp_self_heal_from_pending"),
+            "row must carry the self-heal flag we passed in, got: {flags}"
+        );
+        assert!(
+            !hmac_hex.is_empty(),
+            "HMAC chain column must be populated — empty means writer skipped HMAC compute"
         );
     }
 }

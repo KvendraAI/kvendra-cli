@@ -32,6 +32,14 @@ pub struct PrimitiveInfo {
     /// la shape de `args` (cierra el retry pattern documentado en
     /// ISSUE-KVD-CLI-014). Empty string si no hay doc adicional.
     pub operations_doc: &'static str,
+    /// REQ-KVD-CLI-42CB74 — `true` when the primitive needs an unlocked
+    /// vault to function (every credential-bound capability). The MCP
+    /// dispatcher gates these with JSON-RPC `-32002` when the vault state
+    /// is `LockedPendingUnlock`. Set `false` for inert read-only tools
+    /// that can run before `kvendra unlock` (none exist in this catalog
+    /// today; the flag is wired in for future `whoami` / `help` /
+    /// `config_get` tools).
+    pub requires_vault: bool,
 }
 
 impl PrimitiveInfo {
@@ -95,6 +103,7 @@ const CATALOG: [PrimitiveInfo; 8] = [
         operations: &["clone", "push", "pull", "commit", "tag"],
         is_unsafe: false,
         operations_doc: "Operations:\n  clone:  args: { url: \"<git url>\", dst?: \"<path>\" }\n  push:   args: { cwd: \"<path>\", remote?: \"origin\", ref: \"refs/heads/<branch>\" }\n  pull:   args: { cwd: \"<path>\", remote?: \"origin\", ref: \"refs/heads/<branch>\" }\n  commit: args: { cwd: \"<path>\", message: \"<msg>\" }\n  tag:    args: { cwd: \"<path>\", name: \"<tag>\", message?: \"<msg>\" }\nAll operations require profile_id at the top level.",
+        requires_vault: true,
     },
     PrimitiveInfo {
         name: "kvendra.github",
@@ -109,6 +118,7 @@ const CATALOG: [PrimitiveInfo; 8] = [
         ],
         is_unsafe: false,
         operations_doc: "Operations (`repo` accepts `owner/name` or `github.com/owner/name`):\n  read_repo:    args: { repo: \"owner/name\" }\n  read_issue:   args: { repo: \"owner/name\", number: 42 }\n  update_issue: args: { repo: \"owner/name\", number: 42, title?, body?, state?, labels?, assignees? }\n  update_repo:  args: { repo: \"owner/name\", description?, homepage?, private?, default_branch? }\n  add_topics:   args: { repo: \"owner/name\", topics: [\"a\", \"b\"] }   # APPENDS (REQ-KVD-005)\n  release:      args: { repo: \"owner/name\", tag_name, name?, body?, draft?, prerelease?, target_commitish? }\nAll operations require profile_id at the top level.",
+        requires_vault: true,
     },
     PrimitiveInfo {
         name: "kvendra.npm",
@@ -116,6 +126,7 @@ const CATALOG: [PrimitiveInfo; 8] = [
         operations: &["publish", "deprecate", "read_metadata"],
         is_unsafe: false,
         operations_doc: "Operations:\n  publish:       args: { cwd: \"<path>\", access?: \"public\"|\"restricted\", tag?: \"latest\" }\n  deprecate:     args: { package: \"<name>\", version: \"<semver>\", message: \"<reason>\" }\n  read_metadata: args: { package: \"<name>\" }\nAll operations require profile_id at the top level.",
+        requires_vault: true,
     },
     PrimitiveInfo {
         name: "kvendra.pypi",
@@ -123,6 +134,7 @@ const CATALOG: [PrimitiveInfo; 8] = [
         operations: &["upload", "read_metadata"],
         is_unsafe: false,
         operations_doc: "Operations:\n  upload:        args: { dist_path: \"<path>\", repository_url?: \"https://upload.pypi.org/legacy/\" }\n  read_metadata: args: { project: \"<name>\" }\nAll operations require profile_id at the top level.",
+        requires_vault: true,
     },
     PrimitiveInfo {
         name: "kvendra.aws",
@@ -130,6 +142,7 @@ const CATALOG: [PrimitiveInfo; 8] = [
         operations: &["s3_sync", "s3_cp", "cloudfront_invalidate", "lambda_invoke"],
         is_unsafe: false,
         operations_doc: "Operations:\n  s3_sync:               args: { src: \"<src>\", dst: \"<dst>\", delete?: false }   # delete=true is destructive\n  s3_cp:                 args: { src: \"<src>\", dst: \"<dst>\" }\n  cloudfront_invalidate: args: { distribution_id: \"<id>\", paths: [\"/*\"] }\n  lambda_invoke:         args: { function_name: \"<name>\", payload?: <object>, invocation_type?: \"RequestResponse\" }\nAll operations require profile_id at the top level.",
+        requires_vault: true,
     },
     PrimitiveInfo {
         name: "kvendra.http",
@@ -137,6 +150,7 @@ const CATALOG: [PrimitiveInfo; 8] = [
         operations: &["request"],
         is_unsafe: false,
         operations_doc: "Operations:\n  request: args: { url: \"<url>\", method: \"GET\"|\"POST\"|\"PUT\"|\"PATCH\"|\"DELETE\"|\"HEAD\"|\"OPTIONS\", headers?: <object>, body?: <object|string> }\nThe profile's allowlist constrains url_pattern_regex + methods. POST/PUT/PATCH/DELETE require accept_destructive: true on the operation.\nRequires profile_id at the top level.",
+        requires_vault: true,
     },
     PrimitiveInfo {
         name: "kvendra.shell",
@@ -144,6 +158,7 @@ const CATALOG: [PrimitiveInfo; 8] = [
         operations: &["exec"],
         is_unsafe: false,
         operations_doc: "Operations:\n  exec: args: { binary: \"<name>\", args: [\"<arg1>\", ...], cwd?: \"<path>\", env?: <object> }\nThe profile's allowlist constrains binary names + arg patterns. Always destructive (requires accept_destructive: true).\nRequires profile_id at the top level.",
+        requires_vault: true,
     },
     PrimitiveInfo {
         name: "kvendra.unsafe.raw_token",
@@ -151,8 +166,22 @@ const CATALOG: [PrimitiveInfo; 8] = [
         operations: &["get"],
         is_unsafe: true,
         operations_doc: "Args: { profile_id: \"<id>\", reason: \"<why this escape hatch is necessary, audit-logged>\" }\nThis primitive deliberately exposes the plaintext credential. Each call is logged with severity=warn and flag=unsafe_escape_hatch. Use ONLY when no canonical primitive can perform the action and you have approved the risk in the profile metadata.",
+        requires_vault: true,
     },
 ];
+
+/// REQ-KVD-CLI-42CB74 — look up `requires_vault` for a tool by name. Used
+/// by the MCP dispatcher's `LockedPendingUnlock` gate. Returns `true` as
+/// the conservative default for unknown names so the gate fails-closed:
+/// if a typo or stray tool slips past the catalog, it does NOT bypass the
+/// vault gate.
+pub fn tool_requires_vault(name: &str) -> bool {
+    catalog()
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| p.requires_vault)
+        .unwrap_or(true)
+}
 
 #[cfg(test)]
 mod tests {
@@ -166,6 +195,7 @@ mod tests {
             operations: &["op_a", "op_b"],
             is_unsafe: false,
             operations_doc: "Operations:\n  op_a: ...\n  op_b: ...",
+            requires_vault: true,
         };
         let d = info.tools_list_description();
         assert!(d.starts_with("Summary line"));
@@ -181,6 +211,7 @@ mod tests {
             operations: &["op"],
             is_unsafe: false,
             operations_doc: "",
+            requires_vault: true,
         };
         assert_eq!(info.tools_list_description(), "Just a summary");
     }
@@ -193,6 +224,7 @@ mod tests {
             operations: &["get"],
             is_unsafe: true,
             operations_doc: "",
+            requires_vault: true,
         };
         assert!(
             info.tools_list_description().starts_with("[UNSAFE] "),
@@ -219,6 +251,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// REQ-KVD-CLI-42CB74 AC-BOOT-4 — `tool_requires_vault` must return
+    /// `true` for every catalog entry today (all 8 primitives are
+    /// credential-bound) and `true` (fail-closed) for unknown names.
+    /// When future vault-free tools (`whoami`, `help`, `config_get`) are
+    /// added to the catalog with `requires_vault: false`, this test will
+    /// fail and the assertions on those names below should be flipped.
+    #[test]
+    fn tool_requires_vault_default_fail_closed() {
+        // Every entry currently in the catalog requires the vault.
+        for entry in catalog() {
+            assert!(
+                tool_requires_vault(entry.name),
+                "catalog entry {} unexpectedly returns false from tool_requires_vault — \
+                 if intentional (new vault-free tool), update this test",
+                entry.name
+            );
+        }
+
+        // Sample of the canonical primitives — must require vault.
+        assert!(tool_requires_vault("kvendra.git"));
+        assert!(tool_requires_vault("kvendra.aws"));
+        assert!(tool_requires_vault("kvendra.unsafe.raw_token"));
+
+        // Unknown tool name must fail-closed — the dispatcher's
+        // LockedPendingUnlock gate would otherwise leak through on typo.
+        assert!(
+            tool_requires_vault("totally.not.a.real.tool"),
+            "unknown tool must default to requires_vault=true (fail-closed)"
+        );
+        assert!(
+            tool_requires_vault(""),
+            "empty tool name must default to requires_vault=true (fail-closed)"
+        );
+
+        // Future vault-free tools — when added, these must be flipped to
+        // false. Today they are NOT in the catalog → fall through to the
+        // fail-closed default = true.
+        assert!(
+            tool_requires_vault("whoami"),
+            "whoami not in catalog today → fail-closed true; \
+             flip when REQ-KVD-CLI-42CB74 Phase 2 adds vault-free tools"
+        );
+        assert!(
+            tool_requires_vault("help"),
+            "help not in catalog today → fail-closed true"
+        );
+        assert!(
+            tool_requires_vault("config_get"),
+            "config_get not in catalog today → fail-closed true"
+        );
     }
 
     #[test]
