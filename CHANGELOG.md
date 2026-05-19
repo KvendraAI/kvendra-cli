@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.4.0-alpha.4] — 2026-05-19 — Pro session email from id_token (OIDC compliance)
+
+Polish release on top of `0.4.0-alpha.3`. Cierra `ISSUE-KVD-CLI-940018` (reclasificado del original `ISSUE-KVD-ENTERPRISE-CC3B95`): el campo `pro.email` aparecía como `None` en `kvendra session info --json` porque el flow `login --pro` solo persistía el access_token, y Cognito sigue OIDC estrictamente — el claim `email` va en el id_token, no en el access_token.
+
+### Fixed
+- **`session info` no mostraba `pro.email`** (`ISSUE-KVD-CLI-940018`, redirect from `ISSUE-KVD-ENTERPRISE-CC3B95`): `pro_login()` ahora persiste también `~/.kvendra/sessions/pro.id_token` (mode 0600) junto al access_token. `read_pro_view` prefiere id_token para extraer email/issuer/exp con fallback al access_token para backwards-compat con instalaciones pre-0.4.0-alpha.4. `logout` sin `--workspace` borra idempotentemente el sidecar pro.id_token. El access_token sigue siendo consumido por `kvendra backup` endpoints sin cambios. Causa raíz verificada empíricamente: Cognito client tiene `AllowedOAuthScopes: [openid, email, profile]` correctamente, pero el `email` claim solo se incluye en el id_token (comportamiento OIDC estándar, no bug de Cognito ni del SAM template). Fix CLI-side: 4 ficheros tocados, 3 tests añadidos. 388/388 PASS.
+
 ## [0.4.0-alpha.3] — 2026-05-19 — Pro tier inspector + decoder fix + login tracing
 
 Polish release on top of `0.4.0-alpha.2`. Consolida 3 fixes detectados durante el dogfooding del manual gate TEST-M1: el decoder bug original que la sesión Pro disparaba en `kvendra session info`, la falta de detección del tier Pro en el inspector, y la ausencia de tracing structured log en `kvendra login --pro`. Closes `ISSUE-KVD-CLI-2F07ED`, `ISSUE-KVD-CLI-170F9D` and `ISSUE-KVD-CLI-9AE300`.
