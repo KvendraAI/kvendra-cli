@@ -133,9 +133,7 @@ pub fn load_any_jwt() -> KvendraResult<String> {
 
 fn load_first_workspace_jwt(home: &Path) -> KvendraResult<Option<String>> {
     let active = list_active_sessions(home)?;
-    // Prefer a non-"pro" id (the pro token is also list-detectable but lives
-    // outside the SessionState schema).
-    let chosen = active.into_iter().find(|w| w != "pro");
+    let chosen = active.into_iter().next();
     let Some(ws_id) = chosen else { return Ok(None) };
     let Some(state) = SessionState::load(home, &ws_id)? else { return Ok(None) };
     Ok(Some(state.jwt))

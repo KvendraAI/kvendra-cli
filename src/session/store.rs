@@ -128,8 +128,12 @@ impl SessionState {
         }
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| KvendraError::SessionStore(format!("read: {e}")))?;
-        let parsed: Self = serde_json::from_str(&raw)
-            .map_err(|e| KvendraError::SessionStore(format!("decode: {e}")))?;
+        let parsed: Self = serde_json::from_str(&raw).map_err(|e| {
+            KvendraError::SessionStore(format!(
+                "decode session at {}: {e} — file is not valid SessionState JSON (raw tier tokens like pro.token should not live here as workspace state)",
+                path.display()
+            ))
+        })?;
         Ok(Some(parsed))
     }
 
@@ -227,6 +231,13 @@ pub fn list_active_sessions(home: &Path) -> KvendraResult<Vec<String>> {
             if stripped.contains(".tmp.") {
                 continue;
             }
+            if stripped == "pro" {
+                // pro.token is a raw JWT (not SessionState JSON) written by
+                // `kvendra login --pro`. It lives in sessions/ for locality but
+                // is consumed via backup::load_pro_jwt directly. Skip it here
+                // so workspace-session enumerations don't choke on its shape.
+                continue;
+            }
             out.push(SessionState::workspace_id_from_safe(stripped));
         }
     }
@@ -300,5 +311,77 @@ mod tests {
         s.persist_atomic(dir.path()).unwrap();
         let active = list_active_sessions(dir.path()).unwrap();
         assert_eq!(active, vec![s.workspace_id.clone()]);
+    }
+
+    // -------- ISSUE-KVD-CLI-2F07ED regression tests --------
+    //
+    // `kvendra login --pro` (REQ-KVD-CLI-005 AC-BACKUP-7) intentionally writes
+    // a raw JWT to `~/.kvendra/sessions/pro.token`. The bug: `list_active_sessions`
+    // currently treats every `*.token` file as a workspace token, so it returns
+    // `"pro"` as if it were a `workspace_id`. Downstream, `session info` calls
+    // `SessionState::load(home, "pro")` which `serde_json::from_str` rejects
+    // because `pro.token` is raw JWT, not JSON.
+    //
+    // The fix (Opción A per functional-expert) is to skip `pro` in
+    // `list_active_sessions`. These tests pin that contract.
+
+    #[test]
+    fn list_active_sessions_skips_pro_token() {
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // Raw JWT as written by `pro_login` (src/cli/login.rs:117-125).
+        std::fs::write(sessions.join("pro.token"), b"eyJhbGc.payload.sig").unwrap();
+
+        let active = list_active_sessions(dir.path()).unwrap();
+        assert_eq!(
+            active,
+            Vec::<String>::new(),
+            "pro.token must NOT be reported as a workspace session"
+        );
+    }
+
+    #[test]
+    fn list_active_sessions_mixed_pro_and_workspace() {
+        let dir = tempdir().unwrap();
+        // Persist a real workspace session.
+        let s = fixture_state();
+        s.persist_atomic(dir.path()).unwrap();
+        // Then drop a raw pro JWT next to it.
+        let sessions = dir.path().join("sessions");
+        std::fs::write(sessions.join("pro.token"), b"eyJhbGc.payload.sig").unwrap();
+
+        let active = list_active_sessions(dir.path()).unwrap();
+        assert_eq!(
+            active,
+            vec![s.workspace_id.clone()],
+            "list must contain only the workspace session, not 'pro'"
+        );
+    }
+
+    #[test]
+    fn session_state_load_rejects_non_json_with_helpful_error() {
+        // Defence-in-depth follow-up: even if a non-JSON file slips into
+        // sessions/<slug>.token, `load` should fail with an actionable
+        // message (not the bare serde "expected value at line 1 column 1").
+        // This test is intentionally aspirational — the implementer of the
+        // FASE 4 fix decides whether to widen `load`'s error message as part
+        // of the fix or as a follow-up.
+        let dir = tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("bogus.token"), b"not.json").unwrap();
+
+        let err = SessionState::load(dir.path(), "bogus").expect_err("must fail on non-JSON");
+        let msg = err.to_string().to_lowercase();
+        // Helpful = mentions the file path OR a hint about the format.
+        assert!(
+            msg.contains("bogus.token")
+                || msg.contains("not valid json")
+                || msg.contains("corrupt")
+                || msg.contains("re-run `kvendra login")
+                || msg.contains("re-run kvendra login"),
+            "error message should be actionable, got: {err}"
+        );
     }
 }

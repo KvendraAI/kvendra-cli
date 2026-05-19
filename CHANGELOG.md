@@ -7,6 +7,9 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+### Fixed
+- **`session info` crash post `login --pro`** (`ISSUE-KVD-CLI-2F07ED`): `list_active_sessions` no excluía `pro.token` del scan de workspace tokens. `pro.token` es un JWT raw escrito intencionalmente por `pro_login()` y consumido por `backup::load_pro_jwt`; aparecía como pseudo-workspace `"pro"` y `SessionState::load` fallaba con `decode: expected value at line 1 column 1`. Filtro añadido en `src/session/store.rs:225-237`. Adicionalmente: error de `SessionState::load` ahora incluye el path completo + hint sobre raw tier tokens (defence-in-depth para futuros `team.token`/`enterprise.token`); workaround redundante `.find(|w| w != "pro")` en `src/cli/notifs.rs:135-138` eliminado (single source of truth en el listado canónico). Curaba 5 callsites afectados además del reportado: `cli/logout.rs:30`, `cli/secret.rs:134`, `cli/workspace.rs:127`, `mcp/server.rs:294`, `cli/notifs.rs:135`. 5 tests de regresión añadidos (3 unit + 2 integration via `assert_cmd`).
+
 ## [0.4.0-alpha.2] — 2026-05-19 — MCP tolerant boot + audit writer lazy-spawn
 
 Polish/extension release on top of `0.4.0-alpha.1`. Closes the cold-start
