@@ -129,11 +129,23 @@ async fn pro_login() -> KvendraResult<()> {
         path.display()
     );
 
+    // Persist also the id_token for UX display (email + profile claims).
+    // OIDC by-design: `access_token` is opaque to clients and carries no
+    // user claims; `id_token` carries `email`, `name`, `sub`, etc. Backup
+    // endpoints continue to use `pro.token` (access_token) as the bearer.
+    // Fix for ISSUE-KVD-CLI-940018 — `session info` rendered `email: None`
+    // because it decoded the access_token instead of the id_token.
+    let id_token_path = sessions_dir.join("pro.id_token");
+    std::fs::write(&id_token_path, token_set.id_token.as_bytes())
+        .map_err(|e| KvendraError::SessionStore(format!("write pro.id_token: {e}")))?;
+    set_file_mode_secure(&id_token_path)?;
+
     // Structured log for UX-quality observability (ISSUE-KVD-CLI-9AE300).
     // Claims are untrusted at this point — the IdP signed them and the broker
     // re-validates on every API call; we use them only to surface flag, email,
-    // issuer and expires_at to operators tailing the trace.
-    let claims = decode_jwt_payload(&token_set.access_token).unwrap_or_default();
+    // issuer and expires_at to operators tailing the trace. Use the id_token
+    // because access_token has no `email` claim (OIDC by-design).
+    let claims = decode_jwt_payload(&token_set.id_token).unwrap_or_default();
     let expires_at = claims
         .exp
         .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts, 0))

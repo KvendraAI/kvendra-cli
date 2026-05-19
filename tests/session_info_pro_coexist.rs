@@ -142,6 +142,65 @@ fn session_info_pro_coexists_with_workspace_session() {
     );
 }
 
+/// Regression for ISSUE-KVD-CLI-940018: when `pro.id_token` sidecar exists
+/// alongside `pro.token`, `kvendra session info --json` must surface the
+/// `email` claim sourced from the id_token (the access_token is opaque to
+/// clients and carries no `email` claim per OIDC). End-to-end CLI test.
+#[test]
+fn session_info_shows_email_from_id_token() {
+    let home = tempdir().unwrap();
+    let sessions = home.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    // access_token: no email (Cognito-shaped opaque access_token).
+    let access_jwt = make_jwt(serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000",
+        "iss": "https://auth.kvendra.cloud",
+        "token_use": "access",
+    }));
+    // id_token: carries email + exp.
+    let exp = (Utc::now() + ChronoDuration::hours(24)).timestamp();
+    let id_jwt = make_jwt(serde_json::json!({
+        "email": "owner@kvendra.cloud",
+        "sub":   "550e8400-e29b-41d4-a716-446655440000",
+        "iss":   "https://auth.kvendra.cloud",
+        "exp":   exp,
+        "token_use": "id",
+    }));
+    std::fs::write(sessions.join("pro.token"), access_jwt.as_bytes()).unwrap();
+    std::fs::write(sessions.join("pro.id_token"), id_jwt.as_bytes()).unwrap();
+
+    let assert = Command::cargo_bin("kvendra")
+        .unwrap()
+        .env("KVENDRA_HOME", home.path())
+        .args(["session", "info", "--json"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("session info --json must emit valid JSON");
+    assert_eq!(
+        json.get("mode").and_then(|v| v.as_str()),
+        Some("pro"),
+        "mode must be 'pro' when only pro.* tokens exist, got: {stdout}"
+    );
+    let pro = json.get("pro").expect("pro section must be present");
+    assert_eq!(
+        pro.get("email").and_then(|v| v.as_str()),
+        Some("owner@kvendra.cloud"),
+        "pro.email MUST be sourced from pro.id_token, got: {stdout}"
+    );
+    assert_eq!(
+        pro.get("issuer").and_then(|v| v.as_str()),
+        Some("https://auth.kvendra.cloud"),
+        "pro.issuer must be decoded, got: {stdout}"
+    );
+    assert!(
+        pro.get("expires_at").is_some(),
+        "pro.expires_at must be decoded from id_token exp, got: {stdout}"
+    );
+}
+
 #[test]
 fn session_info_works_with_pro_token_and_workspace_token() {
     let home = tempdir().unwrap();

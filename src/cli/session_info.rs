@@ -223,12 +223,26 @@ fn print_local_section(local: Option<&LocalSessionView>) {
 /// caller falls back to "local" mode and the operator re-runs
 /// `kvendra login --pro`).
 fn read_pro_view(home: &Path) -> Option<ProSessionView> {
-    let path = home.join("sessions/pro.token");
-    if !path.is_file() {
+    let access_path = home.join("sessions/pro.token");
+    if !access_path.is_file() {
         return None;
     }
-    let jwt = std::fs::read_to_string(&path).ok()?;
-    let claims = crate::cli::login::decode_jwt_payload(jwt.trim()).unwrap_or_default();
+    // Prefer `pro.id_token` for UX claims (email, issuer, exp). OIDC
+    // by-design: the access_token is opaque to clients and carries no
+    // user claims; only the id_token has `email`, `name`, `sub`, etc.
+    // Fall back to `pro.token` for backwards compat with installs from
+    // before 0.4.0-alpha.4 that persisted only the access_token. Fix
+    // for ISSUE-KVD-CLI-940018.
+    let id_path = home.join("sessions/pro.id_token");
+    let jwt_for_claims = if id_path.is_file() {
+        std::fs::read_to_string(&id_path).ok()
+    } else {
+        std::fs::read_to_string(&access_path).ok()
+    };
+    let claims = jwt_for_claims
+        .as_deref()
+        .and_then(|s| crate::cli::login::decode_jwt_payload(s.trim()))
+        .unwrap_or_default();
     let expires_at = claims
         .exp
         .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0));
@@ -239,7 +253,9 @@ fn read_pro_view(home: &Path) -> Option<ProSessionView> {
         issuer: claims.iss,
         expires_at,
         seconds_until_expiry,
-        blob_path: path,
+        // User-visible "Token:" path points to the access_token because that
+        // is the file consumed by `kvendra backup *` (bearer JWT).
+        blob_path: access_path,
     })
 }
 
@@ -465,5 +481,78 @@ mod tests {
         assert!(view.email.is_none());
         assert!(view.issuer.is_none());
         assert!(view.expires_at.is_none());
+    }
+
+    /// Regression for ISSUE-KVD-CLI-940018: when both `pro.token` (access
+    /// token, opaque, no claims) and `pro.id_token` (claims-carrying) are
+    /// present, `read_pro_view` MUST decode email/issuer/exp from the
+    /// id_token, not from the access_token. OIDC by-design: access_token
+    /// carries no `email` claim.
+    #[test]
+    fn read_pro_view_prefers_id_token_for_email() {
+        let home = tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // access_token: NO email claim (mimics Cognito opaque access_token).
+        let access_jwt = make_jwt(serde_json::json!({
+            "sub": "550e8400-e29b-41d4-a716-446655440000",
+            "iss": "https://auth.kvendra.cloud",
+            "token_use": "access",
+        }));
+        // id_token: carries the email claim.
+        let exp = (Utc::now() + chrono::Duration::hours(24)).timestamp();
+        let id_jwt = make_jwt(serde_json::json!({
+            "email": "owner@kvendra.cloud",
+            "sub":   "550e8400-e29b-41d4-a716-446655440000",
+            "iss":   "https://auth.kvendra.cloud",
+            "exp":   exp,
+            "token_use": "id",
+        }));
+        std::fs::write(sessions.join("pro.token"), access_jwt.as_bytes()).unwrap();
+        std::fs::write(sessions.join("pro.id_token"), id_jwt.as_bytes()).unwrap();
+
+        let view = read_pro_view(home.path()).expect("must find pro.token");
+        assert!(view.active);
+        assert_eq!(
+            view.email.as_deref(),
+            Some("owner@kvendra.cloud"),
+            "email MUST be sourced from id_token, not access_token"
+        );
+        assert_eq!(view.issuer.as_deref(), Some("https://auth.kvendra.cloud"));
+        assert!(
+            view.expires_at.is_some(),
+            "exp must decode from id_token"
+        );
+        // blob_path stays pointing to pro.token (the backup-consumed bearer).
+        assert!(view.blob_path.ends_with("sessions/pro.token"));
+    }
+
+    /// Regression for ISSUE-KVD-CLI-940018 backwards-compat path: installs
+    /// that pre-date 0.4.0-alpha.4 only have `pro.token` (access_token);
+    /// no `pro.id_token` sidecar. `read_pro_view` must still return a view
+    /// without crashing — claims fall back to whatever the access_token
+    /// happens to expose (usually nothing useful, hence the email shows
+    /// as None until the operator re-runs `kvendra login --pro`).
+    #[test]
+    fn read_pro_view_falls_back_to_access_token_when_no_id_token() {
+        let home = tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // Cognito-shaped access_token: no email claim.
+        let access_jwt = make_jwt(serde_json::json!({
+            "sub": "550e8400-e29b-41d4-a716-446655440000",
+            "iss": "https://auth.kvendra.cloud",
+            "token_use": "access",
+        }));
+        std::fs::write(sessions.join("pro.token"), access_jwt.as_bytes()).unwrap();
+
+        let view = read_pro_view(home.path()).expect("file exists → Some");
+        assert!(view.active);
+        assert!(
+            view.email.is_none(),
+            "no id_token sidecar AND access_token has no email → None (expected pre-fix behaviour)"
+        );
+        assert_eq!(view.issuer.as_deref(), Some("https://auth.kvendra.cloud"));
+        assert!(view.blob_path.ends_with("sessions/pro.token"));
     }
 }

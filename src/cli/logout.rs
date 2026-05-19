@@ -35,6 +35,14 @@ pub async fn run(args: LogoutArgs) -> KvendraResult<()> {
                     eprintln!("Workspace session '{ws_id}' cleared.");
                 }
             }
+            // Best-effort clear of the Pro tier id_token sidecar (added in
+            // 0.4.0-alpha.4 for ISSUE-KVD-CLI-940018). `pro.token` itself is
+            // not deleted here — it was never deleted by `logout` historically
+            // and the operator may want to keep the backup bearer alive; only
+            // the id_token sidecar (UX-only) is cleaned up to avoid leaving
+            // stale email/issuer claims behind after a session clear.
+            let id_token_path = home.join("sessions/pro.id_token");
+            let _ = std::fs::remove_file(&id_token_path);
             crate::cli::lock::run().await
         }
     }
