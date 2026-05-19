@@ -9,7 +9,7 @@ use crate::session::{SessionState, list_active_sessions};
 use chrono::{DateTime, Utc};
 use clap::Args;
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Args)]
 pub struct SessionInfoArgs {
@@ -39,6 +39,24 @@ struct LocalSessionView {
     seconds_until_expiry: Option<i64>,
 }
 
+/// Pro tier session view (REQ-KVD-CLI-005 AC-BACKUP-7). Reports presence of
+/// `~/.kvendra/sessions/pro.token` plus a best-effort decode of the JWT
+/// claims for UX (BUG-A / ISSUE-KVD-CLI-170F9D — previously `session info`
+/// rendered "Free tier" even when a valid pro.token existed).
+#[derive(Debug, Clone, Serialize)]
+struct ProSessionView {
+    active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seconds_until_expiry: Option<i64>,
+    blob_path: PathBuf,
+}
+
 #[derive(Debug, Serialize)]
 struct SessionView {
     mode: String,
@@ -46,6 +64,11 @@ struct SessionView {
     /// from the workspace JWT below — both can be active at once.
     #[serde(skip_serializing_if = "Option::is_none")]
     local: Option<LocalSessionView>,
+    /// Pro tier JWT session (REQ-KVD-CLI-005). Independent from `local`
+    /// and `workspace_id` — `pro.token` can coexist with either; the `mode`
+    /// field decides which one is primary for human rendering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pro: Option<ProSessionView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,10 +102,14 @@ pub async fn run(args: SessionInfoArgs) -> KvendraResult<()> {
     let home = kvendra_home()?;
     let sessions = list_active_sessions(&home)?;
     let local_view = read_local_view(&home);
+    let pro_view = read_pro_view(&home);
     let mut view = match sessions.len() {
         0 => SessionView {
-            mode: "local".into(),
+            // BUG-A (ISSUE-KVD-CLI-170F9D): when only pro.token exists
+            // we render "Mode: pro" instead of misleading "Free tier".
+            mode: if pro_view.is_some() { "pro".into() } else { "local".into() },
             local: None,
+            pro: None,
             workspace_id: None,
             tenant_id: None,
             member_id: None,
@@ -125,6 +152,7 @@ pub async fn run(args: SessionInfoArgs) -> KvendraResult<()> {
     };
 
     view.local = local_view.clone();
+    view.pro = pro_view.clone();
 
     if args.json {
         // JSON output is machine-readable and always carries the full
@@ -151,6 +179,7 @@ pub async fn run(args: SessionInfoArgs) -> KvendraResult<()> {
             }
         };
         full.local = local_view;
+        full.pro = pro_view;
         println!("{}", serde_json::to_string_pretty(&full)?);
     } else {
         print_human(&view, args.verbose);
@@ -185,6 +214,35 @@ fn print_local_section(local: Option<&LocalSessionView>) {
     }
 }
 
+/// Read the Pro tier token from `~/.kvendra/sessions/pro.token` (if any)
+/// and best-effort decode the JWT for UX rendering. The signature is NOT
+/// verified — the broker re-validates on every call. Returns `None` when
+/// the file does not exist, unreadable, or is not a parseable 3-segment
+/// JWT (in which case we still want to surface that *something* is there;
+/// but absent a parseable payload we conservatively return `None` so the
+/// caller falls back to "local" mode and the operator re-runs
+/// `kvendra login --pro`).
+fn read_pro_view(home: &Path) -> Option<ProSessionView> {
+    let path = home.join("sessions/pro.token");
+    if !path.is_file() {
+        return None;
+    }
+    let jwt = std::fs::read_to_string(&path).ok()?;
+    let claims = crate::cli::login::decode_jwt_payload(jwt.trim()).unwrap_or_default();
+    let expires_at = claims
+        .exp
+        .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0));
+    let seconds_until_expiry = expires_at.map(|e| (e - Utc::now()).num_seconds());
+    Some(ProSessionView {
+        active: true,
+        email: claims.email,
+        issuer: claims.iss,
+        expires_at,
+        seconds_until_expiry,
+        blob_path: path,
+    })
+}
+
 /// Read the local-session status into a serialisable view. Returns `None`
 /// when there is no active session — keeps `kvendra session status` quiet
 /// for fresh installs.
@@ -213,6 +271,7 @@ fn build_workspace_view(state: SessionState, verbose: bool) -> SessionView {
     SessionView {
         mode: "workspace".into(),
         local: None,
+        pro: None,
         workspace_id: Some(state.workspace_id),
         tenant_id: Some(state.tenant_id),
         member_id: Some(state.member_id),
@@ -241,8 +300,31 @@ fn build_workspace_view(state: SessionState, verbose: bool) -> SessionView {
     }
 }
 
+fn print_pro_section(pro: Option<&ProSessionView>) {
+    if let Some(p) = pro {
+        println!("Pro session: active");
+        if let Some(e) = &p.email {
+            println!("  Email:   {e}");
+        }
+        if let Some(t) = p.expires_at {
+            let mins = p.seconds_until_expiry.unwrap_or(0).max(0) / 60;
+            println!(
+                "  Expires: {} (in {} minutes)",
+                t.format("%Y-%m-%d %H:%M:%S UTC"),
+                mins
+            );
+        }
+        if let Some(i) = &p.issuer {
+            println!("  Issuer:  {i}");
+        }
+        println!("  Token:   {}", p.blob_path.display());
+        println!();
+    }
+}
+
 fn print_human(view: &SessionView, verbose: bool) {
     print_local_section(view.local.as_ref());
+    print_pro_section(view.pro.as_ref());
     if view.mode == "local" {
         println!("Mode: local (Free tier)");
         if verbose {
@@ -255,7 +337,22 @@ fn print_human(view: &SessionView, verbose: bool) {
         }
         return;
     }
+    if view.mode == "pro" {
+        println!("Mode: pro (cloud backup)");
+        if verbose {
+            if let Some(b) = &view.broker_url {
+                println!("Broker URL: {b}");
+            }
+            if let Some(a) = &view.auth_url {
+                println!("Auth URL: {a}");
+            }
+        }
+        return;
+    }
     println!("Mode: workspace");
+    if view.pro.is_some() {
+        println!("(Pro session also active — see section above.)");
+    }
     if let Some(w) = &view.workspace_id {
         println!("Workspace: {w}");
     }
@@ -299,5 +396,74 @@ fn print_human(view: &SessionView, verbose: bool) {
         if let Some(a) = &view.auth_url {
             println!("Auth URL: {a}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
+    use tempfile::tempdir;
+
+    fn make_jwt(payload: serde_json::Value) -> String {
+        let header = B64URL.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let body = B64URL.encode(payload.to_string().as_bytes());
+        let sig = B64URL.encode(b"sig");
+        format!("{header}.{body}.{sig}")
+    }
+
+    /// Regression for BUG-A (ISSUE-KVD-CLI-170F9D): `read_pro_view` must
+    /// return a populated view when `~/.kvendra/sessions/pro.token` is
+    /// present and the JWT carries email/iss/exp claims.
+    #[test]
+    fn read_pro_view_returns_some_when_pro_token_exists() {
+        let home = tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // exp ~24h in the future so seconds_until_expiry is positive.
+        let exp = (Utc::now() + chrono::Duration::hours(24)).timestamp();
+        let jwt = make_jwt(serde_json::json!({
+            "email": "pro@kvendra.cloud",
+            "iss":   "https://auth.kvendra.cloud",
+            "exp":   exp,
+        }));
+        std::fs::write(sessions.join("pro.token"), jwt.as_bytes()).unwrap();
+
+        let view = read_pro_view(home.path()).expect("must find pro.token");
+        assert!(view.active);
+        assert_eq!(view.email.as_deref(), Some("pro@kvendra.cloud"));
+        assert_eq!(view.issuer.as_deref(), Some("https://auth.kvendra.cloud"));
+        assert!(view.expires_at.is_some(), "exp must decode");
+        let secs = view.seconds_until_expiry.unwrap();
+        assert!(
+            (23 * 3600..=25 * 3600).contains(&secs),
+            "expected ~24h, got {secs}"
+        );
+        assert!(view.blob_path.ends_with("sessions/pro.token"));
+    }
+
+    /// Negative: no pro.token → `None`. Keeps the "Free tier" rendering
+    /// for fresh installs (BUG-A coexistence with the Free tier UX).
+    #[test]
+    fn read_pro_view_returns_none_when_no_pro_token() {
+        let home = tempdir().unwrap();
+        assert!(read_pro_view(home.path()).is_none());
+    }
+
+    /// Defensive: pro.token with garbled JWT still returns `Some` with
+    /// `active:true` and empty claims, because the file's existence is
+    /// the source of truth for "Pro session present" — claims are
+    /// best-effort UX only.
+    #[test]
+    fn read_pro_view_returns_some_with_empty_claims_when_jwt_unparseable() {
+        let home = tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("pro.token"), b"not-a-jwt").unwrap();
+        let view = read_pro_view(home.path()).expect("file exists → Some");
+        assert!(view.active);
+        assert!(view.email.is_none());
+        assert!(view.issuer.is_none());
+        assert!(view.expires_at.is_none());
     }
 }

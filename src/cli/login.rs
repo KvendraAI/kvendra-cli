@@ -128,6 +128,26 @@ async fn pro_login() -> KvendraResult<()> {
         "Pro session JWT persisted at {} (mode 0600).",
         path.display()
     );
+
+    // Structured log for UX-quality observability (ISSUE-KVD-CLI-9AE300).
+    // Claims are untrusted at this point — the IdP signed them and the broker
+    // re-validates on every API call; we use them only to surface flag, email,
+    // issuer and expires_at to operators tailing the trace.
+    let claims = decode_jwt_payload(&token_set.access_token).unwrap_or_default();
+    let expires_at = claims
+        .exp
+        .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts, 0))
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_else(|| "unknown".into());
+    tracing::info!(
+        target: "kvendra::login",
+        flag = "pro_login_succeeded",
+        email = claims.email.as_deref().unwrap_or("unknown"),
+        issuer = claims.iss.as_deref().unwrap_or("unknown"),
+        expires_at = %expires_at,
+        "Pro tier login completed"
+    );
+
     eprintln!(
         "Note: refresh background is not active for --pro in M2.5; re-run\n\
          `kvendra login --pro` if `kvendra backup` returns 401."
@@ -160,13 +180,17 @@ async fn initial_allowlist_sync(home: &Path, workspace_id: &str, jwt: &str) {
 /// Minimal JWT claims subset we read at login time. Untrusted — used only
 /// for UX display.
 #[derive(Debug, Default, Deserialize)]
-struct JwtClaims {
+pub(crate) struct JwtClaims {
     #[serde(default)]
     pub email: Option<String>,
     #[serde(default)]
     pub sub: Option<String>,
     #[serde(default)]
     pub iss: Option<String>,
+    /// Standard `exp` (Unix epoch seconds). Used by `session info` to render
+    /// "expires in N minutes" for the Pro tier section.
+    #[serde(default)]
+    pub exp: Option<i64>,
     /// Custom claim namespaced under `kvendra:tenant_id`. Present when the
     /// IdP emits the canonical workspace claims (see GLO-013/014).
     #[serde(default, rename = "kvendra:tenant_id")]
@@ -174,7 +198,7 @@ struct JwtClaims {
 }
 
 impl JwtClaims {
-    fn tenant_id_hint(&self) -> Option<String> {
+    pub(crate) fn tenant_id_hint(&self) -> Option<String> {
         self.kvendra_tenant_id.clone()
     }
 }
@@ -183,7 +207,7 @@ impl JwtClaims {
 /// Returns `None` on any parse error. We intentionally do NOT verify the
 /// signature here — the IdP did that already, and the broker re-validates
 /// on every API call. We just want the email + sub for UX.
-fn decode_jwt_payload(jwt: &str) -> Option<JwtClaims> {
+pub(crate) fn decode_jwt_payload(jwt: &str) -> Option<JwtClaims> {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
     let mut parts = jwt.split('.');
     let _header = parts.next()?;
@@ -218,6 +242,32 @@ mod tests {
             Some("550e8400-e29b-41d4-a716-446655440000")
         );
         assert_eq!(claims.iss.as_deref(), Some("https://auth.kvendra.cloud"));
+    }
+
+    /// Regression for BUG-A (ISSUE-KVD-CLI-170F9D) — `exp` is now decoded so
+    /// that `session info` and the `pro_login` tracing emit can surface the
+    /// JWT expiry to operators. Format: RFC3339 from Unix epoch seconds.
+    #[test]
+    fn decodes_exp_claim_and_formats_rfc3339() {
+        // Use a known epoch: 2024-01-15T00:00:00Z = 1705276800.
+        let exp_ts: i64 = 1_705_276_800;
+        let jwt = make_jwt(serde_json::json!({
+            "email": "pro@kvendra.cloud",
+            "iss":   "https://auth.kvendra.cloud",
+            "exp":   exp_ts,
+        }));
+        let claims = decode_jwt_payload(&jwt).unwrap();
+        assert_eq!(claims.exp, Some(exp_ts));
+        let formatted = claims
+            .exp
+            .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts, 0))
+            .map(|d| d.to_rfc3339())
+            .unwrap();
+        // RFC3339 from chrono ends in `+00:00` for UTC.
+        assert_eq!(
+            formatted, "2024-01-15T00:00:00+00:00",
+            "unexpected rfc3339: {formatted}"
+        );
     }
 
     #[test]

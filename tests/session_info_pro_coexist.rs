@@ -67,6 +67,10 @@ fn write_workspace_token(home: &std::path::Path, workspace_id: &str) {
 
 #[test]
 fn session_info_works_with_pro_token_present() {
+    // BUG-A (ISSUE-KVD-CLI-170F9D): before the fix, this case reported
+    // `mode == "local"` (Free tier) which was misleading. After the fix,
+    // when only `pro.token` exists, `mode == "pro"` and a `pro` block is
+    // emitted carrying the decoded email/issuer for UX.
     let home = tempdir().unwrap();
     write_pro_token(home.path());
 
@@ -82,8 +86,59 @@ fn session_info_works_with_pro_token_present() {
         .expect("session info --json must emit valid JSON when only pro.token exists");
     assert_eq!(
         json.get("mode").and_then(|v| v.as_str()),
-        Some("local"),
-        "with only pro.token present, mode must be 'local' (pro.token is NOT a workspace), got: {stdout}"
+        Some("pro"),
+        "with only pro.token present, mode must be 'pro' (BUG-A fix), got: {stdout}"
+    );
+    let pro = json.get("pro").expect("pro section must be present");
+    assert_eq!(
+        pro.get("active").and_then(|v| v.as_bool()),
+        Some(true),
+        "pro.active must be true, got: {stdout}"
+    );
+    assert_eq!(
+        pro.get("email").and_then(|v| v.as_str()),
+        Some("pro-user@kvendra.cloud"),
+        "pro.email must be decoded from JWT, got: {stdout}"
+    );
+    assert_eq!(
+        pro.get("issuer").and_then(|v| v.as_str()),
+        Some("https://auth.kvendra.cloud"),
+        "pro.issuer must be decoded from JWT, got: {stdout}"
+    );
+}
+
+#[test]
+fn session_info_pro_coexists_with_workspace_session() {
+    // BUG-A coexistence: when both pro.token AND a workspace session are
+    // present, mode stays "workspace" (workspace prevails) but the `pro`
+    // block is still emitted so the operator sees both at once.
+    let home = tempdir().unwrap();
+    write_pro_token(home.path());
+    let ws = "acme/frontend";
+    write_workspace_token(home.path(), ws);
+
+    let assert = Command::cargo_bin("kvendra")
+        .unwrap()
+        .env("KVENDRA_HOME", home.path())
+        .args(["session", "info", "--json"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("session info --json must emit valid JSON when pro+workspace tokens coexist");
+    assert_eq!(
+        json.get("mode").and_then(|v| v.as_str()),
+        Some("workspace"),
+        "workspace prevails, got: {stdout}"
+    );
+    let pro = json
+        .get("pro")
+        .expect("pro section must be present alongside workspace");
+    assert_eq!(
+        pro.get("email").and_then(|v| v.as_str()),
+        Some("pro-user@kvendra.cloud"),
+        "pro section must still carry decoded JWT claims, got: {stdout}"
     );
 }
 
