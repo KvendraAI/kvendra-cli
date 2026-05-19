@@ -7,6 +7,20 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.4.0-alpha.2] — 2026-05-19 — MCP tolerant boot + audit writer lazy-spawn
+
+Polish/extension release on top of `0.4.0-alpha.1`. Closes the cold-start
+friction left by `REQ-KVD-CLI-011`: the MCP server now arranca tolerant
+when no session blob is available at boot, and self-heals transparently
+when `kvendra unlock` is executed afterwards — eliminating the need for
+Claude Code restart in the arranque-sin-credenciales case. Also fixes a
+forensics gap detected during validation (audit writer was never spawned
+post-self-heal from `LockedPendingUnlock`).
+
+Implements `REQ-KVD-CLI-42CB74`, closes `ISSUE-KVD-CLI-E6591F` and
+`ISSUE-KVD-CLI-9764AC`. Supersedes partial `PAT-KVD-009` (canonical fix
+"restart Claude Code") for the arranque-sin-credenciales case.
+
 ### Added
 - **Tolerant MCP boot**: `kvendra mcp serve` now starts in `LockedPendingUnlock` state when no session blob, env var, or keychain credential is available — instead of exiting with error. `whoami`, `help`, and `config_get` remain functional in this state; vault-dependent tools return JSON-RPC error `-32002` with `help.topic: vault-locked-pending-unlock`. The MCP server auto-recovers transparently on the next vault-dependent tool call once `kvendra unlock` is executed in another terminal — no Claude Code restart needed. Supersedes partial PAT-KVD-009 (canonical fix "restart Claude Code") for the arranque-sin-credenciales case. Implements REQ-KVD-CLI-42CB74.
 

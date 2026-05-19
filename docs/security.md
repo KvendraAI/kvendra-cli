@@ -28,7 +28,7 @@ The trust narrative for v0.1.0:
    with sub-key `kvendra/audit-hmac/v1`. Tampering detected via
    `kvendra audit --verify`.
 
-## Session blob threat model (v0.4.0-alpha.1)
+## Session blob threat model (v0.4.0-alpha.2)
 
 `~/.kvendra/sessions/active.blob` is the new asset that lets
 `kvendra mcp serve` start without re-prompting. It is **not** the
