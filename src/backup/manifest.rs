@@ -50,7 +50,7 @@ fn current_iso8601() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupVersionMeta {
     pub backup_id: String,
-    pub version: String,
+    pub version: u64,
     pub etag: String,
     pub created_at: String,
     pub size_bytes: u64,

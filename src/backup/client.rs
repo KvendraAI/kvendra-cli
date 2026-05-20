@@ -40,8 +40,16 @@ impl BackupClient {
         &self,
         manifest: &BackupManifest,
         blob: Vec<u8>,
+        force: bool,
     ) -> KvendraResult<BackupVersionMeta> {
-        let manifest_json = serde_json::to_string(manifest)
+        let mut manifest_value = serde_json::to_value(manifest)
+            .map_err(|e| KvendraError::Serialization(format!("manifest: {e}")))?;
+        if force {
+            if let Some(obj) = manifest_value.as_object_mut() {
+                obj.insert("parent_version_etag".into(), serde_json::Value::Null);
+            }
+        }
+        let manifest_json = serde_json::to_string(&manifest_value)
             .map_err(|e| KvendraError::Serialization(format!("manifest: {e}")))?;
         let form = reqwest::multipart::Form::new()
             .text("manifest", manifest_json)
@@ -153,9 +161,11 @@ impl BackupClient {
             ));
         }
         if status == 401 || status == 403 {
-            return Err(KvendraError::Vault(
-                "NotProAuthenticated: run `kvendra login --pro`".into(),
-            ));
+            let body = resp.text().await.unwrap_or_default();
+            return Err(KvendraError::Vault(format!(
+                "Backend rejected request (status={status}): {body}\n\
+                 Hint: if the JWT expired, run `kvendra login --pro` and retry."
+            )));
         }
         if !(200..300).contains(&status) {
             let body = resp.text().await.unwrap_or_default();

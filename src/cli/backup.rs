@@ -169,7 +169,7 @@ async fn run_push(args: PushArgs) -> KvendraResult<()> {
     let manifest = BackupManifest::new(checksum, parent_etag, size, args.label.clone());
 
     let client = BackupClient::new(jwt);
-    let result = client.push(&manifest, ciphertext.clone()).await;
+    let result = client.push(&manifest, ciphertext.clone(), args.force).await;
     ciphertext.zeroize();
 
     let meta = result?;
