@@ -6,6 +6,8 @@ El **enforcer** (`allowlist::enforcer`) es el componente que ejecuta la validaci
 
 Este capítulo documenta el modelo en capas (TIER 0-4), las decisiones D1-D8 plasmadas inline en el código, la separación entre `validator` (setup-time) y `enforcer` (runtime), y cómo se cierra el shape MCP envelope.
 
+Desde `0.4.0-alpha.5` el helper `glob_match` (Tier 1) acepta `*` como wildcard single-segment (`[^/]*`) en cualquier posición del pattern, no sólo como sufijo `/*`. Ver [Glob semantics](./07-allowlist-dsl.md#glob-semantics) en el capítulo 7 para la sintaxis y ejemplos canónicos. Aplica a `refs`, `buckets`, `distributions`, `functions`, `packages`, `projects`, `org` y `repos`/`repo`.
+
 ## Vista en capas
 
 ```mermaid

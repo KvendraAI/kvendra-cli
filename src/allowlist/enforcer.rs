@@ -429,13 +429,34 @@ fn check_args(
 // Helpers.
 // ---------------------------------------------------------------------------
 
-/// Minimalist `*` glob: `prefix/*` matches anything with `prefix/`.
+/// Single-segment glob matcher: `*` matches any run of characters that
+/// does NOT cross `/`, in any position of the pattern. Other characters
+/// are matched literally (regex metacharacters are escaped). The match
+/// is anchored full-string (`^...$`). Aligns with the semantics
+/// documented in TEST-KVD-CLI-097 flow B2b.
+///
+/// Examples:
+/// - `refs/tags/v*`     matches `refs/tags/v0.4.0-alpha.3`
+/// - `refs/heads/r/*`   matches `refs/heads/r/v1`  but NOT `refs/heads/r/v1/sub`
+/// - `kvendra-*-prod`   matches `kvendra-com-prod`
+/// - `release.v*`       matches `release.v1`       but NOT `releaseXv1`
+/// - `KvendraAI/*`      matches `KvendraAI/foo`    but NOT `OrgX/KvendraAI/foo`
 fn glob_match(pattern: &str, candidate: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        candidate.starts_with(prefix) && candidate.len() > prefix.len()
-    } else {
-        pattern == candidate
+    let mut re = String::with_capacity(pattern.len() * 2 + 2);
+    re.push('^');
+    for ch in pattern.chars() {
+        match ch {
+            '*' => re.push_str("[^/]*"),
+            '.' | '+' | '?' | '(' | ')' | '|' | '['
+            | ']' | '{' | '}' | '^' | '$' | '\\' => {
+                re.push('\\');
+                re.push(ch);
+            }
+            _ => re.push(ch),
+        }
     }
+    re.push('$');
+    Regex::new(&re).is_ok_and(|r| r.is_match(candidate))
 }
 
 /// Substring regex match (`Regex::is_match` semantics — anchor with `^`/`$`
@@ -1760,5 +1781,173 @@ allowlist:
         );
         let bad = env_args(serde_json::json!({ "argv": ["build"] }));
         assert!(check(&s, "kvendra.shell", "run", &bad).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // BLOQUE — glob_match single-segment wildcard (REQ-KVD-CLI-E0C962).
+    // Cubre AC-GLOB-1..AC-GLOB-7. Ejercita `glob_match` indirectamente
+    // a través de `check()` (helper privado, no expuesto pub(super)).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn glob_star_matches_versioned_tag() {
+        // AC-GLOB-1: `refs/tags/v*` matchea `refs/tags/v0.4.0-alpha.3`.
+        // Reproduce el caso del ISSUE-KVD-CLI-280B87.
+        let s = spec_with(
+            r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.git
+      operations:
+        - push:
+            repos: ["github.com/Foo/*"]
+            refs: ["refs/tags/v*"]
+            accept_destructive: true
+"#,
+        );
+        let args = env_args(serde_json::json!({
+            "repo": "github.com/Foo/bar",
+            "ref": "refs/tags/v0.4.0-alpha.3"
+        }));
+        assert!(check(&s, "kvendra.git", "push", &args).is_ok());
+    }
+
+    #[test]
+    fn glob_star_release_branch_no_cross_slash() {
+        // AC-GLOB-2 positivo: `refs/heads/release/*` matchea `refs/heads/release/v1`.
+        let s = spec_with(
+            r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.git
+      operations:
+        - push:
+            repos: ["github.com/Foo/*"]
+            refs: ["refs/heads/release/*"]
+            accept_destructive: true
+"#,
+        );
+        let args = env_args(serde_json::json!({
+            "repo": "github.com/Foo/bar",
+            "ref": "refs/heads/release/v1"
+        }));
+        assert!(check(&s, "kvendra.git", "push", &args).is_ok());
+    }
+
+    #[test]
+    fn glob_star_rejects_cross_slash() {
+        // AC-GLOB-2 negativo (D8 boundary): `refs/heads/release/*` NO matchea
+        // `refs/heads/release/v1/sub`. El matcher previo PERMITÍA este caso
+        // (bug latente alineado con TEST-KVD-CLI-097 B2b).
+        let s = spec_with(
+            r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.git
+      operations:
+        - push:
+            repos: ["github.com/Foo/*"]
+            refs: ["refs/heads/release/*"]
+            accept_destructive: true
+"#,
+        );
+        let args = env_args(serde_json::json!({
+            "repo": "github.com/Foo/bar",
+            "ref": "refs/heads/release/v1/sub"
+        }));
+        let err = check(&s, "kvendra.git", "push", &args).unwrap_err();
+        assert!(matches!(err, KvendraError::AllowlistViolation(_)));
+    }
+
+    #[test]
+    fn glob_star_at_middle_bucket() {
+        // AC-GLOB-3: `*` puede aparecer en mitad del pattern.
+        // `kvendra-*-prod` matchea `kvendra-com-prod`.
+        let s = aws_s3_sync_with_buckets(&["kvendra-*-prod"]);
+        let args =
+            env_args(serde_json::json!({ "src": "./build", "dst": "s3://kvendra-com-prod/foo" }));
+        assert!(check(&s, "kvendra.aws", "s3_sync", &args).is_ok());
+    }
+
+    #[test]
+    fn glob_special_chars_treated_as_literal() {
+        // AC-GLOB-4: `.` en el pattern se trata literalmente, NO como
+        // regex any-char. `release.v*` matchea `release.v1` pero NO `releaseXv1`.
+        let s = aws_s3_sync_with_buckets(&["release.v*"]);
+        let ok_args = env_args(
+            serde_json::json!({ "src": "./build", "dst": "s3://release.v1/foo" }),
+        );
+        assert!(check(&s, "kvendra.aws", "s3_sync", &ok_args).is_ok());
+        let bad_args = env_args(
+            serde_json::json!({ "src": "./build", "dst": "s3://releaseXv1/foo" }),
+        );
+        let err = check(&s, "kvendra.aws", "s3_sync", &bad_args).unwrap_err();
+        assert!(matches!(err, KvendraError::AllowlistViolation(_)));
+    }
+
+    #[test]
+    fn glob_full_match_anchored_repos() {
+        // AC-GLOB-5: el match está anclado full-string (^...$). El pattern
+        // `github.com/KvendraAI/*` no debe matchear un repo arbitrario donde
+        // `KvendraAI` aparece en medio (post `extract_repo_canonical`).
+        let s = spec_with(
+            r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.git
+      operations:
+        - push:
+            repos: ["github.com/KvendraAI/*"]
+            accept_destructive: true
+"#,
+        );
+        let args = env_args(serde_json::json!({
+            "repo": "github.com/OrgX/KvendraAI-evil",
+            "ref": "refs/heads/main"
+        }));
+        let err = check(&s, "kvendra.git", "push", &args).unwrap_err();
+        assert!(matches!(err, KvendraError::AllowlistViolation(_)));
+    }
+
+    #[test]
+    fn glob_no_permissive_on_absence_via_unmatched_pattern() {
+        // AC-GLOB-7: cuando `refs` está declarado con un pattern que NO
+        // matchea el ref del call, el enforcer rechaza. Confirma que el
+        // matcher no introduce permissive-on-absence (PAT-KVD-CLI-003)
+        // — la lógica `if let Some(allowed) && !any(match)` sigue
+        // retornando Err si no hay match.
+        let s = spec_with(
+            r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.git
+      operations:
+        - push:
+            repos: ["github.com/Foo/*"]
+            refs: ["never-matches-this-literal-xyz"]
+            accept_destructive: true
+"#,
+        );
+        let args = env_args(serde_json::json!({
+            "repo": "github.com/Foo/bar",
+            "ref": "refs/heads/main"
+        }));
+        let err = check(&s, "kvendra.git", "push", &args).unwrap_err();
+        assert!(matches!(err, KvendraError::AllowlistViolation(_)));
     }
 }

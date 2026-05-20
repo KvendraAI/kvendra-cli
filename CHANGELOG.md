@@ -7,6 +7,35 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.4.0-alpha.5] — 2026-05-20 — Allowlist YAML wildcard `*` general
+
+Polish release on top of `0.4.0-alpha.4`. Cierra `ISSUE-KVD-CLI-280B87`
+(allowlist `refs` matcher exact-literal — workaround per-tag eliminado)
+y materializa la spec `TEST-KVD-CLI-097` D8 (glob single-segment).
+
+### Changed
+- **`glob_match` ahora soporta `*` en cualquier posición del pattern, no sólo
+  como sufijo `/*`** (`REQ-KVD-CLI-E0C962`). El carácter `*` se comporta
+  como `[^/]*` (single-segment, no cruza `/`); caracteres regex
+  (`.`, `+`, `?`, ...) se tratan literalmente; el match queda anclado
+  full-string (`^...$`). Aplica a campos `refs`, `buckets`,
+  `distributions`, `functions`, `packages`, `projects`, `org`, `repos`/`repo`
+  del allowlist DSL. Sin dependencias nuevas (usa `regex` ya presente).
+
+### Fixed
+- `refs: ["refs/tags/v*"]` ya permite push de `refs/tags/v0.4.0-alpha.3`
+  (`ISSUE-KVD-CLI-280B87`). Workaround per-tag literal en el allowlist
+  del profile `github.kvendraai.cli-write` puede eliminarse re-firmando
+  con `kvendra secret set-allowlist`.
+
+### Breaking — internal semantic change
+- El matcher previo de `prefix/*` cruzaba `/` silenciosamente
+  (`release/*` matcheaba `release/v1/sub`). El nuevo matcher rechaza
+  ese caso, alineando con `TEST-KVD-CLI-097` B2b. Owners que dependan
+  del comportamiento previo deben re-firmar allowlists con entries
+  split-explícitas. Sin usuarios reales hoy fuera del owner; no se
+  considera ruptura externa.
+
 ## [0.4.0-alpha.4] — 2026-05-19 — Pro session email from id_token (OIDC compliance)
 
 Polish release on top of `0.4.0-alpha.3`. Cierra `ISSUE-KVD-CLI-940018` (reclasificado del original `ISSUE-KVD-ENTERPRISE-CC3B95`): el campo `pro.email` aparecía como `None` en `kvendra session info --json` porque el flow `login --pro` solo persistía el access_token, y Cognito sigue OIDC estrictamente — el claim `email` va en el id_token, no en el access_token.

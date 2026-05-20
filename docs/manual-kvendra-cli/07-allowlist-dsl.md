@@ -49,6 +49,33 @@ Estas combinaciones se **rechazan en setup** sin `--accept-broad-scope`:
 
 El header `Authorization` está **siempre** forbidden al caller — el broker lo construye server-side desde el `auth_scheme` del profile (ver `IF-KVD-CLI-006`).
 
+## Glob semantics
+
+Los campos `refs`, `buckets`, `distributions`, `functions`, `packages`,
+`projects`, `org` y `repos`/`repo` aceptan patterns con el wildcard `*`:
+
+- `*` matchea cualquier secuencia de caracteres que **no contenga `/`**
+  (single-segment). Es la semántica de bash glob estándar.
+- El match es **anclado full-string**: el pattern debe cubrir el
+  candidato completo, no sólo un prefijo.
+- Caracteres con significado en regex (`.`, `+`, `?`, `(`, `)`, `|`,
+  `[`, `]`, `{`, `}`, `^`, `$`, `\`) se tratan **literalmente**.
+- Para cubrir múltiples segmentos (cruce de `/`) hay que listar
+  patterns explícitos o entries por nivel.
+
+Ejemplos:
+
+| Pattern | Matchea | NO matchea |
+|---|---|---|
+| `refs/tags/v*` | `refs/tags/v0.4.0-alpha.3`, `refs/tags/v1` | `refs/tags/v0/sub` |
+| `refs/heads/release/*` | `refs/heads/release/v1` | `refs/heads/release/v1/sub` |
+| `kvendra-*-prod` | `kvendra-com-prod`, `kvendra-x-prod` | `kvendra-com-staging` |
+| `KvendraAI/*` | `KvendraAI/kvendra-cli` | `KvendraAI/foo/extra`, `OrgX/KvendraAI/foo` |
+
+> ℹ️ Los campos `tag_pattern` y `url_pattern_regex` usan **regex completa**
+> (no glob). El campo `args_constraints` token-level acepta `*` per-slot
+> (consulta el capítulo 15).
+
 ## Ejemplos por servicio
 
 ### `kvendra.git` (operaciones git locales)
