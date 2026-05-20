@@ -207,11 +207,11 @@ impl Vault {
     /// Cheaper than reaching into the full [`crate::vault::session::VaultState`]
     /// when callers only need to branch on the variant.
     ///
-    /// - `Unlocked`            — in-RAM session present and not expired.
-    /// - `LockedPendingUnlock` — process booted without credentials and
-    ///                           no unlock has happened yet.
-    /// - `Locked`              — neither of the above (session expired,
-    ///                           explicitly locked, or never armed).
+    /// - `Unlocked` — in-RAM session present and not expired.
+    /// - `LockedPendingUnlock` — process booted without credentials and no
+    ///   unlock has happened yet.
+    /// - `Locked` — neither of the above (session expired, explicitly
+    ///   locked, or never armed).
     pub fn state(&self) -> VaultStateKind {
         if self.is_unlocked() {
             return VaultStateKind::Unlocked;

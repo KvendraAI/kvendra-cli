@@ -125,6 +125,15 @@ pub fn validate_max_ttl(value: Duration) -> KvendraResult<Duration> {
     Ok(value)
 }
 
+// Compile-time invariants for the TTL constants above. Replaces the
+// previous runtime `defaults_are_in_canonical_range` test (lifted out
+// of `mod tests` to avoid `clippy::assertions_on_constants`).
+const _: () = {
+    assert!(DEFAULT_TTL_SECONDS >= MIN_TTL_SECONDS);
+    assert!(DEFAULT_TTL_SECONDS <= DEFAULT_MAX_TTL_SECONDS);
+    assert!(DEFAULT_MAX_TTL_SECONDS <= MAX_CONFIGURABLE_TTL_SECONDS);
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,12 +200,5 @@ mod tests {
         assert!(validate_max_ttl(Duration::from_secs(MIN_TTL_SECONDS - 1)).is_err());
         assert!(validate_max_ttl(Duration::from_secs(MAX_CONFIGURABLE_TTL_SECONDS)).is_ok());
         assert!(validate_max_ttl(Duration::from_secs(MAX_CONFIGURABLE_TTL_SECONDS + 1)).is_err());
-    }
-
-    #[test]
-    fn defaults_are_in_canonical_range() {
-        assert!(DEFAULT_TTL_SECONDS >= MIN_TTL_SECONDS);
-        assert!(DEFAULT_TTL_SECONDS <= DEFAULT_MAX_TTL_SECONDS);
-        assert!(DEFAULT_MAX_TTL_SECONDS <= MAX_CONFIGURABLE_TTL_SECONDS);
     }
 }

@@ -189,6 +189,54 @@ async fn resolve_password(args: &ServeArgs) -> KvendraResult<String> {
     }
 }
 
+fn read_keychain_password() -> KvendraResult<String> {
+    match keychain_acl::read_with_user_presence(MCP_PASSWORD_LABEL) {
+        Ok(p) => {
+            tracing::info!(
+                target: "kvendra::mcp",
+                flag = "mcp_password_keychain_acl_unlock",
+                "MCP password retrieved from keychain via presence ACL"
+            );
+            Ok(p)
+        }
+        Err(BiometricError::Rejected) => {
+            tracing::warn!(
+                target: "kvendra::mcp",
+                flag = "mcp_password_keychain_acl_rejected",
+                "User rejected biometric/presence prompt"
+            );
+            Err(KvendraError::BiometricRejected)
+        }
+        Err(BiometricError::NotFound(label)) => {
+            tracing::error!(
+                target: "kvendra::mcp",
+                flag = "mcp_password_keychain_item_missing",
+                %label,
+                "No keychain entry — run `kvendra config mcp-password enable` first"
+            );
+            Err(KvendraError::Vault(format!(
+                "keychain item '{label}' not found — run `kvendra config mcp-password enable`"
+            )))
+        }
+        Err(BiometricError::Unavailable(msg)) => {
+            tracing::error!(
+                target: "kvendra::mcp",
+                flag = "mcp_password_keychain_unavailable",
+                "{msg}"
+            );
+            Err(KvendraError::BiometricUnavailable(msg))
+        }
+        Err(BiometricError::Backend(msg)) => {
+            tracing::error!(
+                target: "kvendra::mcp",
+                flag = "mcp_password_keychain_unavailable",
+                "{msg}"
+            );
+            Err(KvendraError::Keychain(msg))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,52 +366,4 @@ mod tests {
     // builds. Validator FASE 5 (winking-owl-skills:validator) MUST exercise
     // path #3 manually on a Mac box, asserting the vault transitions to
     // Unlocked (no pending) when biometric/presence ACL succeeds.
-}
-
-fn read_keychain_password() -> KvendraResult<String> {
-    match keychain_acl::read_with_user_presence(MCP_PASSWORD_LABEL) {
-        Ok(p) => {
-            tracing::info!(
-                target: "kvendra::mcp",
-                flag = "mcp_password_keychain_acl_unlock",
-                "MCP password retrieved from keychain via presence ACL"
-            );
-            Ok(p)
-        }
-        Err(BiometricError::Rejected) => {
-            tracing::warn!(
-                target: "kvendra::mcp",
-                flag = "mcp_password_keychain_acl_rejected",
-                "User rejected biometric/presence prompt"
-            );
-            Err(KvendraError::BiometricRejected)
-        }
-        Err(BiometricError::NotFound(label)) => {
-            tracing::error!(
-                target: "kvendra::mcp",
-                flag = "mcp_password_keychain_item_missing",
-                %label,
-                "No keychain entry — run `kvendra config mcp-password enable` first"
-            );
-            Err(KvendraError::Vault(format!(
-                "keychain item '{label}' not found — run `kvendra config mcp-password enable`"
-            )))
-        }
-        Err(BiometricError::Unavailable(msg)) => {
-            tracing::error!(
-                target: "kvendra::mcp",
-                flag = "mcp_password_keychain_unavailable",
-                "{msg}"
-            );
-            Err(KvendraError::BiometricUnavailable(msg))
-        }
-        Err(BiometricError::Backend(msg)) => {
-            tracing::error!(
-                target: "kvendra::mcp",
-                flag = "mcp_password_keychain_unavailable",
-                "{msg}"
-            );
-            Err(KvendraError::Keychain(msg))
-        }
-    }
 }

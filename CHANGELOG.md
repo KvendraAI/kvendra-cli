@@ -7,6 +7,33 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.4.0-alpha.6] — 2026-05-20 — Clippy hygiene post Rust 1.95.0
+
+Code-hygiene release: limpia 6 lints clippy pre-existentes que el upgrade
+del Rust toolchain a 1.95.0 stable endureció a errores fail-on-warn.
+Cierra `ISSUE-KVD-CLI-062364`. **Sin cambios funcionales** — sólo
+refactor de docstrings, conversión de runtime→compile-time assertions,
+y reordenación de items en módulos test.
+
+### Changed
+- `src/session/ttl.rs` — invariantes de TTL movidas de un `#[test] fn`
+  runtime a un `const _: () = { ... }` block compile-time
+  (`clippy::assertions_on_constants`). Más estricto + más rápido: el
+  build falla si las constantes salen del rango canónico.
+- `src/vault/mod.rs` — doc-comments con indentación corregida en 2
+  ocurrencias (`clippy::doc_overindented_list_items`).
+- `src/cli/mcp.rs` — `fn read_keychain_password` reordenado para
+  preceder al `mod tests` (`clippy::items_after_test_module`).
+
+### Verified
+- `cargo clippy --all-features --all-targets -- -D warnings` verde
+  (0 errores).
+- `cargo test --all-features --no-fail-fast` verde (394 PASS / 0 FAIL /
+  3 IGNORED). El test count bajó de 395 a 394 porque el `#[test] fn
+  defaults_are_in_canonical_range` fue eliminado: las invariantes ahora
+  se verifican en compile-time vía `const _: () = { ... }`, lo que es
+  estrictamente más fuerte (fallo en build en lugar de runtime).
+
 ## [0.4.0-alpha.5] — 2026-05-20 — Allowlist YAML wildcard `*` general
 
 Polish release on top of `0.4.0-alpha.4`. Cierra `ISSUE-KVD-CLI-280B87`
