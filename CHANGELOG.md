@@ -7,6 +7,102 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-20 — First cross-platform stable since 0.1.0
+
+**Consolidates the 0.4.0 alpha series (.1..6) into a stable release.** Works on
+macOS, Linux, and Windows. No Apple Developer ID required. Promotes
+`max_stable_version` in crates.io from `0.1.0` (2026-05-08) to `0.4.0`, so
+`cargo install kvendra` now installs this version by default.
+
+### Added (consolidated from alpha.1..6)
+
+- **Cross-platform session model** (`kvendra unlock` / `lock` /
+  `session status`) with session blob TTL — supersedes the macOS-only
+  Touch ID + Keychain ACL approach. AES-256-GCM
+  `~/.kvendra/sessions/active.blob` with HKDF sub-key wrap (per
+  `ADR-KVD-022`). Closes the `path-to-stable` chapter of
+  `ROAD-KVD-CLI-002`. (`REQ-KVD-CLI-011`, alpha.1)
+- **3-layer anti-captured-env defense**: `/dev/tty` direct + triple
+  `isatty` + parent ancestry enrichment. Validated empirically vs
+  Claude Code Bash tool, `!` shell escape, and native terminal
+  (probe `/tmp/kvendra-probe.sh`). (`PAT-KVD-CLI-008`, alpha.1)
+- **Pro tier inspector** (`kvendra pro inspect`) — surfaces JWT
+  identity + tier + email + tenant_id from the id_token. (alpha.3 +
+  alpha.4 OIDC compliance: `pro.email` from id_token claim, not
+  access_token.)
+- **Allowlist wildcard glob single-segment matcher** — `refs/tags/v*`
+  now matches any tag without literal per-tag entries. The matcher
+  treats `*` as `[^/]*` (does not cross `/`), with anchored
+  full-string match. Validated end-to-end pushing `v0.4.0-alpha.6`
+  with no per-tag literal. (`REQ-KVD-CLI-E0C962`, alpha.5)
+- **MCP tolerant boot** + **audit writer lazy-spawn** — the broker
+  survives `LockedPendingUnlock` state without crash; the audit
+  thread is spawned on the first event instead of at boot.
+  (alpha.2)
+
+### Fixed (consolidated from alpha.1..6)
+
+- Decoder crash on malformed JWT in `list_active_sessions` + 6
+  collateral callsites curated in a single pass
+  (`ISSUE-KVD-CLI-2F07ED`, alpha.3).
+- `login --pro` tracing — explicit `tracing::info!(target:
+  "kvendra::login", flag: "pro_login_succeeded", ...)` for
+  observability (`ISSUE-KVD-CLI-9AE300`, alpha.3).
+- Pro tier detection in `session info` (`ISSUE-KVD-CLI-170F9D`,
+  alpha.3).
+- Pro session `email` field populated from id_token, not
+  access_token (Cognito OIDC compliance; `ISSUE-KVD-CLI-940018`,
+  alpha.4).
+- Clippy lints post Rust 1.95.0 toolchain upgrade — 6 lints fixed
+  (`clippy::assertions_on_constants`,
+  `clippy::doc_overindented_list_items`,
+  `clippy::items_after_test_module`). Runtime invariant test
+  replaced by compile-time `const _: () = { ... }` block (stricter:
+  build fails instead of runtime). (`ISSUE-KVD-CLI-062364`, alpha.6)
+
+### Distribution
+
+- **crates.io**: kvendra `0.4.0` published. Now the
+  `max_stable_version` (was `0.1.0` since 2026-05-08).
+  `cargo install kvendra` installs this version by default.
+- **Yanked from crates.io**: `0.0.1`, `0.0.2` (pre-MVP placeholders),
+  and `0.1.0` (superseded as max_stable by `0.4.0`; still
+  installable via `cargo install kvendra --version "0.1.0"`).
+- **GitHub Releases**: `v0.4.0` with `prerelease: false`. First
+  non-prerelease tag since `v0.1.0`.
+
+### Verified
+
+- `cargo test --all-features --no-fail-fast`: 394 PASS / 0 FAIL /
+  3 IGNORED.
+- `cargo clippy --all-features --all-targets -- -D warnings`: 0
+  errors.
+- `cargo build --release`: kvendra v0.4.0 binary OK.
+- crates.io API post-publish: `max_stable_version: "0.4.0"`,
+  `newest_version: "0.4.0"`, `0.0.1`/`0.0.2`/`0.1.0` `yanked: true`.
+
+### Pending follow-up (NOT blockers)
+
+- Physical Windows smoke validation — CI matrix is green; physical
+  PoC tracked in `ROAD-KVD-CLI-002` caveat list. Owner-call accepted
+  this as non-blocker for 0.4.0 stable.
+- Apple Developer ID + Touch ID 1-tap UX → future ROAD v0.3.0+
+  nice-to-have for macOS power users.
+- Windows Authenticode + Linux GPG signing + reproducible builds →
+  `ROAD-CLI-003` (future).
+
+### Trazabilidad
+
+- ROAD parent: `ROAD-KVD-CLI-002` (done 2026-05-18 vía
+  `REL-KVD-CLI-0.4.0.1`; this release consolidates the path).
+- Consolidates: `REL-KVD-CLI-0.4.0.1` ..
+  `REL-KVD-CLI-0.4.0.6`.
+- Supersedes (as crates.io `max_stable`): `REL-KVD-CLI-0.1.0`.
+- Resolves: `ISSUE-KVD-CLI-6508C3` (CLAUDE.md drift + crates.io
+  max_stable promotion trigger).
+- Origin: consultancy-v3 session 2026-05-20 — owner prompt
+  "queremos que la versión estable apunte a la última".
+
 ## [0.4.0-alpha.6] — 2026-05-20 — Clippy hygiene post Rust 1.95.0
 
 Code-hygiene release: limpia 6 lints clippy pre-existentes que el upgrade
