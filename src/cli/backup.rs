@@ -99,6 +99,22 @@ fn load_pro_jwt() -> KvendraResult<String> {
     Ok(raw.trim().to_string())
 }
 
+/// REQ-KVD-ENTERPRISE-30F5D0 Fase 1 — read the id_token sidecar persisted
+/// since REL-0.4.0.4. Returns `None` (NOT an error) when missing so existing
+/// sessions keep working; the server accepts requests without X-Id-Token in
+/// Fase 1 and falls back to `identity_source: 'access-token-fallback'`.
+fn load_pro_id_token() -> Option<String> {
+    let home = kvendra_home().ok()?;
+    let id_path = home.join("sessions").join("pro.id_token");
+    if !id_path.exists() {
+        return None;
+    }
+    std::fs::read_to_string(&id_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn read_password(password_stdin: bool) -> KvendraResult<String> {
     if password_stdin {
         let mut buf = String::new();
@@ -168,7 +184,7 @@ async fn run_push(args: PushArgs) -> KvendraResult<()> {
     let parent_etag = read_cached_etag(&home).ok();
     let manifest = BackupManifest::new(checksum, parent_etag, size, args.label.clone());
 
-    let client = BackupClient::new(jwt);
+    let client = BackupClient::with_id_token(jwt, load_pro_id_token());
     let result = client.push(&manifest, ciphertext.clone(), args.force).await;
     ciphertext.zeroize();
 
@@ -186,7 +202,7 @@ async fn run_push(args: PushArgs) -> KvendraResult<()> {
 
 async fn run_list(args: ListArgs) -> KvendraResult<()> {
     let jwt = load_pro_jwt()?;
-    let client = BackupClient::new(jwt);
+    let client = BackupClient::with_id_token(jwt, load_pro_id_token());
     let items = client.list(args.limit).await?;
     if items.is_empty() {
         println!("(no backups yet — run `kvendra backup push`)");
@@ -216,7 +232,7 @@ async fn run_pull(args: PullArgs) -> KvendraResult<()> {
     let backup_key = derive_backup_key_from_password(&password)?;
     password.zeroize();
 
-    let client = BackupClient::new(jwt);
+    let client = BackupClient::with_id_token(jwt, load_pro_id_token());
     let backup_id = match args.id {
         Some(id) => id,
         None => {
@@ -264,7 +280,7 @@ async fn run_prune(args: PruneArgs) -> KvendraResult<()> {
         println!("Delete backup {}? Use --yes to confirm.", args.backup_id);
         return Err(KvendraError::Vault("prune aborted by user".into()));
     }
-    let client = BackupClient::new(jwt);
+    let client = BackupClient::with_id_token(jwt, load_pro_id_token());
     client.delete(&args.backup_id).await?;
     println!("Deleted backup {}", args.backup_id);
     Ok(())

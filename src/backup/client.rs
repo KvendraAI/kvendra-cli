@@ -15,16 +15,25 @@ const DEFAULT_BASE_URL: &str = "https://api.kvendra.cloud";
 pub struct BackupClient {
     base_url: String,
     jwt: String,
+    // REQ-KVD-ENTERPRISE-30F5D0 Fase 1 — identity propagation. Optional
+    // X-Id-Token sent on every request when present. The server accepts
+    // requests with or without it in Fase 1; Fase 3 will make it mandatory.
+    id_token: Option<String>,
     http: reqwest::Client,
 }
 
 impl BackupClient {
     pub fn new(jwt: String) -> Self {
+        Self::with_id_token(jwt, None)
+    }
+
+    pub fn with_id_token(jwt: String, id_token: Option<String>) -> Self {
         let base_url =
             std::env::var("KVENDRA_BACKUP_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         Self {
             base_url,
             jwt,
+            id_token,
             http: reqwest::Client::builder()
                 .user_agent(concat!(
                     "kvendra-cli/",
@@ -33,6 +42,14 @@ impl BackupClient {
                 ))
                 .build()
                 .expect("reqwest client build"),
+        }
+    }
+
+    fn with_identity(&self, b: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let b = b.bearer_auth(&self.jwt);
+        match &self.id_token {
+            Some(t) if !t.is_empty() => b.header("X-Id-Token", t.as_str()),
+            _ => b,
         }
     }
 
@@ -62,9 +79,7 @@ impl BackupClient {
             );
 
         let resp = self
-            .http
-            .post(format!("{}/v1/backups", self.base_url))
-            .bearer_auth(&self.jwt)
+            .with_identity(self.http.post(format!("{}/v1/backups", self.base_url)))
             .multipart(form)
             .send()
             .await
@@ -79,9 +94,7 @@ impl BackupClient {
             self.base_url
         );
         let resp = self
-            .http
-            .get(url)
-            .bearer_auth(&self.jwt)
+            .with_identity(self.http.get(url))
             .send()
             .await
             .map_err(|e| KvendraError::Vault(format!("backup list: {e}")))?;
@@ -103,9 +116,7 @@ impl BackupClient {
     pub async fn pull(&self, backup_id: &str) -> KvendraResult<Vec<u8>> {
         let url = format!("{}/v1/backups/{backup_id}", self.base_url);
         let resp = self
-            .http
-            .get(url)
-            .bearer_auth(&self.jwt)
+            .with_identity(self.http.get(url))
             .send()
             .await
             .map_err(|e| KvendraError::Vault(format!("backup pull: {e}")))?;
@@ -124,9 +135,7 @@ impl BackupClient {
     pub async fn delete(&self, backup_id: &str) -> KvendraResult<()> {
         let url = format!("{}/v1/backups/{backup_id}", self.base_url);
         let resp = self
-            .http
-            .delete(url)
-            .bearer_auth(&self.jwt)
+            .with_identity(self.http.delete(url))
             .send()
             .await
             .map_err(|e| KvendraError::Vault(format!("backup delete: {e}")))?;
