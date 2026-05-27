@@ -57,6 +57,14 @@ pub enum KeychainCommand {
 }
 
 pub async fn run(cmd: ConfigCommand) -> KvendraResult<()> {
+    // Dispatch `mcp-password` BEFORE touching `kvendra_home()` — its
+    // `enable` subcommand has its own platform-gating (macOS-only) and must
+    // not be blocked by `kvendra_home()` failing on CI runners without HOME
+    // set (Windows CI).
+    let cmd = match cmd {
+        ConfigCommand::McpPassword(c) => return run_mcp_password(c).await,
+        other => other,
+    };
     let home = kvendra_home()?;
     ensure_layout(&home)?;
 
@@ -103,7 +111,7 @@ pub async fn run(cmd: ConfigCommand) -> KvendraResult<()> {
             }
         }
         ConfigCommand::Approval(c) => return run_approval(c).await,
-        ConfigCommand::McpPassword(c) => return run_mcp_password(c).await,
+        ConfigCommand::McpPassword(_) => unreachable!("dispatched before kvendra_home() above"),
         ConfigCommand::RebindHome(args) => {
             return crate::cli::config_rebind::run(args).await;
         }
