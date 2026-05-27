@@ -7,7 +7,7 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
-## [0.4.1-alpha.1] — 2026-05-27 — kvendra.github primitive: create_issue + list_issues
+## [0.4.1] — 2026-05-27 — kvendra.github primitive: create_issue + list_issues + yank-recovery stable
 
 Aditivo, no breaking. Extiende el primitive `kvendra.github` con dos nuevas operations para soportar sync bidireccional KB↔GitHub Issues.
 
@@ -25,6 +25,29 @@ Aditivo, no breaking. Extiende el primitive `kvendra.github` con dos nuevas oper
 - Implementa: `REQ-KVD-CLI-1D156A` (`scope: A+B`, sub-task `C (pulls parity)` diferida).
 - Resuelve: `ISSUE-KVD-CLI-ADBC83`.
 - Origin: workflow KB↔GitHub sync demand.
+
+### Distribution
+
+- **crates.io `max_stable_version`**: `None` → `0.4.1` (yank-recovery — recovers from `0.4.0` yank executed 2026-05-27 12:24 UTC).
+- **`cargo install kvendra`** (sin `--version`) ahora resuelve a `0.4.1`. Cierra la ventana "no stable" abierta el 2026-05-27 12:24 UTC.
+- **`0.4.1-alpha.1`** se preserva publicada (NOT yanked) — installable explícito vía `cargo install kvendra --version "0.4.1-alpha.1"` por trazabilidad.
+- **`0.4.0`** permanece yanked (sin cambio) por `ISSUE-KVD-CLI-8CDFB5`.
+
+### Yank-recovery context
+
+Este release recupera la posición `max_stable_version` perdida tras el yank de `0.4.0` (commit `df6274c`, 2026-05-20) por `Cargo.toml [target.'cfg(unix)'.dependencies]` mal cerrado que atrapaba 23 deps cross-platform (ver `ISSUE-KVD-CLI-8CDFB5` + `PAT-KVD-CLI-FFE04A`). El código de `0.4.1` es funcionalmente superset de `0.4.0`: incluye el fix cross-platform + feat(github) `create_issue` + `list_issues`.
+
+CI 9/9 verde en `main` por primera vez (rustfmt, clippy, test [ubuntu/macos/windows], msrv [1.88], cloud-agnostic-lint, e2e-smoke [ubuntu/macos]).
+
+### Trazabilidad (yank-recovery)
+
+- **REQ**: `REQ-KVD-CLI-04C06A` (release-engineering / yank-recovery).
+- **TXN**: `TXN-KVD-20260527-004`.
+- **PAT canónico**: `PAT-KVD-CLI-A45DEA` (segunda aplicación — primer scenario fue `0.4.0` promotion el 2026-05-20).
+- **ISSUE incident origen**: `ISSUE-KVD-CLI-8CDFB5`.
+- **PAT lesson cfg(unix)**: `PAT-KVD-CLI-FFE04A` (cumplido en HEAD).
+- **REL anterior (pre-release)**: `REL-KVD-CLI-0.4.1.1`.
+- **REL reemplazada (yanked)**: `REL-KVD-CLI-0.4.0`.
 
 ## [0.4.0] — 2026-05-20 — First cross-platform stable since 0.1.0
 
