@@ -44,6 +44,17 @@ pub struct MigrateArgs {
 }
 
 pub async fn run(cmd: McpPasswordCommand) -> KvendraResult<()> {
+    // Reject `enable` on non-macOS before touching the filesystem — keychain
+    // ACL is macOS-only, and `kvendra_home()` would otherwise fail first on
+    // CI runners without HOME set (REQ-KVD-005 AC-USE-KEYCHAIN-4).
+    if matches!(cmd, McpPasswordCommand::Enable) && !cfg!(target_os = "macos") {
+        return Err(KvendraError::Config(
+            "config mcp-password enable is only available on macOS — \
+             use the KVENDRA_MCP_PASSWORD env var on Linux/Windows \
+             (keychain ACL not available on this platform)"
+                .into(),
+        ));
+    }
     let home = kvendra_home()?;
     crate::config::ensure_layout(&home)?;
     match cmd {
