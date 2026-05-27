@@ -1950,4 +1950,87 @@ allowlist:
         let err = check(&s, "kvendra.git", "push", &args).unwrap_err();
         assert!(matches!(err, KvendraError::AllowlistViolation(_)));
     }
+
+    #[test]
+    fn create_issue_passes_with_allowlisted_repo() {
+        let s = spec_with(r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.github
+      operations:
+        - create_issue:
+            repos: ["KvendraAI/kvendra-cli"]
+            accept_destructive: true
+"#);
+        let args = env_args(serde_json::json!({
+            "repo": "KvendraAI/kvendra-cli",
+            "title": "hello"
+        }));
+        assert!(check(&s, "kvendra.github", "create_issue", &args).is_ok());
+    }
+
+    #[test]
+    fn create_issue_blocked_when_repo_not_in_allowlist() {
+        let s = spec_with(r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.github
+      operations:
+        - create_issue:
+            repos: ["KvendraAI/kvendra-cli"]
+            accept_destructive: true
+"#);
+        let args = env_args(serde_json::json!({
+            "repo": "EvilCorp/other",
+            "title": "hello"
+        }));
+        let err = check(&s, "kvendra.github", "create_issue", &args).unwrap_err();
+        assert!(matches!(err, KvendraError::AllowlistViolation(_)));
+    }
+
+    #[test]
+    fn list_issues_passes_read_only() {
+        let s = spec_with(r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.github
+      operations:
+        - list_issues:
+            repos: ["KvendraAI/kvendra-cli"]
+"#);
+        let args = env_args(serde_json::json!({
+            "repo": "KvendraAI/kvendra-cli"
+        }));
+        assert!(check(&s, "kvendra.github", "list_issues", &args).is_ok());
+    }
+
+    #[test]
+    fn create_issue_not_declared_in_yaml_is_violation() {
+        let s = spec_with(r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.github
+      operations:
+        - read_repo:
+            repos: ["KvendraAI/kvendra-cli"]
+"#);
+        let args = env_args(serde_json::json!({
+            "repo": "KvendraAI/kvendra-cli",
+            "title": "hello"
+        }));
+        let err = check(&s, "kvendra.github", "create_issue", &args).unwrap_err();
+        assert!(matches!(err, KvendraError::AllowlistViolation(_)));
+    }
 }

@@ -54,7 +54,7 @@ fn issue_state_closed(args: &Value) -> bool {
     args.get("state").and_then(Value::as_str) == Some("closed")
 }
 
-// --- catálogo (14 entradas — owner ratificado 2026-05-07) ---
+// --- catálogo (15 entradas — owner ratificado 2026-05-07, extended 2026-05-27 with create_issue) ---
 
 pub const CATALOG: &[DestructiveRule] = &[
     DestructiveRule {
@@ -80,6 +80,12 @@ pub const CATALOG: &[DestructiveRule] = &[
         operation: "update_issue",
         kind: DestructiveKind::Annotated,
         args_predicate: Some(issue_state_closed),
+    },
+    DestructiveRule {
+        primitive: "kvendra.github",
+        operation: "create_issue",
+        kind: DestructiveKind::Destructive,
+        args_predicate: None,
     },
     DestructiveRule {
         primitive: "kvendra.npm",
@@ -210,8 +216,8 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn catalog_size_is_14() {
-        assert_eq!(CATALOG.len(), 14);
+    fn catalog_size_is_15() {
+        assert_eq!(CATALOG.len(), 15);
     }
 
     #[test]
@@ -286,6 +292,16 @@ mod tests {
             "kvendra.aws",
             "lambda_invoke",
             &json!({ "anything": "goes" })
+        ));
+    }
+
+    #[test]
+    fn create_issue_destructive_unconditional() {
+        assert!(is_destructive("kvendra.github", "create_issue", &Value::Null));
+        assert!(is_destructive(
+            "kvendra.github",
+            "create_issue",
+            &json!({ "title": "x", "body": "y" })
         ));
     }
 

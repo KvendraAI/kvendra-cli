@@ -115,9 +115,11 @@ const CATALOG: [PrimitiveInfo; 8] = [
             "read_issue",
             "update_issue",
             "add_topics",
+            "create_issue",
+            "list_issues",
         ],
         is_unsafe: false,
-        operations_doc: "Operations (`repo` accepts `owner/name` or `github.com/owner/name`):\n  read_repo:    args: { repo: \"owner/name\" }\n  read_issue:   args: { repo: \"owner/name\", number: 42 }\n  update_issue: args: { repo: \"owner/name\", number: 42, title?, body?, state?, labels?, assignees? }\n  update_repo:  args: { repo: \"owner/name\", description?, homepage?, private?, default_branch? }\n  add_topics:   args: { repo: \"owner/name\", topics: [\"a\", \"b\"] }   # APPENDS (REQ-KVD-005)\n  release:      args: { repo: \"owner/name\", tag_name, name?, body?, draft?, prerelease?, target_commitish? }\nAll operations require profile_id at the top level.",
+        operations_doc: "Operations (`repo` accepts `owner/name` or `github.com/owner/name`):\n  read_repo:    args: { repo: \"owner/name\" }\n  read_issue:   args: { repo: \"owner/name\", number: 42 }\n  update_issue: args: { repo: \"owner/name\", number: 42, title?, body?, state?, labels?, assignees? }\n  update_repo:  args: { repo: \"owner/name\", description?, homepage?, private?, default_branch? }\n  add_topics:   args: { repo: \"owner/name\", topics: [\"a\", \"b\"] }   # APPENDS (REQ-KVD-005)\n  release:      args: { repo: \"owner/name\", tag_name, name?, body?, draft?, prerelease?, target_commitish? }\n  create_issue: args: { repo: \"owner/name\", title, body?, labels?, assignees?, milestone? }   # POST (destructive — public write, body pre-sanitized)\n  list_issues:  args: { repo: \"owner/name\", state?: \"open\"|\"closed\"|\"all\", labels?, since?, max_pages?: 10 (cap 50) }\nAll operations require profile_id at the top level.",
         requires_vault: true,
     },
     PrimitiveInfo {

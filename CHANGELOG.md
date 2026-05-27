@@ -7,6 +7,25 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.4.1-alpha.1] — 2026-05-27 — kvendra.github primitive: create_issue + list_issues
+
+Aditivo, no breaking. Extiende el primitive `kvendra.github` con dos nuevas operations para soportar sync bidireccional KB↔GitHub Issues.
+
+### Added
+
+- `kvendra.github.create_issue` — `POST /repos/{owner}/{repo}/issues`. Destructive (requiere `accept_destructive: true` en allowlist YAML). El campo `body` se sanitiza ad-hoc antes del POST: tokens (`ghp_*`, `kvd_live_*`, `sk-*`), AWS keys, master password patterns y paths absolutos `/Users/<name>/` son reemplazados por `<redacted:provider>` vía `detection::sanitize_value`. Args: `{ repo, title, body?, labels?, assignees?, milestone? }`. (`REQ-KVD-CLI-1D156A`)
+- `kvendra.github.list_issues` — `GET /repos/{owner}/{repo}/issues` con filtros (`state`, `labels`, `since`) y paginación transparente. Read-only (no destructive opt-in). Default `max_pages=10`, cap `50`. Retorna wrap rico `{ issues, truncated, pages_fetched }`. (`REQ-KVD-CLI-1D156A`)
+
+### Allowlist catalog
+
+- Catalog destructive: `kvendra.github.create_issue` añadido como `Destructive` (incondicional). Total reglas: 14 → **15**.
+
+### Trazabilidad
+
+- Implementa: `REQ-KVD-CLI-1D156A` (`scope: A+B`, sub-task `C (pulls parity)` diferida).
+- Resuelve: `ISSUE-KVD-CLI-ADBC83`.
+- Origin: workflow KB↔GitHub sync demand.
+
 ## [0.4.0] — 2026-05-20 — First cross-platform stable since 0.1.0
 
 **Consolidates the 0.4.0 alpha series (.1..6) into a stable release.** Works on

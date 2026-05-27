@@ -410,4 +410,56 @@ allowlist:
         let p = ProfileSpec::from_yaml(yaml).unwrap();
         assert!(validate(&p).is_ok());
     }
+
+    #[test]
+    fn create_issue_without_accept_destructive_is_rejected() {
+        let yaml = r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.github
+      operations:
+        - create_issue:
+            repos: ["KvendraAI/kvendra-cli"]
+"#;
+        let p = ProfileSpec::from_yaml(yaml).unwrap();
+        assert!(validate(&p).is_err());
+    }
+
+    #[test]
+    fn create_issue_with_accept_destructive_passes() {
+        let yaml = r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.github
+      operations:
+        - create_issue:
+            repos: ["KvendraAI/kvendra-cli"]
+            accept_destructive: true
+"#;
+        let p = ProfileSpec::from_yaml(yaml).unwrap();
+        assert!(validate(&p).is_ok());
+    }
+
+    #[test]
+    fn list_issues_without_accept_destructive_passes() {
+        let yaml = r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.github
+      operations:
+        - list_issues:
+            repos: ["KvendraAI/kvendra-cli"]
+"#;
+        let p = ProfileSpec::from_yaml(yaml).unwrap();
+        assert!(validate(&p).is_ok());
+    }
 }
