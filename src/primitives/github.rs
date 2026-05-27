@@ -278,11 +278,8 @@ async fn list_issues(
 
     for page in 1..=max_pages {
         let page_str = page.to_string();
-        let mut query: Vec<(&str, &str)> = vec![
-            ("state", state),
-            ("per_page", "100"),
-            ("page", &page_str),
-        ];
+        let mut query: Vec<(&str, &str)> =
+            vec![("state", state), ("per_page", "100"), ("page", &page_str)];
         if let Some(l) = labels_csv.as_deref() {
             query.push(("labels", l));
         }
@@ -476,7 +473,10 @@ mod tests {
         });
         crate::detection::sanitize_value(&mut body);
         let body_str = body.get("body").and_then(Value::as_str).unwrap();
-        assert!(body_str.contains("<redacted:"), "expected redaction marker; got: {body_str}");
+        assert!(
+            body_str.contains("<redacted:"),
+            "expected redaction marker; got: {body_str}"
+        );
         assert!(!body_str.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345678901"));
     }
 

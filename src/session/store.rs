@@ -220,8 +220,8 @@ pub fn list_active_sessions(home: &Path) -> KvendraResult<Vec<String>> {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir)
-        .map_err(|e| KvendraError::SessionStore(format!("readdir: {e}")))?
+    for entry in
+        std::fs::read_dir(&dir).map_err(|e| KvendraError::SessionStore(format!("readdir: {e}")))?
     {
         let entry = entry.map_err(|e| KvendraError::SessionStore(format!("entry: {e}")))?;
         let name = entry.file_name();
@@ -283,7 +283,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let s = fixture_state();
         s.persist_atomic(dir.path()).unwrap();
-        let loaded = SessionState::load(dir.path(), &s.workspace_id).unwrap().unwrap();
+        let loaded = SessionState::load(dir.path(), &s.workspace_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.workspace_id, s.workspace_id);
         assert_eq!(loaded.jwt, s.jwt);
     }

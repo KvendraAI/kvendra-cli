@@ -109,7 +109,11 @@ fn http_client() -> KvendraResult<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
-        .user_agent(concat!("kvendra-cli/", env!("CARGO_PKG_VERSION"), " (rust)"))
+        .user_agent(concat!(
+            "kvendra-cli/",
+            env!("CARGO_PKG_VERSION"),
+            " (rust)"
+        ))
         .build()
         .map_err(|e| KvendraError::Http(format!("http client: {e}")))
 }
@@ -135,7 +139,9 @@ fn load_first_workspace_jwt(home: &Path) -> KvendraResult<Option<String>> {
     let active = list_active_sessions(home)?;
     let chosen = active.into_iter().next();
     let Some(ws_id) = chosen else { return Ok(None) };
-    let Some(state) = SessionState::load(home, &ws_id)? else { return Ok(None) };
+    let Some(state) = SessionState::load(home, &ws_id)? else {
+        return Ok(None);
+    };
     Ok(Some(state.jwt))
 }
 

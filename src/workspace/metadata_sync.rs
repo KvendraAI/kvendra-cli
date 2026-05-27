@@ -62,20 +62,25 @@ async fn sync_once(client: &reqwest::Client, url: &str, opts: &DaemonOpts) {
             if status.is_success() {
                 println!(
                     "{{\"event\":\"sync_ok\",\"workspace\":\"{}\",\"http\":{},\"elapsed_ms\":{}}}",
-                    opts.workspace_id, status.as_u16(), elapsed_ms
+                    opts.workspace_id,
+                    status.as_u16(),
+                    elapsed_ms
                 );
             } else {
                 let body = resp.text().await.unwrap_or_default();
                 eprintln!(
                     "{{\"event\":\"sync_err\",\"workspace\":\"{}\",\"http\":{},\"body\":{:?}}}",
-                    opts.workspace_id, status.as_u16(), body
+                    opts.workspace_id,
+                    status.as_u16(),
+                    body
                 );
             }
         }
         Err(e) => {
             eprintln!(
                 "{{\"event\":\"sync_err\",\"workspace\":\"{}\",\"error\":{:?}}}",
-                opts.workspace_id, e.to_string()
+                opts.workspace_id,
+                e.to_string()
             );
         }
     }
@@ -85,7 +90,11 @@ fn build_client() -> KvendraResult<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
-        .user_agent(concat!("kvendra-cli/", env!("CARGO_PKG_VERSION"), " (rust)"))
+        .user_agent(concat!(
+            "kvendra-cli/",
+            env!("CARGO_PKG_VERSION"),
+            " (rust)"
+        ))
         .build()
         .map_err(|e| KvendraError::Http(format!("http client: {e}")))
 }

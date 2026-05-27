@@ -146,16 +146,16 @@ async fn render_loop(
             })
             .map_err(|e| KvendraError::Tui(e.to_string()))?;
 
-        if event::poll(refresh).map_err(|e| KvendraError::Tui(e.to_string()))? {
-            if let Event::Key(k) = event::read().map_err(|e| KvendraError::Tui(e.to_string()))? {
-                if k.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match k.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('r') => continue,
-                    _ => {}
-                }
+        if event::poll(refresh).map_err(|e| KvendraError::Tui(e.to_string()))?
+            && let Event::Key(k) = event::read().map_err(|e| KvendraError::Tui(e.to_string()))?
+        {
+            if k.kind != KeyEventKind::Press {
+                continue;
+            }
+            match k.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('r') => continue,
+                _ => {}
             }
         }
     }

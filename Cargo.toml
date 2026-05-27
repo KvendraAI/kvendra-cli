@@ -2,7 +2,7 @@
 name = "kvendra"
 version = "0.4.1-alpha.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "Developer harness CLI for Kvendra — capability broker via MCP with zero-knowledge local vault."
 repository = "https://github.com/KvendraAI/kvendra-cli"
@@ -45,17 +45,6 @@ bip39 = { version = "2", features = ["rand"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 # OS keychain (opt-in)
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent"] }
-
-# macOS biometric ACL (REQ-KVD-005 / ISSUE-KVD-CLI-017) — direct deps for SecAccessControl + SecItem*
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3"
-security-framework-sys = "2"
-core-foundation = "0.10"
-core-foundation-sys = "0.8"
-
-# SIGPIPE handler (ISSUE-KVD-CLI-042) — install SIG_DFL on unix to avoid Rust default panic
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 # HTTP
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
 # TUI (Pase B placeholder)
@@ -89,6 +78,17 @@ printpdf = "0.7"
 tar = "0.4"
 # HKDF (already implemented manually in vault/session, but reuse for backup_crypto)
 hkdf = "0.12"
+
+# macOS biometric ACL (REQ-KVD-005 / ISSUE-KVD-CLI-017) — direct deps for SecAccessControl + SecItem*
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+security-framework-sys = "2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+
+# SIGPIPE handler (ISSUE-KVD-CLI-042) — install SIG_DFL on unix to avoid Rust default panic
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = ["tui"]

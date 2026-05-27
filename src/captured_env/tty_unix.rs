@@ -3,7 +3,7 @@
 #![cfg(unix)]
 
 use crate::captured_env::ancestry::walk_ancestors;
-use crate::captured_env::tty::{new_unix_handle, TtyHandle, UnlockRejection};
+use crate::captured_env::tty::{TtyHandle, UnlockRejection, new_unix_handle};
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 

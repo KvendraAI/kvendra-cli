@@ -635,14 +635,8 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
         let conn = rusqlite::Connection::open(tmp.path().join("audit.db")).unwrap();
-        let (action, severity, status, flags, primitive): (
-            String,
-            String,
-            String,
-            String,
-            String,
-        ) = conn
-            .query_row(
+        let (action, severity, status, flags, primitive): (String, String, String, String, String) =
+            conn.query_row(
                 "SELECT action, severity, status, flags, primitive FROM audit_events \
                  WHERE action = 'home_rebound_attempt' ORDER BY id DESC LIMIT 1",
                 [],
@@ -745,7 +739,10 @@ mod tests {
         assert_eq!(action, "home_rebound_attempt");
         // Nothing in the row may equal or contain the literal code.
         let code = "1111-2222-33";
-        assert!(!args_hash.contains(code), "args_hash leaked code: {args_hash}");
+        assert!(
+            !args_hash.contains(code),
+            "args_hash leaked code: {args_hash}"
+        );
         assert!(!flags.contains(code), "flags leaked code: {flags}");
     }
 }

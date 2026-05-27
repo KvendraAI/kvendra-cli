@@ -447,8 +447,7 @@ fn glob_match(pattern: &str, candidate: &str) -> bool {
     for ch in pattern.chars() {
         match ch {
             '*' => re.push_str("[^/]*"),
-            '.' | '+' | '?' | '(' | ')' | '|' | '['
-            | ']' | '{' | '}' | '^' | '$' | '\\' => {
+            '.' | '+' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '\\' => {
                 re.push('\\');
                 re.push(ch);
             }
@@ -1883,13 +1882,11 @@ allowlist:
         // AC-GLOB-4: `.` en el pattern se trata literalmente, NO como
         // regex any-char. `release.v*` matchea `release.v1` pero NO `releaseXv1`.
         let s = aws_s3_sync_with_buckets(&["release.v*"]);
-        let ok_args = env_args(
-            serde_json::json!({ "src": "./build", "dst": "s3://release.v1/foo" }),
-        );
+        let ok_args =
+            env_args(serde_json::json!({ "src": "./build", "dst": "s3://release.v1/foo" }));
         assert!(check(&s, "kvendra.aws", "s3_sync", &ok_args).is_ok());
-        let bad_args = env_args(
-            serde_json::json!({ "src": "./build", "dst": "s3://releaseXv1/foo" }),
-        );
+        let bad_args =
+            env_args(serde_json::json!({ "src": "./build", "dst": "s3://releaseXv1/foo" }));
         let err = check(&s, "kvendra.aws", "s3_sync", &bad_args).unwrap_err();
         assert!(matches!(err, KvendraError::AllowlistViolation(_)));
     }
@@ -1953,7 +1950,8 @@ allowlist:
 
     #[test]
     fn create_issue_passes_with_allowlisted_repo() {
-        let s = spec_with(r#"
+        let s = spec_with(
+            r#"
 profile_id: x
 secret:
   type: t
@@ -1964,7 +1962,8 @@ allowlist:
         - create_issue:
             repos: ["KvendraAI/kvendra-cli"]
             accept_destructive: true
-"#);
+"#,
+        );
         let args = env_args(serde_json::json!({
             "repo": "KvendraAI/kvendra-cli",
             "title": "hello"
@@ -1974,7 +1973,8 @@ allowlist:
 
     #[test]
     fn create_issue_blocked_when_repo_not_in_allowlist() {
-        let s = spec_with(r#"
+        let s = spec_with(
+            r#"
 profile_id: x
 secret:
   type: t
@@ -1985,7 +1985,8 @@ allowlist:
         - create_issue:
             repos: ["KvendraAI/kvendra-cli"]
             accept_destructive: true
-"#);
+"#,
+        );
         let args = env_args(serde_json::json!({
             "repo": "EvilCorp/other",
             "title": "hello"
@@ -1996,7 +1997,8 @@ allowlist:
 
     #[test]
     fn list_issues_passes_read_only() {
-        let s = spec_with(r#"
+        let s = spec_with(
+            r#"
 profile_id: x
 secret:
   type: t
@@ -2006,7 +2008,8 @@ allowlist:
       operations:
         - list_issues:
             repos: ["KvendraAI/kvendra-cli"]
-"#);
+"#,
+        );
         let args = env_args(serde_json::json!({
             "repo": "KvendraAI/kvendra-cli"
         }));
@@ -2015,7 +2018,8 @@ allowlist:
 
     #[test]
     fn create_issue_not_declared_in_yaml_is_violation() {
-        let s = spec_with(r#"
+        let s = spec_with(
+            r#"
 profile_id: x
 secret:
   type: t
@@ -2025,7 +2029,8 @@ allowlist:
       operations:
         - read_repo:
             repos: ["KvendraAI/kvendra-cli"]
-"#);
+"#,
+        );
         let args = env_args(serde_json::json!({
             "repo": "KvendraAI/kvendra-cli",
             "title": "hello"

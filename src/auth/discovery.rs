@@ -34,9 +34,8 @@ impl OidcConfig {
     }
 
     pub fn token_url(&self) -> KvendraResult<Url> {
-        Url::parse(&self.token_endpoint).map_err(|e| {
-            KvendraError::OidcDiscoveryFailed(format!("invalid token_endpoint: {e}"))
-        })
+        Url::parse(&self.token_endpoint)
+            .map_err(|e| KvendraError::OidcDiscoveryFailed(format!("invalid token_endpoint: {e}")))
     }
 }
 
@@ -54,8 +53,7 @@ pub const DEFAULT_OIDC_DISCOVERY_URL: &str =
 /// Read the IdP base URL from `KVENDRA_AUTH_URL`, falling back to
 /// [`DEFAULT_AUTH_BASE`]. The URL is normalized to include a trailing `/`.
 pub fn auth_base_from_env() -> KvendraResult<Url> {
-    let raw =
-        std::env::var("KVENDRA_AUTH_URL").unwrap_or_else(|_| DEFAULT_AUTH_BASE.to_string());
+    let raw = std::env::var("KVENDRA_AUTH_URL").unwrap_or_else(|_| DEFAULT_AUTH_BASE.to_string());
     let mut s = raw;
     if !s.ends_with('/') {
         s.push('/');
@@ -88,7 +86,11 @@ pub async fn discover(auth_base: &Url) -> KvendraResult<OidcConfig> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
-        .user_agent(concat!("kvendra-cli/", env!("CARGO_PKG_VERSION"), " (rust)"))
+        .user_agent(concat!(
+            "kvendra-cli/",
+            env!("CARGO_PKG_VERSION"),
+            " (rust)"
+        ))
         .build()
         .map_err(|e| KvendraError::OidcDiscoveryFailed(format!("client: {e}")))?;
     let resp = client.get(url.clone()).send().await.map_err(|e| {

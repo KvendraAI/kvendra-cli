@@ -298,12 +298,7 @@ mod tests {
             #[command(flatten)]
             args: LoginArgs,
         }
-        let r = Cli::try_parse_from([
-            "kvendra",
-            "--workspace",
-            "acme/frontend",
-            "--pro",
-        ]);
+        let r = Cli::try_parse_from(["kvendra", "--workspace", "acme/frontend", "--pro"]);
         assert!(r.is_err(), "expected --workspace + --pro to conflict");
     }
 }

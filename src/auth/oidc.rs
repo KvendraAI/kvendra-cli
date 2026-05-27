@@ -210,7 +210,11 @@ pub async fn exchange_code_for_tokens(
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
-        .user_agent(concat!("kvendra-cli/", env!("CARGO_PKG_VERSION"), " (rust)"))
+        .user_agent(concat!(
+            "kvendra-cli/",
+            env!("CARGO_PKG_VERSION"),
+            " (rust)"
+        ))
         .build()
         .map_err(|e| KvendraError::OidcFlow(format!("client: {e}")))?;
     let form = [
@@ -245,7 +249,11 @@ pub async fn exchange_refresh_token(
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
-        .user_agent(concat!("kvendra-cli/", env!("CARGO_PKG_VERSION"), " (rust)"))
+        .user_agent(concat!(
+            "kvendra-cli/",
+            env!("CARGO_PKG_VERSION"),
+            " (rust)"
+        ))
         .build()
         .map_err(|e| KvendraError::OidcFlow(format!("client: {e}")))?;
     let form = [

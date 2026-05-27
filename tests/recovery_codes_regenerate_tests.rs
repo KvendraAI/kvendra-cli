@@ -40,7 +40,8 @@ fn fast_params() -> KdfParams {
 fn bootstrap(home: &Path) -> (Vault, Vec<String>) {
     ensure_layout(home).unwrap();
     let v = Vault::new(home.to_path_buf());
-    v.create_with_params(b"hunter2-test", fast_params()).unwrap();
+    v.create_with_params(b"hunter2-test", fast_params())
+        .unwrap();
     v.unlock(b"hunter2-test", 30).unwrap();
 
     let codes = generate_codes();
@@ -175,7 +176,10 @@ async fn happy_path_overwrites_recovery_codes_json_with_eight_slots() {
     // hashed slots — the rotation must produce different material.
     let new_codes_set: std::collections::HashSet<_> = outcome.new_codes.iter().collect();
     let original_set: std::collections::HashSet<_> = original_codes.iter().collect();
-    assert!(new_codes_set.is_disjoint(&original_set), "codes must rotate");
+    assert!(
+        new_codes_set.is_disjoint(&original_set),
+        "codes must rotate"
+    );
 }
 
 /// F.6 — recovery_codes.json perms are 0600 after the atomic rename.
@@ -302,10 +306,7 @@ async fn args_hash_does_not_contain_any_new_recovery_code() {
             !args_hash.contains(code),
             "args_hash leaked code {code}: {args_hash}"
         );
-        assert!(
-            !flags.contains(code),
-            "flags leaked code {code}: {flags}"
-        );
+        assert!(!flags.contains(code), "flags leaked code {code}: {flags}");
     }
 }
 

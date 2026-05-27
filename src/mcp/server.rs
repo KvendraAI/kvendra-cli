@@ -703,26 +703,26 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
 
     // REQ-KVD-CLI-009 AC-ALLOWSYNC-3 — if the allowlist cache has been stale
     // for >24h, refuse the call before talking to the resolver.
-    if let Some(ws_id) = ctx.workspace_id.as_deref() {
-        if crate::workspace::allowlist_sync::is_stale_blocked(ctx.vault.home(), ws_id) {
-            flags.push("allowlist_cache_stale".into());
-            let _ = record_audit(
-                &ctx,
-                &arguments,
-                name,
-                &profile_id,
-                &action,
-                &flags,
-                true,
-                None,
-            )
-            .await;
-            return JsonRpcResponse::error(
-                id,
-                codes::APPLICATION_ERROR,
-                KvendraError::AllowlistCacheStale.to_string(),
-            );
-        }
+    if let Some(ws_id) = ctx.workspace_id.as_deref()
+        && crate::workspace::allowlist_sync::is_stale_blocked(ctx.vault.home(), ws_id)
+    {
+        flags.push("allowlist_cache_stale".into());
+        let _ = record_audit(
+            &ctx,
+            &arguments,
+            name,
+            &profile_id,
+            &action,
+            &flags,
+            true,
+            None,
+        )
+        .await;
+        return JsonRpcResponse::error(
+            id,
+            codes::APPLICATION_ERROR,
+            KvendraError::AllowlistCacheStale.to_string(),
+        );
     }
 
     // Resolve the secret via the configured SecretResolver. In local mode
@@ -802,10 +802,10 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         | Err(KvendraError::DetectionBlocked(_)) => (Status::Error, Severity::Warn),
         Err(_) => (Status::Error, Severity::Error),
     };
-    if let Some(w) = ctx.audit_writer() {
-        if event_id > 0 {
-            let _ = w.update_status(event_id, status, severity).await;
-        }
+    if let Some(w) = ctx.audit_writer()
+        && event_id > 0
+    {
+        let _ = w.update_status(event_id, status, severity).await;
     }
 
     match outcome {
@@ -1409,11 +1409,7 @@ mod tests {
         #[derive(Default)]
         struct FlagCapture(StdArc<StdMutex<Vec<String>>>);
         impl<S: Subscriber> Layer<S> for FlagCapture {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: LayerCtx<'_, S>,
-            ) {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: LayerCtx<'_, S>) {
                 struct V<'a>(&'a StdMutex<Vec<String>>);
                 impl<'a> Visit for V<'a> {
                     fn record_str(&mut self, field: &Field, value: &str) {
@@ -1421,11 +1417,7 @@ mod tests {
                             self.0.lock().unwrap().push(value.to_string());
                         }
                     }
-                    fn record_debug(
-                        &mut self,
-                        field: &Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
+                    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
                         if field.name() == "flag" {
                             self.0.lock().unwrap().push(format!("{value:?}"));
                         }
@@ -1452,11 +1444,15 @@ mod tests {
         // AC-HEAL-2 + AC-HEAL-4 — emits _from_pending, NOT _from_idle.
         let captured = flags.lock().unwrap().clone();
         assert!(
-            captured.iter().any(|f| f.contains("mcp_self_heal_from_pending")),
+            captured
+                .iter()
+                .any(|f| f.contains("mcp_self_heal_from_pending")),
             "expected flag mcp_self_heal_from_pending, captured: {captured:?}"
         );
         assert!(
-            !captured.iter().any(|f| f.contains("mcp_self_heal_from_idle")),
+            !captured
+                .iter()
+                .any(|f| f.contains("mcp_self_heal_from_idle")),
             "must NOT emit _from_idle flag when prior state was LockedPendingUnlock, captured: {captured:?}"
         );
     }
@@ -1498,7 +1494,11 @@ mod tests {
         crate::session::local::persist_atomic(&state, home).unwrap();
         v.lock();
 
-        assert_eq!(v.state(), VaultStateKind::Locked, "must be plain Locked, not pending");
+        assert_eq!(
+            v.state(),
+            VaultStateKind::Locked,
+            "must be plain Locked, not pending"
+        );
 
         let ctx = ServerContext {
             vault: v,
@@ -1515,11 +1515,7 @@ mod tests {
         #[derive(Default)]
         struct FlagCapture(StdArc<StdMutex<Vec<String>>>);
         impl<S: Subscriber> Layer<S> for FlagCapture {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: LayerCtx<'_, S>,
-            ) {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: LayerCtx<'_, S>) {
                 struct V<'a>(&'a StdMutex<Vec<String>>);
                 impl<'a> Visit for V<'a> {
                     fn record_str(&mut self, field: &Field, value: &str) {
@@ -1527,11 +1523,7 @@ mod tests {
                             self.0.lock().unwrap().push(value.to_string());
                         }
                     }
-                    fn record_debug(
-                        &mut self,
-                        field: &Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
+                    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
                         if field.name() == "flag" {
                             self.0.lock().unwrap().push(format!("{value:?}"));
                         }
@@ -1552,11 +1544,15 @@ mod tests {
         assert!(ctx.vault.is_unlocked(), "self-heal from Locked must unlock");
         let captured = flags.lock().unwrap().clone();
         assert!(
-            captured.iter().any(|f| f.contains("mcp_self_heal_from_idle")),
+            captured
+                .iter()
+                .any(|f| f.contains("mcp_self_heal_from_idle")),
             "expected mcp_self_heal_from_idle, captured: {captured:?}"
         );
         assert!(
-            !captured.iter().any(|f| f.contains("mcp_self_heal_from_pending")),
+            !captured
+                .iter()
+                .any(|f| f.contains("mcp_self_heal_from_pending")),
             "must NOT emit _from_pending flag for plain Locked, captured: {captured:?}"
         );
     }

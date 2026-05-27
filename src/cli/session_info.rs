@@ -107,7 +107,11 @@ pub async fn run(args: SessionInfoArgs) -> KvendraResult<()> {
         0 => SessionView {
             // BUG-A (ISSUE-KVD-CLI-170F9D): when only pro.token exists
             // we render "Mode: pro" instead of misleading "Free tier".
-            mode: if pro_view.is_some() { "pro".into() } else { "local".into() },
+            mode: if pro_view.is_some() {
+                "pro".into()
+            } else {
+                "local".into()
+            },
             local: None,
             pro: None,
             workspace_id: None,
@@ -372,18 +376,14 @@ fn print_human(view: &SessionView, verbose: bool) {
     if let Some(w) = &view.workspace_id {
         println!("Workspace: {w}");
     }
-    if verbose {
-        if let Some(t) = &view.tenant_id {
-            println!("Tenant: {t}");
-        }
+    if verbose && let Some(t) = &view.tenant_id {
+        println!("Tenant: {t}");
     }
     if let Some(e) = &view.member_email {
         println!("Member: {e}");
     }
-    if verbose {
-        if let Some(id) = &view.member_id {
-            println!("Member id: {id}");
-        }
+    if verbose && let Some(id) = &view.member_id {
+        println!("Member id: {id}");
     }
     if let Some(t) = view.jwt_expires_at {
         let secs = view.seconds_until_expiry.unwrap_or(0);
@@ -519,10 +519,7 @@ mod tests {
             "email MUST be sourced from id_token, not access_token"
         );
         assert_eq!(view.issuer.as_deref(), Some("https://auth.kvendra.cloud"));
-        assert!(
-            view.expires_at.is_some(),
-            "exp must decode from id_token"
-        );
+        assert!(view.expires_at.is_some(), "exp must decode from id_token");
         // blob_path stays pointing to pro.token (the backup-consumed bearer).
         assert!(view.blob_path.ends_with("sessions/pro.token"));
     }

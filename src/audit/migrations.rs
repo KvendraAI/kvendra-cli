@@ -130,13 +130,13 @@ pub fn apply_pending(conn: &Connection) -> KvendraResult<()> {
     if applied < 2 {
         if let Some(db_path) = conn.path().filter(|p| !p.is_empty()) {
             let p = Path::new(db_path);
-            if p.is_file() {
-                if let Some(backup) = backup_audit_db(p) {
-                    tracing::info!(
-                        backup = %backup.display(),
-                        "audit.db backed up before v1→v2 migration"
-                    );
-                }
+            if p.is_file()
+                && let Some(backup) = backup_audit_db(p)
+            {
+                tracing::info!(
+                    backup = %backup.display(),
+                    "audit.db backed up before v1→v2 migration"
+                );
             }
         }
         apply_v2(conn)?;
@@ -158,9 +158,9 @@ fn apply_v2(conn: &Connection) -> KvendraResult<()> {
     // alongside an index in a single batch under the bundled features we
     // ship, so we do it in two statements inside a transaction. Both
     // additions are NULL-safe and do not require row rewrites.
-    let tx = conn.unchecked_transaction().map_err(|e| {
-        KvendraError::AuditMigrationAborted(format!("begin tx: {e}"))
-    })?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| KvendraError::AuditMigrationAborted(format!("begin tx: {e}")))?;
     // `IF NOT EXISTS` for ALTER TABLE ADD COLUMN landed in SQLite 3.35;
     // bundled rusqlite ships 3.44+, but we fall back to a manual check
     // anyway in case a downstream packager pins an older bundle.
@@ -169,9 +169,7 @@ fn apply_v2(conn: &Connection) -> KvendraResult<()> {
             "ALTER TABLE audit_events ADD COLUMN remote_audit_id TEXT NULL",
             [],
         )
-        .map_err(|e| {
-            KvendraError::AuditMigrationAborted(format!("ALTER remote_audit_id: {e}"))
-        })?;
+        .map_err(|e| KvendraError::AuditMigrationAborted(format!("ALTER remote_audit_id: {e}")))?;
     }
     if !column_exists(&tx, "audit_events", "hmac_version")? {
         // Existing rows belong to layout v1; default keeps the chain valid.
@@ -179,9 +177,7 @@ fn apply_v2(conn: &Connection) -> KvendraResult<()> {
             "ALTER TABLE audit_events ADD COLUMN hmac_version INTEGER NOT NULL DEFAULT 1",
             [],
         )
-        .map_err(|e| {
-            KvendraError::AuditMigrationAborted(format!("ALTER hmac_version: {e}"))
-        })?;
+        .map_err(|e| KvendraError::AuditMigrationAborted(format!("ALTER hmac_version: {e}")))?;
     }
     tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_audit_remote_id \
@@ -202,9 +198,8 @@ fn apply_v2(conn: &Connection) -> KvendraResult<()> {
         KvendraError::AuditMigrationAborted(format!("INSERT schema_migrations v2: {e}"))
     })?;
 
-    tx.commit().map_err(|e| {
-        KvendraError::AuditMigrationAborted(format!("commit tx: {e}"))
-    })?;
+    tx.commit()
+        .map_err(|e| KvendraError::AuditMigrationAborted(format!("commit tx: {e}")))?;
 
     Ok(())
 }

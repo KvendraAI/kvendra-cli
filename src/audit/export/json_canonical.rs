@@ -13,7 +13,7 @@ pub fn write_json(path: &Path, bundle: &ExportBundle) -> KvendraResult<()> {
 
 pub fn read_json_canonical(path: &Path) -> KvendraResult<ExportBundle> {
     let raw = std::fs::read_to_string(path)?;
-    let bundle: ExportBundle = serde_json::from_str(&raw)
-        .map_err(|e| KvendraError::Audit(format!("jcs parse: {e}")))?;
+    let bundle: ExportBundle =
+        serde_json::from_str(&raw).map_err(|e| KvendraError::Audit(format!("jcs parse: {e}")))?;
     Ok(bundle)
 }

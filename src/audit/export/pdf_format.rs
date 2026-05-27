@@ -5,9 +5,7 @@
 
 use crate::audit::export::bundle::{BRAND_DEFAULT, ExportBundle};
 use crate::error::{KvendraError, KvendraResult};
-use printpdf::{
-    BuiltinFont, Mm, PdfDocument, PdfDocumentReference, PdfLayerIndex, PdfPageIndex,
-};
+use printpdf::{BuiltinFont, Mm, PdfDocument, PdfDocumentReference, PdfLayerIndex, PdfPageIndex};
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -128,16 +126,13 @@ pub fn write_pdf(path: &Path, bundle: &ExportBundle, brand: &BrandConfig) -> Kve
     }
     let layer = doc.get_page(current_page).get_layer(current_layer);
     y = Mm(y.0 - 15.0);
-    layer.use_text(
-        "Cryptographic block",
-        12.0,
-        Mm(15.0),
-        y,
-        &helvetica_bold,
-    );
+    layer.use_text("Cryptographic block", 12.0, Mm(15.0), y, &helvetica_bold);
     y = Mm(y.0 - 7.0);
     layer.use_text(
-        format!("Chain root HMAC: {}", truncate(&bundle.chain_root_hmac_hex, 80)),
+        format!(
+            "Chain root HMAC: {}",
+            truncate(&bundle.chain_root_hmac_hex, 80)
+        ),
         7.0,
         Mm(15.0),
         y,
@@ -145,7 +140,10 @@ pub fn write_pdf(path: &Path, bundle: &ExportBundle, brand: &BrandConfig) -> Kve
     );
     y = Mm(y.0 - 5.0);
     layer.use_text(
-        format!("Chain end  HMAC: {}", truncate(&bundle.chain_end_hmac_hex, 80)),
+        format!(
+            "Chain end  HMAC: {}",
+            truncate(&bundle.chain_end_hmac_hex, 80)
+        ),
         7.0,
         Mm(15.0),
         y,
@@ -153,7 +151,10 @@ pub fn write_pdf(path: &Path, bundle: &ExportBundle, brand: &BrandConfig) -> Kve
     );
     y = Mm(y.0 - 5.0);
     layer.use_text(
-        format!("Chain key seed: {}", truncate(&bundle.chain_key_seed_hex, 80)),
+        format!(
+            "Chain key seed: {}",
+            truncate(&bundle.chain_key_seed_hex, 80)
+        ),
         7.0,
         Mm(15.0),
         y,

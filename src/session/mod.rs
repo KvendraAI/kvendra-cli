@@ -24,4 +24,4 @@ pub mod store;
 pub mod ttl;
 pub mod wrap_key;
 
-pub use store::{list_active_sessions, SessionState};
+pub use store::{SessionState, list_active_sessions};

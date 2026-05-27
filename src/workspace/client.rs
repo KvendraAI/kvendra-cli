@@ -13,8 +13,8 @@ pub const DEFAULT_BROKER_BASE: &str = "https://api.kvendra.cloud";
 
 /// Read the broker base URL from env, normalize trailing `/`.
 pub fn broker_base_from_env() -> KvendraResult<Url> {
-    let raw = std::env::var("KVENDRA_BROKER_URL")
-        .unwrap_or_else(|_| DEFAULT_BROKER_BASE.to_string());
+    let raw =
+        std::env::var("KVENDRA_BROKER_URL").unwrap_or_else(|_| DEFAULT_BROKER_BASE.to_string());
     let mut s = raw;
     if !s.ends_with('/') {
         s.push('/');
@@ -39,7 +39,11 @@ impl WorkspaceClient {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
-            .user_agent(concat!("kvendra-cli/", env!("CARGO_PKG_VERSION"), " (rust)"))
+            .user_agent(concat!(
+                "kvendra-cli/",
+                env!("CARGO_PKG_VERSION"),
+                " (rust)"
+            ))
             .build()
             .map_err(|e| KvendraError::Http(format!("client: {e}")))?;
         Ok(Self { base, jwt, http })

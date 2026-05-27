@@ -31,7 +31,11 @@ pub async fn run(args: TelemetryArgs) -> KvendraResult<()> {
         let cfg = Config::load(&home, None).unwrap_or_default();
         println!(
             "telemetry.enabled: {}",
-            if cfg.telemetry.enabled { "true" } else { "false" }
+            if cfg.telemetry.enabled {
+                "true"
+            } else {
+                "false"
+            }
         );
         return Ok(());
     }
@@ -42,7 +46,11 @@ pub async fn run(args: TelemetryArgs) -> KvendraResult<()> {
     cfg.save(&home, &vault)?;
     println!(
         "telemetry.enabled set to {}",
-        if cfg.telemetry.enabled { "true" } else { "false" }
+        if cfg.telemetry.enabled {
+            "true"
+        } else {
+            "false"
+        }
     );
     if cfg.telemetry.enabled {
         println!(

@@ -127,9 +127,7 @@ async fn run_regenerate(args: RegenerateArgs) -> KvendraResult<()> {
     println!("      - recovery_codes.json will be overwritten atomically (0600).");
     println!("      - audit row 'recovery_codes_regenerate' (severity=warn) appended.");
     println!();
-    println!(
-        "Type the literal string '{REGENERATE_ACK}' (case-sensitive) to confirm:"
-    );
+    println!("Type the literal string '{REGENERATE_ACK}' (case-sensitive) to confirm:");
 
     let mut typed = String::new();
     std::io::stdin()
@@ -142,12 +140,13 @@ async fn run_regenerate(args: RegenerateArgs) -> KvendraResult<()> {
     // Render the new codes ONCE.
     println!();
     println!("════════════════════════════════════════════════════════════════");
-    println!(
-        "  NEW Recovery codes — SAVE THESE NOW. They will not be shown again."
-    );
+    println!("  NEW Recovery codes — SAVE THESE NOW. They will not be shown again.");
     println!("════════════════════════════════════════════════════════════════");
     println!();
-    println!("Numeric one-time codes ({} codes):", outcome.new_codes.len());
+    println!(
+        "Numeric one-time codes ({} codes):",
+        outcome.new_codes.len()
+    );
     for code in &outcome.new_codes {
         println!("    {code}");
     }
@@ -284,9 +283,7 @@ pub async fn regenerate_inner(
             args_hash_hex: args_hash,
             status: Status::Ok,
             severity: Severity::Warn,
-            flags: format!(
-                "recovery_codes_regenerated,previous_used_count_{previous_used_count}"
-            ),
+            flags: format!("recovery_codes_regenerated,previous_used_count_{previous_used_count}"),
             remote_audit_id: None,
         })
         .await?;
@@ -329,7 +326,8 @@ mod tests {
     fn bootstrap_vault_with_8_codes(home: &Path) -> (Vault, Vec<String>) {
         ensure_layout(home).unwrap();
         let v = Vault::new(home.to_path_buf());
-        v.create_with_params(b"hunter2-test", fast_params()).unwrap();
+        v.create_with_params(b"hunter2-test", fast_params())
+            .unwrap();
         v.unlock(b"hunter2-test", 30).unwrap();
 
         let codes = generate_codes();
@@ -388,6 +386,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (_v, _codes) = bootstrap_vault_with_8_codes(tmp.path());
         let r = regenerate_inner(tmp.path(), b"hunter2-test", "regenerate").await;
-        assert!(matches!(r, Err(KvendraError::RegenerateAcknowledgeMismatch)));
+        assert!(matches!(
+            r,
+            Err(KvendraError::RegenerateAcknowledgeMismatch)
+        ));
     }
 }

@@ -59,26 +59,26 @@ pub async fn refresh_if_needed(
     let _guard = SessionState::acquire_lock(home, &snapshot.workspace_id)?;
 
     // Re-read disk: a peer may have refreshed while we were waiting.
-    if let Some(fresh) = SessionState::load(home, &snapshot.workspace_id)? {
-        if fresh.jwt_expires_at - now > lead {
-            *session.write().await = fresh;
-            return Ok(RefreshOutcome::SkippedRefreshedByPeer);
-        }
+    if let Some(fresh) = SessionState::load(home, &snapshot.workspace_id)?
+        && fresh.jwt_expires_at - now > lead
+    {
+        *session.write().await = fresh;
+        return Ok(RefreshOutcome::SkippedRefreshedByPeer);
     }
 
     let discovery_url = discovery_url_from_env()?;
     let oidc = discover(&discovery_url).await?;
     let client_id = client_id_from_env();
 
-    let new_tokens =
-        match exchange_refresh_token(&oidc, &client_id, &snapshot.refresh_token).await {
-            Ok(t) => t,
-            Err(KvendraError::OidcFlow(msg)) if is_invalid_grant(&msg) => {
-                let _ = SessionState::delete(home, &snapshot.workspace_id);
-                return Err(KvendraError::WorkspaceSessionExpired);
-            }
-            Err(e) => return Err(e),
-        };
+    let new_tokens = match exchange_refresh_token(&oidc, &client_id, &snapshot.refresh_token).await
+    {
+        Ok(t) => t,
+        Err(KvendraError::OidcFlow(msg)) if is_invalid_grant(&msg) => {
+            let _ = SessionState::delete(home, &snapshot.workspace_id);
+            return Err(KvendraError::WorkspaceSessionExpired);
+        }
+        Err(e) => return Err(e),
+    };
 
     let new_state = SessionState::from_token_set(
         &snapshot.workspace_id,

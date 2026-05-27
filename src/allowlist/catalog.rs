@@ -297,7 +297,11 @@ mod tests {
 
     #[test]
     fn create_issue_destructive_unconditional() {
-        assert!(is_destructive("kvendra.github", "create_issue", &Value::Null));
+        assert!(is_destructive(
+            "kvendra.github",
+            "create_issue",
+            &Value::Null
+        ));
         assert!(is_destructive(
             "kvendra.github",
             "create_issue",

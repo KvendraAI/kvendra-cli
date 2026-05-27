@@ -101,10 +101,14 @@ pub struct WorkspaceQueryArgs {
 pub async fn run(cmd: WorkspaceCommand) -> KvendraResult<()> {
     match cmd {
         WorkspaceCommand::AddSecret(args) => add_secret(args).await,
-        WorkspaceCommand::Allowlist(AllowlistCommand::Refresh(args)) => refresh_allowlists(args).await,
+        WorkspaceCommand::Allowlist(AllowlistCommand::Refresh(args)) => {
+            refresh_allowlists(args).await
+        }
         WorkspaceCommand::Members(MembersCommand::List(args)) => list_members(args).await,
         WorkspaceCommand::Profiles(ProfilesCommand::List(args)) => list_profiles(args).await,
-        WorkspaceCommand::MetadataSync(MetadataSyncCommand::Daemon(args)) => metadata_sync_daemon(args).await,
+        WorkspaceCommand::MetadataSync(MetadataSyncCommand::Daemon(args)) => {
+            metadata_sync_daemon(args).await
+        }
     }
 }
 

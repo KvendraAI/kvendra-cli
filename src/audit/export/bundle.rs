@@ -69,8 +69,14 @@ pub fn build_bundle(
     chain_key_seed_hex: String,
 ) -> ExportBundle {
     let now = current_iso8601();
-    let chain_root_hmac_hex = events.first().map(|e| e.prev_hmac_hex.clone()).unwrap_or_default();
-    let chain_end_hmac_hex = events.last().map(|e| e.hmac_hex.clone()).unwrap_or_default();
+    let chain_root_hmac_hex = events
+        .first()
+        .map(|e| e.prev_hmac_hex.clone())
+        .unwrap_or_default();
+    let chain_end_hmac_hex = events
+        .last()
+        .map(|e| e.hmac_hex.clone())
+        .unwrap_or_default();
 
     let exported_events: Vec<ExportedEvent> = events
         .iter()
@@ -82,10 +88,7 @@ pub fn build_bundle(
             primitive: ev.primitive.clone(),
             action: ev.action.clone(),
             args_hash_hex: ev.args_hash_hex.clone(),
-            args_summary: super::redaction::redact_text(&format!(
-                "{}:{}",
-                ev.primitive, ev.action
-            )),
+            args_summary: super::redaction::redact_text(&format!("{}:{}", ev.primitive, ev.action)),
             result_status: ev.status.clone(),
             severity: ev.severity.clone(),
             flags: ev.flags.clone(),
@@ -112,7 +115,9 @@ pub fn build_bundle(
 fn current_iso8601() -> String {
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
-    OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default()
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_default()
 }
 
 fn ts_unix_ms_to_iso(ms: i64) -> String {

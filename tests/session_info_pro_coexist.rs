@@ -8,8 +8,8 @@
 
 use assert_cmd::Command;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
-use kvendra::session::SessionState;
 use chrono::{Duration as ChronoDuration, Utc};
+use kvendra::session::SessionState;
 use tempfile::tempdir;
 
 /// Synthesise a 3-segment JWT (header.payload.sig) like the one `pro_login`
@@ -177,8 +177,8 @@ fn session_info_shows_email_from_id_token() {
         .success();
 
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .expect("session info --json must emit valid JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("session info --json must emit valid JSON");
     assert_eq!(
         json.get("mode").and_then(|v| v.as_str()),
         Some("pro"),

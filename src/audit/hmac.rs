@@ -181,12 +181,8 @@ mod tests {
     /// pick the right function on verify (`verify_chain`).
     #[test]
     fn v1_and_v2_disagree_even_with_null_remote_audit() {
-        let v1 = compute_hmac_v1(
-            b"key", 1, 0, "p", "x", "y", "z", "ok", "info", "", "",
-        );
-        let v2 = compute_hmac_v2(
-            b"key", 1, 0, "p", "x", "y", "z", "ok", "info", "", "", None,
-        );
+        let v1 = compute_hmac_v1(b"key", 1, 0, "p", "x", "y", "z", "ok", "info", "", "");
+        let v2 = compute_hmac_v2(b"key", 1, 0, "p", "x", "y", "z", "ok", "info", "", "", None);
         assert_ne!(v1, v2);
     }
 
@@ -194,9 +190,7 @@ mod tests {
     /// row with `None`: the remote correlation id is bound to the chain.
     #[test]
     fn v2_remote_audit_id_changes_hmac() {
-        let none = compute_hmac_v2(
-            b"key", 1, 0, "p", "x", "y", "z", "ok", "info", "", "", None,
-        );
+        let none = compute_hmac_v2(b"key", 1, 0, "p", "x", "y", "z", "ok", "info", "", "", None);
         let some = compute_hmac_v2(
             b"key",
             1,

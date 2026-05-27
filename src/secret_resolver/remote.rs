@@ -32,22 +32,25 @@ pub struct RemoteBrokerResolver {
 impl RemoteBrokerResolver {
     /// Build a new resolver wired to the broker behind `KVENDRA_BROKER_URL`.
     pub fn new(session: Arc<RwLock<SessionState>>) -> KvendraResult<Self> {
-        let raw = std::env::var("KVENDRA_BROKER_URL")
-            .unwrap_or_else(|_| DEFAULT_BROKER_BASE.to_string());
+        let raw =
+            std::env::var("KVENDRA_BROKER_URL").unwrap_or_else(|_| DEFAULT_BROKER_BASE.to_string());
         let mut s = raw;
         if !s.ends_with('/') {
             s.push('/');
         }
-        let base_url = Url::parse(&s).map_err(|e| {
-            KvendraError::Http(format!("invalid KVENDRA_BROKER_URL: {e}"))
-        })?;
+        let base_url = Url::parse(&s)
+            .map_err(|e| KvendraError::Http(format!("invalid KVENDRA_BROKER_URL: {e}")))?;
 
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             // SLA-KVD-ENTERPRISE-001 p99 < 100ms; 3s gives 30x headroom for
             // cold-starts and jitter without degrading UX.
             .timeout(Duration::from_secs(3))
-            .user_agent(concat!("kvendra-cli/", env!("CARGO_PKG_VERSION"), " (rust)"))
+            .user_agent(concat!(
+                "kvendra-cli/",
+                env!("CARGO_PKG_VERSION"),
+                " (rust)"
+            ))
             .build()
             .map_err(|e| KvendraError::Http(format!("client: {e}")))?;
 
@@ -100,9 +103,10 @@ impl SecretResolver for RemoteBrokerResolver {
                     .json()
                     .await
                     .map_err(|e| KvendraError::Http(format!("decode tokens:issue: {e}")))?;
-                let expires_at: DateTime<Utc> = parsed.expires_at.parse().map_err(|e| {
-                    KvendraError::Http(format!("expires_at parse: {e}"))
-                })?;
+                let expires_at: DateTime<Utc> = parsed
+                    .expires_at
+                    .parse()
+                    .map_err(|e| KvendraError::Http(format!("expires_at parse: {e}")))?;
                 Ok(EphemeralSecret {
                     token: SecretPlaintext::new(parsed.token.into_bytes()),
                     expires_at,
@@ -125,9 +129,7 @@ impl SecretResolver for RemoteBrokerResolver {
             }
             other => {
                 let body_text = resp.text().await.unwrap_or_default();
-                Err(KvendraError::Http(format!(
-                    "broker {other}: {body_text}"
-                )))
+                Err(KvendraError::Http(format!("broker {other}: {body_text}")))
             }
         }
     }

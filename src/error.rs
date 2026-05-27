@@ -117,7 +117,6 @@ pub enum KvendraError {
     Tui(String),
 
     // ─── M1 Sprint 4 — workspace mode (REQ-KVD-CLI-004/008/009/010) ───
-
     /// Server signalled the workspace membership has been revoked or the
     /// workspace itself has been deleted. The CLI must invalidate the cached
     /// session and prompt the user to re-login or contact an admin.

@@ -61,10 +61,8 @@ impl BackupClient {
     ) -> KvendraResult<BackupVersionMeta> {
         let mut manifest_value = serde_json::to_value(manifest)
             .map_err(|e| KvendraError::Serialization(format!("manifest: {e}")))?;
-        if force {
-            if let Some(obj) = manifest_value.as_object_mut() {
-                obj.insert("parent_version_etag".into(), serde_json::Value::Null);
-            }
+        if force && let Some(obj) = manifest_value.as_object_mut() {
+            obj.insert("parent_version_etag".into(), serde_json::Value::Null);
         }
         let manifest_json = serde_json::to_string(&manifest_value)
             .map_err(|e| KvendraError::Serialization(format!("manifest: {e}")))?;
@@ -89,10 +87,7 @@ impl BackupClient {
     }
 
     pub async fn list(&self, limit: u32) -> KvendraResult<Vec<BackupVersionMeta>> {
-        let url = format!(
-            "{}/v1/backups?limit={limit}&order=desc",
-            self.base_url
-        );
+        let url = format!("{}/v1/backups?limit={limit}&order=desc", self.base_url);
         let resp = self
             .with_identity(self.http.get(url))
             .send()
@@ -100,7 +95,11 @@ impl BackupClient {
             .map_err(|e| KvendraError::Vault(format!("backup list: {e}")))?;
 
         if !resp.status().is_success() {
-            return Err(map_http_error(resp.status().as_u16(), "list", String::new()));
+            return Err(map_http_error(
+                resp.status().as_u16(),
+                "list",
+                String::new(),
+            ));
         }
         #[derive(Deserialize)]
         struct ListResp {
@@ -189,7 +188,5 @@ impl BackupClient {
 }
 
 fn map_http_error(status: u16, op: &str, body: String) -> KvendraError {
-    KvendraError::Vault(format!(
-        "BackendError on {op}: status={status} body={body}"
-    ))
+    KvendraError::Vault(format!("BackendError on {op}: status={status} body={body}"))
 }

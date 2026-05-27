@@ -33,7 +33,9 @@ pub struct SyncReport {
 pub fn cache_root(home: &Path, workspace_id: &str) -> PathBuf {
     home.join("cache")
         .join("allowlists")
-        .join(crate::session::SessionState::workspace_id_safe(workspace_id))
+        .join(crate::session::SessionState::workspace_id_safe(
+            workspace_id,
+        ))
 }
 
 /// Path of the `.stale_blocked` sentinel — touched when the sync has not
@@ -55,15 +57,12 @@ pub fn template_etag_path(home: &Path, workspace_id: &str, template_id: &str) ->
 #[allow(dead_code)]
 fn read_etag(home: &Path, workspace_id: &str, template_id: &str) -> Option<String> {
     let path = template_etag_path(home, workspace_id, template_id);
-    std::fs::read_to_string(&path).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
-fn write_etag(
-    home: &Path,
-    workspace_id: &str,
-    template_id: &str,
-    etag: &str,
-) -> KvendraResult<()> {
+fn write_etag(home: &Path, workspace_id: &str, template_id: &str, etag: &str) -> KvendraResult<()> {
     let path = template_etag_path(home, workspace_id, template_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -80,8 +79,7 @@ fn write_etag(
         f.write_all(etag.as_bytes())
             .map_err(|e| KvendraError::Config(format!("etag write: {e}")))?;
     }
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| KvendraError::Config(format!("etag rename: {e}")))?;
+    std::fs::rename(&tmp, &path).map_err(|e| KvendraError::Config(format!("etag rename: {e}")))?;
     set_file_mode_secure(&path)?;
     Ok(())
 }
@@ -135,7 +133,9 @@ pub async fn sync_once(
     let prior_etag: Option<String> = None;
     let _ = full; // keep the signature stable until IF-002 v1.2.0
 
-    let resp = client.list_templates(workspace_id, prior_etag.as_deref()).await?;
+    let resp = client
+        .list_templates(workspace_id, prior_etag.as_deref())
+        .await?;
     let mut report = SyncReport {
         fetched: 0,
         not_modified: 0,
@@ -155,12 +155,9 @@ pub async fn sync_once(
                 // payload itself is the source of truth, so we write whatever
                 // the broker said. The optional `If-None-Match` on the list
                 // GET above already handles the "nothing changed" path.
-                if let Err(e) = write_template_atomic(
-                    home,
-                    workspace_id,
-                    &tmpl.template_id,
-                    &tmpl.yaml_blob,
-                ) {
+                if let Err(e) =
+                    write_template_atomic(home, workspace_id, &tmpl.template_id, &tmpl.yaml_blob)
+                {
                     tracing::warn!(
                         target: "kvendra::workspace",
                         template = %tmpl.template_id,

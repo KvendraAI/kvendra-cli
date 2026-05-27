@@ -50,11 +50,7 @@ pub fn build_bundle(home: &Path) -> KvendraResult<Vec<u8>> {
                 if !path.is_file() {
                     continue;
                 }
-                let rel = format!(
-                    "{}/{}",
-                    dir,
-                    ent.file_name().to_string_lossy()
-                );
+                let rel = format!("{}/{}", dir, ent.file_name().to_string_lossy());
                 append_file(&mut builder, &path, &rel)?;
             }
         }
@@ -65,11 +61,7 @@ pub fn build_bundle(home: &Path) -> KvendraResult<Vec<u8>> {
     Ok(buf)
 }
 
-fn append_file<W: Write>(
-    builder: &mut Builder<W>,
-    path: &Path,
-    name: &str,
-) -> KvendraResult<()> {
+fn append_file<W: Write>(builder: &mut Builder<W>, path: &Path, name: &str) -> KvendraResult<()> {
     let bytes = std::fs::read(path)?;
     let mut header = Header::new_gnu();
     header

@@ -11,7 +11,7 @@
 #![cfg(windows)]
 
 use crate::captured_env::ancestry::walk_ancestors;
-use crate::captured_env::tty::{new_windows_handle, TtyHandle, UnlockRejection};
+use crate::captured_env::tty::{TtyHandle, UnlockRejection, new_windows_handle};
 use std::io::IsTerminal;
 
 pub fn ensure_real_terminal_windows() -> Result<TtyHandle, UnlockRejection> {

@@ -193,23 +193,23 @@ async fn run_loop(
             .map_err(|e| KvendraError::Tui(e.to_string()))?;
 
         // Poll for keypresses up to `poll_dur`.
-        if event::poll(poll_dur).map_err(|e| KvendraError::Tui(e.to_string()))? {
-            if let Event::Key(k) = event::read().map_err(|e| KvendraError::Tui(e.to_string()))? {
-                if k.kind != KeyEventKind::Press {
-                    continue;
+        if event::poll(poll_dur).map_err(|e| KvendraError::Tui(e.to_string()))?
+            && let Event::Key(k) = event::read().map_err(|e| KvendraError::Tui(e.to_string()))?
+        {
+            if k.kind != KeyEventKind::Press {
+                continue;
+            }
+            match k.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('c') => {
+                    terminal
+                        .clear()
+                        .map_err(|e| KvendraError::Tui(e.to_string()))?;
                 }
-                match k.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('c') => {
-                        terminal
-                            .clear()
-                            .map_err(|e| KvendraError::Tui(e.to_string()))?;
-                    }
-                    KeyCode::Char('h') => *show_help = !*show_help,
-                    KeyCode::Up if *scroll_offset > 0 => *scroll_offset -= 1,
-                    KeyCode::Down => *scroll_offset += 1,
-                    _ => {}
-                }
+                KeyCode::Char('h') => *show_help = !*show_help,
+                KeyCode::Up if *scroll_offset > 0 => *scroll_offset -= 1,
+                KeyCode::Down => *scroll_offset += 1,
+                _ => {}
             }
         }
     }

@@ -19,5 +19,5 @@ pub mod pdf_format;
 pub mod redaction;
 pub mod verify;
 
-pub use bundle::{ExportBundle, ExportedEvent, build_bundle, BRAND_DEFAULT, EXPORT_VERSION};
-pub use verify::{verify_bundle, VerifyOutcome};
+pub use bundle::{BRAND_DEFAULT, EXPORT_VERSION, ExportBundle, ExportedEvent, build_bundle};
+pub use verify::{VerifyOutcome, verify_bundle};

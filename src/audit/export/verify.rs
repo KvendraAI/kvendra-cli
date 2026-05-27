@@ -108,9 +108,7 @@ pub fn verify_path(path: &Path) -> KvendraResult<VerifyOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::export::bundle::{
-        build_bundle, ExportFilters, EXPORT_VERSION,
-    };
+    use crate::audit::export::bundle::{EXPORT_VERSION, ExportFilters, build_bundle};
     use crate::audit::hmac::compute_hmac_v2;
     use crate::audit::reader::StoredEvent;
 
@@ -198,8 +196,7 @@ mod tests {
         match outcome {
             VerifyOutcome::Pass { .. } => panic!("expected FAIL on tampered row"),
             VerifyOutcome::Fail {
-                first_deviation_at,
-                ..
+                first_deviation_at, ..
             } => assert_eq!(first_deviation_at, 1),
         }
     }

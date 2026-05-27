@@ -98,9 +98,7 @@ async fn collect_flags(ctx: &Arc<ServerContext>) -> Vec<(String, String, String,
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let conn = rusqlite::Connection::open(ctx.vault.audit_db_path()).unwrap();
     let mut stmt = conn
-        .prepare(
-            "SELECT action, primitive, flags, status FROM audit_events ORDER BY id ASC",
-        )
+        .prepare("SELECT action, primitive, flags, status FROM audit_events ORDER BY id ASC")
         .unwrap();
     let rows = stmt
         .query_map([], |r| {
@@ -115,7 +113,12 @@ async fn collect_flags(ctx: &Arc<ServerContext>) -> Vec<(String, String, String,
     rows.filter_map(Result::ok).collect()
 }
 
-fn tools_call(profile: &str, primitive: &str, operation: &str, args: serde_json::Value) -> JsonRpcRequest {
+fn tools_call(
+    profile: &str,
+    primitive: &str,
+    operation: &str,
+    args: serde_json::Value,
+) -> JsonRpcRequest {
     JsonRpcRequest {
         jsonrpc: "2.0".into(),
         id: Some(serde_json::json!(1)),
@@ -196,9 +199,9 @@ async fn boundary_unsafe_not_enabled_emits_unsafe_not_enabled_flag() {
 
     let rows = collect_flags(&ctx).await;
     assert!(
-        rows.iter().any(|(_a, _p, flags, status)| flags
-            .contains("unsafe_not_enabled")
-            && status == "error"),
+        rows.iter().any(
+            |(_a, _p, flags, status)| flags.contains("unsafe_not_enabled") && status == "error"
+        ),
         "expected an audit row with flag=unsafe_not_enabled, got: {rows:?}"
     );
 }
@@ -254,10 +257,11 @@ async fn migration_legacy_profile_emits_allowlist_hmac_migrated_flag() {
 
     let rows = collect_flags(&ctx).await;
     assert!(
-        rows.iter().any(|(action, primitive, flags, _s)| action
-            == "allowlist_hmac_migrated"
-            && primitive == kvendra::audit::PRIMITIVE_SYSTEM
-            && flags.contains("allowlist_hmac_migrated")),
+        rows.iter().any(
+            |(action, primitive, flags, _s)| action == "allowlist_hmac_migrated"
+                && primitive == kvendra::audit::PRIMITIVE_SYSTEM
+                && flags.contains("allowlist_hmac_migrated")
+        ),
         "expected dedicated migration row, got: {rows:?}"
     );
 }
