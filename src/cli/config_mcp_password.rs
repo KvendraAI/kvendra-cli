@@ -57,22 +57,34 @@ pub async fn run(cmd: McpPasswordCommand) -> KvendraResult<()> {
 }
 
 fn enable() -> KvendraResult<()> {
-    let password = rpassword::prompt_password("Master password: ")
-        .map_err(|e| KvendraError::Config(format!("failed to read password: {e}")))?;
-    if password.is_empty() {
-        return Err(KvendraError::Config("password is empty".into()));
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(KvendraError::Config(
+            "config mcp-password enable is only available on macOS — \
+             use the KVENDRA_MCP_PASSWORD env var on Linux/Windows \
+             (keychain ACL not available on this platform)"
+                .into(),
+        ))
     }
-    keychain_acl::save_with_user_presence(MCP_PASSWORD_LABEL, &password)
-        .map_err(map_biometric_error)?;
-    println!("Stored mcp-password in OS keychain with presence ACL.");
-    println!();
-    println!("Update your MCP client config (e.g. ~/.claude.json) to:");
-    println!("  \"command\": \"kvendra\",");
-    println!("  \"args\": [\"mcp\", \"serve\", \"--use-keychain\"]");
-    println!("  (remove env.KVENDRA_MCP_PASSWORD if present)");
-    println!();
-    println!("Or run `kvendra config mcp-password migrate-to-keychain-acl`.");
-    Ok(())
+    #[cfg(target_os = "macos")]
+    {
+        let password = rpassword::prompt_password("Master password: ")
+            .map_err(|e| KvendraError::Config(format!("failed to read password: {e}")))?;
+        if password.is_empty() {
+            return Err(KvendraError::Config("password is empty".into()));
+        }
+        keychain_acl::save_with_user_presence(MCP_PASSWORD_LABEL, &password)
+            .map_err(map_biometric_error)?;
+        println!("Stored mcp-password in OS keychain with presence ACL.");
+        println!();
+        println!("Update your MCP client config (e.g. ~/.claude.json) to:");
+        println!("  \"command\": \"kvendra\",");
+        println!("  \"args\": [\"mcp\", \"serve\", \"--use-keychain\"]");
+        println!("  (remove env.KVENDRA_MCP_PASSWORD if present)");
+        println!();
+        println!("Or run `kvendra config mcp-password migrate-to-keychain-acl`.");
+        Ok(())
+    }
 }
 
 fn migrate_to_keychain_acl(home: &Path, client: &str) -> KvendraResult<()> {

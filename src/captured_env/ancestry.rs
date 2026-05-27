@@ -93,6 +93,7 @@ pub fn detect_mcp_client_ancestors() -> Vec<AncestorInfo> {
         .collect()
 }
 
+#[cfg(any(unix, test))]
 fn is_known_mcp_client(comm: &str) -> bool {
     let lower = comm.to_ascii_lowercase();
     KNOWN_MCP_CLIENT_NAMES.iter().any(|name| lower == *name)

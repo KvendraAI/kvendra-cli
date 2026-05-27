@@ -29,7 +29,10 @@ fail()   { printf '\nFAIL [%s]: %s\n' "$1" "$2" >&2; exit "$3"; }
 assert_perm() {
   local f="$1" want="$2"
   local got
-  got=$(stat -f '%A' "$f" 2>/dev/null || stat -c '%a' "$f")
+  # GNU stat (Linux) first, BSD stat (macOS) fallback. `stat -f '%A'` on Linux
+  # silently shows filesystem info (not what we want), so try GNU `-c '%a'`
+  # before BSD `-f '%A'`.
+  got=$(stat -c '%a' "$f" 2>/dev/null || stat -f '%A' "$f")
   [ "$got" = "$want" ] || fail "T1" "perms $f: got 0$got want 0$want" 11
 }
 

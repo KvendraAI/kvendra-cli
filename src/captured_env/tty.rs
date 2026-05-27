@@ -5,6 +5,7 @@
 use crate::captured_env::ancestry::AncestorInfo;
 #[cfg(not(any(unix, windows)))]
 use crate::captured_env::ancestry::walk_ancestors;
+#[cfg(unix)]
 use std::io::Write;
 
 /// Reason `ensure_real_terminal` refused. Each variant maps to one canonical
