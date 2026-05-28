@@ -43,7 +43,10 @@ fn capabilities_emits_valid_compact_json() {
     // REQ-KVD-ECDAE9 / CMP-KVD-CLI text says "24" — stale count from before
     // the `kvendra.github` extension to 8 ops. Authoritative source is
     // `crate::primitives::catalog()`.
-    assert_eq!(total_ops, 25, "must expose 25 ops total per current catalog");
+    assert_eq!(
+        total_ops, 25,
+        "must expose 25 ops total per current catalog"
+    );
 }
 
 #[test]
