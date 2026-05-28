@@ -7,6 +7,28 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-05-28 — `kvendra capabilities` subcommand (broker manifest discovery)
+
+Additive, no breaking. Adds a new top-level `kvendra capabilities` subcommand that emits the canonical broker capabilities manifest as JSON on stdout. Wire-public, read-only, auth-less — designed to be consumed by `kvendra-skills` at runtime (`onboard-project` Step 1.5, `release-manager` IF-MANIFEST sync, `lint-claudemd` primitive cross-check).
+
+### Added
+
+- `kvendra capabilities` — emits a JSON manifest with `broker_version` (matches `CARGO_PKG_VERSION`), `schema_version: 1` (stable wire contract), and `primitives[]` with `{id, ops, destructive_ops, vault_profile_pattern, since_version, deprecated_in?}`. Covers the 8 canonical primitives × 24 ops. Zero vault unlock, zero network IO, zero filesystem writes (`AC-CLI-3`).
+- `kvendra capabilities --pretty` — multi-line indented JSON for human reading (`AC-CLI-9`). Default output is compact single-line JSON.
+- Manifest schema versioning contract (`AC-CLI-8`): `schema_version: 1` is stable. Consumers MUST verify `schema_version == 1`. Bumping requires a major REQ + IF-MANIFEST schema bump in lockstep.
+- Snapshot + invariant unit tests in `src/cli/capabilities.rs` (8 primitives, 24 ops, `destructive_ops ⊆ ops`, deterministic order, compact vs pretty round-trip).
+
+### Trazabilidad
+
+- Implementa: `REQ-KVD-ECDAE9` (`scope: Piece A`, ACs `AC-CLI-1..9`).
+- ROAD: `ROAD-KVD-SKILLS-C20D24` M2 first item.
+- TXN: `TXN-KVD-20260528-005`.
+- Sibling REL (downstream consumer): `REL-KVD-SKILLS-N.alpha` (release-manager extension) + `REL-KVD-SKILLS-N+1` (onboard-project Step 1.5 + STD-TPL library).
+
+### Distribution
+
+- `cargo publish` of `0.5.0` is gated to PHASE 3 owner-manual per `STD-KVD-57DAE1`. Until then, the subcommand is locally testable via `cargo build --release && ./target/release/kvendra capabilities --pretty`.
+
 ## [0.4.1] — 2026-05-27 — kvendra.github primitive: create_issue + list_issues + yank-recovery stable
 
 Aditivo, no breaking. Extiende el primitive `kvendra.github` con dos nuevas operations para soportar sync bidireccional KB↔GitHub Issues.

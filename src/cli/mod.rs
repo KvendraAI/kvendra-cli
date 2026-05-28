@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod backup;
+pub mod capabilities;
 pub mod completion;
 pub mod config_approval;
 pub mod config_cmd;
@@ -82,6 +83,9 @@ pub enum Commands {
     /// Notification preferences (REQ-KVD-CLI-006).
     #[command(subcommand)]
     Notifs(notifs::NotifsCommand),
+    /// Emit the canonical broker capabilities manifest as JSON (read-only,
+    /// auth-less). Consumed by kvendra-skills (REQ-KVD-ECDAE9).
+    Capabilities(capabilities::CapabilitiesArgs),
 }
 
 #[derive(Debug, Subcommand)]

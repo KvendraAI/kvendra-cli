@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Config(cmd) => kvendra::cli::config_cmd::run(cmd).await?,
         Commands::Backup(cmd) => kvendra::cli::backup::run(cmd).await?,
         Commands::Notifs(cmd) => kvendra::cli::notifs::run(cmd).await?,
+        Commands::Capabilities(args) => kvendra::cli::capabilities::run(&args)?,
     }
     Ok(())
 }
