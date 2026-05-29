@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod backup;
+pub mod bypass;
 pub mod capabilities;
 pub mod completion;
 pub mod config_approval;
@@ -86,6 +87,27 @@ pub enum Commands {
     /// Emit the canonical broker capabilities manifest as JSON (read-only,
     /// auth-less). Consumed by kvendra-skills (REQ-KVD-ECDAE9).
     Capabilities(capabilities::CapabilitiesArgs),
+    /// Break-glass: grant a signed, scoped, TTL-bounded bypass of the
+    /// kvendra-skills hook enforcement for the current workspace
+    /// (REQ-KVD-SKILLS-41032D). Requires the master password every time.
+    Bypass(bypass::BypassArgs),
+    /// Revoke the current workspace's bypass grant immediately (mirror of
+    /// `lock`; no credential required).
+    Protect(ProtectArgs),
+    /// Print the pinned ed25519 grant-signing public key (base64). Auth-less,
+    /// read-only — consumed by the hook / `sync-claudemd`.
+    GrantPubkey,
+    /// Internal: verify a bypass grant from a JSON stdin request. Exit 0 if
+    /// the grant applies, 2 (fail-closed) otherwise. Consumed by the hook.
+    VerifyGrant,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ProtectArgs {
+    /// Workspace root whose grant to revoke. Defaults to the current
+    /// directory.
+    #[arg(long, value_name = "PATH")]
+    pub workspace_root: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]

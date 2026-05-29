@@ -63,6 +63,28 @@ pub const FLAG_SESSION_BLOB_MACHINE_MISMATCH: &str = "session_blob_machine_misma
 /// vault-locked-pending-unlock` and records this flag at severity `warn`.
 pub const FLAG_TOOL_CALL_BLOCKED_PENDING_UNLOCK: &str = "tool_call_blocked_pending_unlock";
 
+// ─── Break-glass bypass grant (REQ-KVD-SKILLS-41032D / ISSUE-KVD-CLI-238B54).
+//     Canonical flag strings for the `kvendra bypass` / `protect` /
+//     `verify-grant` lifecycle. Defined here so dashboards and `audit verify`
+//     filters can match exact bytes and the AC-AUDIT-1 trace can reconstruct
+//     which ops were relaxed, when, and for how long.
+
+/// `kvendra bypass` granted a signed grant (records scope + TTL + workspace).
+pub const FLAG_BYPASS_GRANTED: &str = "bypass_granted";
+
+/// `kvendra protect` (or `kvendra lock` auto-revoke) revoked a grant.
+pub const FLAG_BYPASS_REVOKED: &str = "bypass_revoked";
+
+/// A grant was found expired at verification time (TTL elapsed).
+pub const FLAG_BYPASS_EXPIRED: &str = "bypass_expired";
+
+/// A valid in-scope grant relaxed an op at `verify-grant` time (the hook
+/// allowed an otherwise-blocked op).
+pub const FLAG_BYPASS_USED: &str = "bypass_used";
+
+/// A grant failed signature verification — tamper or a foreign/rotated key.
+pub const FLAG_BYPASS_SIG_INVALID: &str = "bypass_sig_invalid";
+
 /// Status field of an audit row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

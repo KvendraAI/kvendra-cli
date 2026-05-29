@@ -20,6 +20,7 @@ pub mod cli;
 pub mod config;
 pub mod detection;
 pub mod error;
+pub mod grant;
 pub mod keychain_acl;
 pub mod mcp;
 pub mod primitives;

@@ -46,6 +46,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Backup(cmd) => kvendra::cli::backup::run(cmd).await?,
         Commands::Notifs(cmd) => kvendra::cli::notifs::run(cmd).await?,
         Commands::Capabilities(args) => kvendra::cli::capabilities::run(&args)?,
+        Commands::Bypass(args) => kvendra::cli::bypass::run_bypass(args).await?,
+        Commands::Protect(args) => kvendra::cli::bypass::run_protect(args.workspace_root).await?,
+        Commands::GrantPubkey => kvendra::cli::bypass::run_grant_pubkey()?,
+        Commands::VerifyGrant => kvendra::cli::bypass::run_verify_grant().await?,
     }
     Ok(())
 }
