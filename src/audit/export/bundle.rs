@@ -46,6 +46,12 @@ pub struct ExportedEvent {
     pub hmac_version: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_audit_id: Option<String>,
+    /// Diagnostic code for error rows (v3+). Bound to the HMAC chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Sanitized error detail for error rows (v3+). Bound to the HMAC chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +102,14 @@ pub fn build_bundle(
             current_hmac_hex: ev.hmac_hex.clone(),
             hmac_version: ev.hmac_version,
             remote_audit_id: ev.remote_audit_id.clone(),
+            error_code: ev.error_code.clone(),
+            // error_message is cloned verbatim — it was already scrubbed
+            // through `crate::detection::sanitize_output` at write time (the
+            // SAME secret redactor that protects every outbound payload), and
+            // it is committed to the v3 HMAC. Running the *export* redactor
+            // (different regex set) over it here would alter the bytes and
+            // break `verify_bundle`'s HMAC recomputation, so we do not.
+            error_message: ev.error_message.clone(),
         })
         .collect();
 

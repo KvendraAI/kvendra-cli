@@ -334,6 +334,8 @@ pub fn build_pre_dispatch_event(
         },
         flags: flags.join(","),
         remote_audit_id: None,
+        error_code: None,
+        error_message: None,
     }
 }
 

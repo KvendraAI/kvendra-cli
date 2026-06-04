@@ -146,9 +146,24 @@ async fn run_legacy(args: AuditArgs) -> KvendraResult<()> {
     }
 
     for ev in events {
+        // Append the v3 diagnostic on error rows so the plain-text listing is
+        // self-diagnosing (ISSUE-KVD-CLI-6C43AA). --json carries the structured
+        // fields; here we render a compact `[CODE] message` tail.
+        let err_tail = match (ev.status.as_str(), &ev.error_code, &ev.error_message) {
+            ("error", Some(code), Some(msg)) => format!("  [{code}] {msg}"),
+            ("error", Some(code), None) => format!("  [{code}]"),
+            _ => String::new(),
+        };
         println!(
-            "{:>5} {} {:>15} {:<26} {:<10} {} {}",
-            ev.id, ev.ts_unix_ms, ev.profile_id, ev.primitive, ev.action, ev.status, ev.severity
+            "{:>5} {} {:>15} {:<26} {:<10} {} {}{}",
+            ev.id,
+            ev.ts_unix_ms,
+            ev.profile_id,
+            ev.primitive,
+            ev.action,
+            ev.status,
+            ev.severity,
+            err_tail
         );
     }
     Ok(())

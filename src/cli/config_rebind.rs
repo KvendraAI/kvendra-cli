@@ -221,6 +221,10 @@ pub async fn rebind_inner(
                 severity: Severity::Warn,
                 flags: format!("recovery_code_replay_attempted,slot_{slot}"),
                 remote_audit_id: None,
+                // System replay-detection row — the forensic signal is the
+                // flag; the primitive error taxonomy does not apply here.
+                error_code: None,
+                error_message: None,
             };
             writer.record(event).await?;
             writer.shutdown().await;
@@ -289,6 +293,8 @@ pub async fn rebind_inner(
         severity: Severity::Warn,
         flags: format!("home_rebound,recovery_code_consumed:slot_{slot_idx}"),
         remote_audit_id: None,
+        error_code: None,
+        error_message: None,
     };
     writer.record(event).await?;
     writer.shutdown().await;

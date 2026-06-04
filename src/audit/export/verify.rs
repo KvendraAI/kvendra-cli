@@ -2,7 +2,7 @@
 
 use crate::audit::export::bundle::ExportBundle;
 use crate::audit::export::json_canonical::read_json_canonical;
-use crate::audit::hmac::{compute_hmac_v1, compute_hmac_v2};
+use crate::audit::hmac::{compute_hmac_v1, compute_hmac_v2, compute_hmac_v3};
 use crate::error::{KvendraError, KvendraResult};
 use std::path::Path;
 
@@ -48,7 +48,24 @@ pub fn verify_bundle(bundle: &ExportBundle) -> KvendraResult<VerifyOutcome> {
                 ),
             });
         }
-        let recomputed = if ev.hmac_version >= 2 {
+        let recomputed = if ev.hmac_version >= 3 {
+            compute_hmac_v3(
+                &key,
+                ev.audit_id,
+                ev.ts_unix_ms,
+                &ev.profile_id,
+                &ev.primitive,
+                &ev.action,
+                &ev.args_hash_hex,
+                &ev.result_status,
+                &ev.severity,
+                &ev.flags,
+                &ev.previous_hmac_hex,
+                ev.remote_audit_id.as_deref(),
+                ev.error_code.as_deref(),
+                ev.error_message.as_deref(),
+            )
+        } else if ev.hmac_version == 2 {
             compute_hmac_v2(
                 &key,
                 ev.audit_id,
@@ -131,6 +148,8 @@ mod tests {
                 hmac_hex: String::new(),
                 remote_audit_id: None,
                 hmac_version: 2,
+                error_code: None,
+                error_message: None,
             };
             let h = compute_hmac_v2(
                 key,

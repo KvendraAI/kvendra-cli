@@ -165,13 +165,30 @@ async fn run_loop(
                             "warning" | "started" => Color::Yellow,
                             _ => Color::White,
                         };
+                        // For error rows, surface the v3 `error_code` (and a
+                        // short slice of the sanitized message) right next to
+                        // the status so a failure is diagnosable in the TUI
+                        // without dropping to `audit --json` (ISSUE-KVD-CLI-6C43AA).
+                        let err_suffix = if ev.status == "error" {
+                            match (&ev.error_code, &ev.error_message) {
+                                (Some(code), Some(msg)) => {
+                                    let m: String = msg.chars().take(80).collect();
+                                    format!(" {code}: {m}")
+                                }
+                                (Some(code), None) => format!(" {code}"),
+                                _ => String::new(),
+                            }
+                        } else {
+                            String::new()
+                        };
                         let text = format!(
-                            "[{ts}] [{pid}] {prim}.{act} {st} (id={id})",
+                            "[{ts}] [{pid}] {prim}.{act} {st}{err} (id={id})",
                             ts = ev.ts_unix_ms,
                             pid = ev.profile_id,
                             prim = ev.primitive,
                             act = ev.action,
                             st = ev.status,
+                            err = err_suffix,
                             id = ev.id,
                         );
                         ListItem::new(Line::from(Span::styled(text, Style::default().fg(color))))

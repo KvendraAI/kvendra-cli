@@ -556,6 +556,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             &flags,
             true,
             None,
+            Some(&KvendraError::VaultLocked),
         )
         .await;
         let data = serde_json::json!({
@@ -597,6 +598,10 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             }
             Decision::Error => {
                 flags.push("detection_error".into());
+                let det_err = KvendraError::DetectionBlocked(format!(
+                    "{} secret pattern hit(s) on inbound args, severity=error",
+                    detection_hits.len()
+                ));
                 let _ = record_audit(
                     &ctx,
                     &arguments,
@@ -606,6 +611,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
                     &flags,
                     true,
                     None,
+                    Some(&det_err),
                 )
                 .await;
                 return JsonRpcResponse::error(
@@ -622,6 +628,10 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
                 if !profile_id.is_empty() {
                     let _ = ctx.vault.mark_quarantined(&profile_id);
                 }
+                let det_err = KvendraError::DetectionBlocked(format!(
+                    "{} secret pattern hit(s) on inbound args, severity=block — profile quarantined",
+                    detection_hits.len()
+                ));
                 let _ = record_audit(
                     &ctx,
                     &arguments,
@@ -631,6 +641,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
                     &flags,
                     true,
                     None,
+                    Some(&det_err),
                 )
                 .await;
                 return JsonRpcResponse::error(
@@ -652,6 +663,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             Ok(MigrationOutcome::Unchanged) | Ok(MigrationOutcome::Migrated) => {}
             Err(KvendraError::AllowlistTampered(pid)) => {
                 flags.push("allowlist_tampered_detected".into());
+                let tamper_err = KvendraError::AllowlistTampered(pid.clone());
                 let _ = record_audit(
                     &ctx,
                     &arguments,
@@ -661,6 +673,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
                     &flags,
                     true,
                     None,
+                    Some(&tamper_err),
                 )
                 .await;
                 let data = serde_json::json!({
@@ -691,6 +704,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
                     &flags,
                     true,
                     None,
+                    Some(&e),
                 )
                 .await;
                 // AC-MCP-3 defence in depth: the error string can include the
@@ -711,6 +725,10 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         flags.push(flag.into());
     }
     if approval_decision.blocks_dispatch() {
+        // APPROVAL_DENIED — the error_type detail also rides in `flags` via
+        // `approval_decision.audit_flag()`, so the code+message pair stays
+        // aggregatable while preserving the nuance.
+        let approval_err = KvendraError::BiometricRejected;
         let _ = record_audit(
             &ctx,
             &arguments,
@@ -720,6 +738,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             &flags,
             true,
             None,
+            Some(&approval_err),
         )
         .await;
         let error_type = approval_decision.error_type().unwrap_or("approval_failed");
@@ -751,6 +770,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             &flags,
             true,
             None,
+            Some(&KvendraError::AllowlistCacheStale),
         )
         .await;
         return JsonRpcResponse::error(
@@ -798,6 +818,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
                     &flags,
                     true,
                     None,
+                    Some(&other),
                 )
                 .await;
                 return JsonRpcResponse::error(id, codes::APPLICATION_ERROR, msg);
@@ -822,6 +843,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         &flags,
         false,
         remote_audit_id_for_event.as_deref(),
+        None,
     )
     .await
     .unwrap_or_default();
@@ -837,10 +859,24 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         | Err(KvendraError::DetectionBlocked(_)) => (Status::Error, Severity::Warn),
         Err(_) => (Status::Error, Severity::Error),
     };
+    // On the error path, classify a closed-vocabulary `error_code` and capture
+    // a SANITIZED `error_message` (ISSUE-KVD-CLI-6C43AA). `crate::audit::
+    // error_code::from_error` scrubs the text through the same secret redactor
+    // used for outbound MCP payloads, so no PAT / password / token can land in
+    // the audit DB. Both are committed to the v3 HMAC.
+    let (err_code, err_msg) = match &outcome {
+        Err(e) => {
+            let (code, msg) = crate::audit::error_code::from_error(e);
+            (Some(code.as_str().to_string()), Some(msg))
+        }
+        Ok(_) => (None, None),
+    };
     if let Some(w) = ctx.audit_writer()
         && event_id > 0
     {
-        let _ = w.update_status(event_id, status, severity).await;
+        let _ = w
+            .update_status(event_id, status, severity, err_code, err_msg)
+            .await;
     }
 
     match outcome {
@@ -919,9 +955,21 @@ async fn record_audit(
     flags: &[String],
     failed_pre_dispatch: bool,
     remote_audit_id: Option<&str>,
+    error: Option<&KvendraError>,
 ) -> KvendraResult<i64> {
     let Some(w) = ctx.audit_writer() else {
         return Err(KvendraError::Audit("audit disabled (vault locked)".into()));
+    };
+    // For pre-dispatch rejections (allowlist/detection/approval/stale) the row
+    // is written directly as `Status::Error`; classify + sanitize the diagnostic
+    // here so the forensic columns are populated on the same row
+    // (ISSUE-KVD-CLI-6C43AA).
+    let (error_code, error_message) = match (failed_pre_dispatch, error) {
+        (true, Some(e)) => {
+            let (code, msg) = crate::audit::error_code::from_error(e);
+            (Some(code.as_str().to_string()), Some(msg))
+        }
+        _ => (None, None),
     };
     let event = AuditEvent {
         ts_unix_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 / 1_000_000,
@@ -941,6 +989,8 @@ async fn record_audit(
         },
         flags: flags.join(","),
         remote_audit_id: remote_audit_id.map(str::to_string),
+        error_code,
+        error_message,
     };
     w.record(event).await
 }
@@ -1025,6 +1075,8 @@ async fn enforce_allowlist(
                     severity: Severity::Info,
                     flags: "allowlist_hmac_migrated".to_string(),
                     remote_audit_id: None,
+                    error_code: None,
+                    error_message: None,
                 };
                 writer.record(event).await?;
             }
@@ -1950,6 +2002,7 @@ mod tests {
             "ping",
             &["mcp_self_heal_from_pending".to_string()],
             false,
+            None,
             None,
         )
         .await

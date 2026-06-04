@@ -18,6 +18,7 @@ pub fn write_csv(path: &Path, bundle: &ExportBundle) -> KvendraResult<()> {
             "args_summary",
             "result_status",
             "error_kind",
+            "error_message",
             "severity",
             "flags",
             "hmac_chain_id",
@@ -29,6 +30,9 @@ pub fn write_csv(path: &Path, bundle: &ExportBundle) -> KvendraResult<()> {
         for ev in &bundle.events {
             let audit_id = ev.audit_id.to_string();
             let ts_ms = ev.ts_unix_ms.to_string();
+            // `error_kind` now carries the v3 closed-vocabulary code;
+            // `error_message` the sanitized detail. Both empty for non-error
+            // and pre-v3 rows.
             wtr.write_record([
                 &ev.timestamp_iso8601,
                 &ev.profile_id,
@@ -36,7 +40,8 @@ pub fn write_csv(path: &Path, bundle: &ExportBundle) -> KvendraResult<()> {
                 &ev.action,
                 &ev.args_summary,
                 &ev.result_status,
-                "", // error_kind — el StoredEvent no lo lleva separado actualmente
+                ev.error_code.as_deref().unwrap_or(""),
+                ev.error_message.as_deref().unwrap_or(""),
                 &ev.severity,
                 &ev.flags,
                 &audit_id,

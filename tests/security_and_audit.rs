@@ -242,6 +242,8 @@ async fn populate_audit_log(home: &std::path::Path, hmac_key: Vec<u8>) {
             severity: Severity::Info,
             flags: String::new(),
             remote_audit_id: None,
+            error_code: None,
+            error_message: None,
         };
         writer.record(ev).await.unwrap();
     }
@@ -371,10 +373,12 @@ async fn audit_verify_passes_after_status_update() {
             severity: Severity::Info,
             flags: String::new(),
             remote_audit_id: None,
+            error_code: None,
+            error_message: None,
         };
         let id = writer.record(ev).await.unwrap();
         writer
-            .update_status(id, Status::Ok, Severity::Info)
+            .update_status(id, Status::Ok, Severity::Info, None, None)
             .await
             .unwrap();
     }

@@ -3,6 +3,7 @@
 //! Public API: [`AuditEvent`], [`AuditLog`], [`AuditWriter`].
 
 pub mod bootstrap;
+pub mod error_code;
 pub mod export;
 pub mod hmac;
 pub mod migrations;
@@ -140,6 +141,17 @@ pub struct AuditEvent {
     /// that pre-dates the v2 migration (REQ-KVD-CLI-010).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_audit_id: Option<String>,
+    /// Closed-vocabulary diagnostic code for `status:error` rows
+    /// (ISSUE-KVD-CLI-6C43AA). `None` for `started`/`ok` rows and for every
+    /// row that pre-dates the v3 migration. Persisted as the
+    /// SCREAMING_SNAKE_CASE string of [`error_code::AuditErrorCode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Free-form, **sanitized** human-readable failure detail for
+    /// `status:error` rows. Scrubbed through `crate::detection::sanitize_output`
+    /// before it reaches this field — never contains plaintext secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 pub use writer::AuditWriter;

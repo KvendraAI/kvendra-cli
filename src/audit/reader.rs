@@ -1,6 +1,6 @@
 //! Audit reader — query / export / verify HMAC chain.
 
-use crate::audit::hmac::{compute_hmac_v1, compute_hmac_v2};
+use crate::audit::hmac::{compute_hmac_v1, compute_hmac_v2, compute_hmac_v3};
 use crate::audit::schema::init;
 use crate::error::{KvendraError, KvendraResult};
 use rusqlite::Connection;
@@ -23,9 +23,17 @@ pub struct StoredEvent {
     /// ULID of the remote audit counterpart. `None` for local-mode rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_audit_id: Option<String>,
-    /// HMAC layout version (1 = legacy, 2 = post-v2 migration). Defaults to
-    /// 1 for rows that pre-date the schema migration.
+    /// HMAC layout version (1 = legacy, 2 = remote_audit_id, 3 = error
+    /// diagnostics). Defaults to 1 for rows that pre-date the schema
+    /// migration; selects which `compute_hmac_vN` `verify_chain` recomputes.
     pub hmac_version: i64,
+    /// Closed-vocabulary diagnostic code for `status:error` rows
+    /// (ISSUE-KVD-CLI-6C43AA). `None` for ok/started rows and pre-v3 rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Sanitized human-readable failure detail. `None` for non-error rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 pub fn open_readonly(db_path: &Path) -> KvendraResult<Connection> {
@@ -42,7 +50,7 @@ pub fn list_all(conn: &Connection) -> KvendraResult<Vec<StoredEvent>> {
     let mut stmt = conn.prepare(
         "SELECT id, ts_unix_ms, profile_id, primitive, action, args_hash_hex,
          status, severity, flags, prev_hmac_hex, hmac_hex,
-         remote_audit_id, hmac_version
+         remote_audit_id, hmac_version, error_code, error_message
          FROM audit_events ORDER BY id ASC",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -60,6 +68,8 @@ pub fn list_all(conn: &Connection) -> KvendraResult<Vec<StoredEvent>> {
             hmac_hex: row.get(10)?,
             remote_audit_id: row.get(11)?,
             hmac_version: row.get(12)?,
+            error_code: row.get(13)?,
+            error_message: row.get(14)?,
         })
     })?;
     let mut out = Vec::new();
@@ -79,7 +89,24 @@ pub fn verify_chain(conn: &Connection, hmac_key: &[u8]) -> KvendraResult<()> {
         if ev.prev_hmac_hex != prev {
             return Err(KvendraError::AuditChainBroken(ev.id));
         }
-        let recomputed = if ev.hmac_version >= 2 {
+        let recomputed = if ev.hmac_version >= 3 {
+            compute_hmac_v3(
+                hmac_key,
+                ev.id,
+                ev.ts_unix_ms,
+                &ev.profile_id,
+                &ev.primitive,
+                &ev.action,
+                &ev.args_hash_hex,
+                &ev.status,
+                &ev.severity,
+                &ev.flags,
+                &ev.prev_hmac_hex,
+                ev.remote_audit_id.as_deref(),
+                ev.error_code.as_deref(),
+                ev.error_message.as_deref(),
+            )
+        } else if ev.hmac_version == 2 {
             compute_hmac_v2(
                 hmac_key,
                 ev.id,

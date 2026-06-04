@@ -110,10 +110,18 @@ async fn audit_chain_remains_intact_when_tampering_event_appended() {
         args_hash_hex: kvendra::audit::reader::args_hash_hex(&serde_json::json!({})),
         flags: "allowlist_tampered_detected".into(),
         remote_audit_id: None,
+        error_code: None,
+        error_message: None,
     };
     let row_id = writer.record(event).await.unwrap();
     writer
-        .update_status(row_id, Status::Error, Severity::Error)
+        .update_status(
+            row_id,
+            Status::Error,
+            Severity::Error,
+            Some("ALLOWLIST_TAMPERED".to_string()),
+            Some("allowlist for profile 'p' has been tampered".to_string()),
+        )
         .await
         .unwrap();
     writer.shutdown().await;

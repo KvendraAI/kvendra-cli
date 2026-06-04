@@ -195,6 +195,8 @@ async fn record_event(
         severity,
         flags: flag.into(),
         remote_audit_id: None,
+        error_code: None,
+        error_message: None,
     };
     writer.record(event).await?;
     writer.shutdown().await;

@@ -20,7 +20,11 @@ use std::path::Path;
 use time::OffsetDateTime;
 
 /// Current schema version this binary writes.
-pub const CURRENT_VERSION: i64 = 2;
+///
+/// - v1: baseline.
+/// - v2: `remote_audit_id` + `hmac_version` (REQ-KVD-CLI-010).
+/// - v3: `error_code` + `error_message` (ISSUE-KVD-CLI-6C43AA).
+pub const CURRENT_VERSION: i64 = 3;
 
 /// Copy `audit.db` to `audit.db.backup.<unix_ts>` before a destructive
 /// migration. Best-effort — failure to backup does not abort the migration
@@ -115,31 +119,38 @@ pub fn apply_pending(conn: &Connection) -> KvendraResult<()> {
     let applied = current_version(conn)?;
 
     if applied == 0 {
-        // Baseline detection: if the v2 columns already exist on disk
-        // (manual ALTER or rolled-forward DB), record v2 directly. Otherwise
-        // record v1 and let `apply_v2` upgrade.
+        // Baseline detection: if the v2/v3 columns already exist on disk
+        // (manual ALTER or rolled-forward DB), record the matching versions
+        // directly. Otherwise record v1 and let `apply_vN` upgrade.
+        insert_version(conn, 1)?;
         if audit_events_has_remote_audit_id(conn)? {
-            insert_version(conn, 1)?;
             insert_version(conn, 2)?;
-        } else {
-            insert_version(conn, 1)?;
+        }
+        if column_exists(conn, "audit_events", "error_code")? {
+            insert_version(conn, 3)?;
         }
     }
 
     let applied = current_version(conn)?;
-    if applied < 2 {
-        if let Some(db_path) = conn.path().filter(|p| !p.is_empty()) {
-            let p = Path::new(db_path);
-            if p.is_file()
-                && let Some(backup) = backup_audit_db(p)
-            {
-                tracing::info!(
-                    backup = %backup.display(),
-                    "audit.db backed up before v1→v2 migration"
-                );
-            }
+    if applied < CURRENT_VERSION
+        && let Some(db_path) = conn.path().filter(|p| !p.is_empty())
+    {
+        let p = Path::new(db_path);
+        if p.is_file()
+            && let Some(backup) = backup_audit_db(p)
+        {
+            tracing::info!(
+                backup = %backup.display(),
+                "audit.db backed up before schema migration"
+            );
         }
+    }
+
+    if applied < 2 {
         apply_v2(conn)?;
+    }
+    if current_version(conn)? < 3 {
+        apply_v3(conn)?;
     }
     Ok(())
 }
@@ -204,6 +215,58 @@ fn apply_v2(conn: &Connection) -> KvendraResult<()> {
     Ok(())
 }
 
+/// Apply migration v3 (ISSUE-KVD-CLI-6C43AA): add the `error_code` +
+/// `error_message` columns, both `TEXT NULL`, then mark v3 applied.
+///
+/// HMAC chain preservation: this is purely additive with NULL defaults, so the
+/// bytes consumed by `compute_hmac_v1` / `compute_hmac_v2` for every existing
+/// row are unchanged and those rows keep verifying under their recorded
+/// `hmac_version`. New rows write `hmac_version = 3` and commit the two new
+/// columns via `compute_hmac_v3`; rows whose error fields are NULL still
+/// verify because v3 canonicalizes NULL to the empty string.
+fn apply_v3(conn: &Connection) -> KvendraResult<()> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| KvendraError::AuditMigrationAborted(format!("begin tx: {e}")))?;
+    if !column_exists(&tx, "audit_events", "error_code")? {
+        tx.execute(
+            "ALTER TABLE audit_events ADD COLUMN error_code TEXT NULL",
+            [],
+        )
+        .map_err(|e| KvendraError::AuditMigrationAborted(format!("ALTER error_code: {e}")))?;
+    }
+    if !column_exists(&tx, "audit_events", "error_message")? {
+        tx.execute(
+            "ALTER TABLE audit_events ADD COLUMN error_message TEXT NULL",
+            [],
+        )
+        .map_err(|e| KvendraError::AuditMigrationAborted(format!("ALTER error_message: {e}")))?;
+    }
+    // Partial index over the diagnostic code so forensic filters
+    // (`WHERE error_code = ?`) stay fast without bloating the index with the
+    // overwhelmingly-NULL ok/started rows.
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_audit_error_code \
+         ON audit_events(error_code) WHERE error_code IS NOT NULL",
+    )
+    .map_err(|e| KvendraError::AuditMigrationAborted(format!("CREATE INDEX error_code: {e}")))?;
+
+    let now = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| String::new());
+    tx.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+        rusqlite::params![3_i64, now],
+    )
+    .map_err(|e| {
+        KvendraError::AuditMigrationAborted(format!("INSERT schema_migrations v3: {e}"))
+    })?;
+
+    tx.commit()
+        .map_err(|e| KvendraError::AuditMigrationAborted(format!("commit tx: {e}")))?;
+    Ok(())
+}
+
 fn column_exists(conn: &Connection, table: &str, column: &str) -> KvendraResult<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
@@ -250,11 +313,11 @@ mod tests {
         let conn = fresh_db();
         apply_pending(&conn).unwrap();
         let v = current_version(&conn).unwrap();
-        assert_eq!(v, 2);
-        // Run 10 more times — version stays at 2, no errors.
+        assert_eq!(v, CURRENT_VERSION);
+        // Run 10 more times — version stays at CURRENT_VERSION, no errors.
         for _ in 0..10 {
             apply_pending(&conn).unwrap();
-            assert_eq!(current_version(&conn).unwrap(), 2);
+            assert_eq!(current_version(&conn).unwrap(), CURRENT_VERSION);
         }
     }
 
@@ -264,6 +327,55 @@ mod tests {
         apply_pending(&conn).unwrap();
         assert!(column_exists(&conn, "audit_events", "remote_audit_id").unwrap());
         assert!(column_exists(&conn, "audit_events", "hmac_version").unwrap());
+    }
+
+    #[test]
+    fn apply_pending_adds_v3_error_columns() {
+        let conn = fresh_db();
+        apply_pending(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert!(column_exists(&conn, "audit_events", "error_code").unwrap());
+        assert!(column_exists(&conn, "audit_events", "error_message").unwrap());
+    }
+
+    #[test]
+    fn v3_migration_preserves_legacy_v1_rows() {
+        // A v1-shape DB with a pre-existing row: after migrating to v3 the row
+        // is untouched (error columns NULL) and the HMAC it carried is still
+        // recomputable under v1.
+        let conn = fresh_db();
+        let h = crate::audit::hmac::compute_hmac_v1(
+            b"key",
+            1,
+            123,
+            "p",
+            "kvendra.git",
+            "push",
+            "ab",
+            "error",
+            "warn",
+            "",
+            "",
+        );
+        conn.execute(
+            "INSERT INTO audit_events (id, ts_unix_ms, profile_id, primitive, action,
+             args_hash_hex, status, severity, flags, prev_hmac_hex, hmac_hex)
+             VALUES (1, 123, 'p', 'kvendra.git', 'push', 'ab', 'error', 'warn', '', '', ?1)",
+            [&h],
+        )
+        .unwrap();
+        apply_pending(&conn).unwrap();
+        // Columns exist, but the legacy row's error fields are NULL.
+        let (ec, em, hv): (Option<String>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT error_code, error_message, hmac_version FROM audit_events WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(ec.is_none());
+        assert!(em.is_none());
+        assert_eq!(hv, 1, "pre-existing row keeps hmac_version=1");
     }
 
     #[test]
@@ -282,7 +394,9 @@ mod tests {
         )
         .unwrap();
         apply_pending(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 2);
+        // The v2 columns pre-existed (recorded as v2), then v3 rolls forward.
+        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert!(column_exists(&conn, "audit_events", "error_code").unwrap());
     }
 
     #[test]

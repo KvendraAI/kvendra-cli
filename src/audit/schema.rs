@@ -12,7 +12,10 @@ pub fn init(conn: &Connection) -> KvendraResult<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
 
-    // v1 baseline tables.
+    // v1 baseline tables. We keep the CREATE at the v1 shape so the migration
+    // ladder (apply_pending) is exercised identically for both fresh and
+    // upgraded DBs — `remote_audit_id`/`hmac_version` (v2) and
+    // `error_code`/`error_message` (v3) are added by their migration steps.
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS audit_events (
