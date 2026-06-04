@@ -42,6 +42,14 @@ pub struct RebindHomeArgs {
     #[cfg(test)]
     #[arg(long, hide = true)]
     pub test_assume_tty: bool,
+    /// Test-only: force the strict no-TTY guard to treat stdin as
+    /// non-terminal, so the reject path is hermetic regardless of the real
+    /// controlling terminal (ISSUE-KVD-CLI-6EA6D4). Without this, the test
+    /// reaches `rpassword::read_password()` and HANGS in an interactive
+    /// terminal. Never present in production builds.
+    #[cfg(test)]
+    #[arg(long, hide = true)]
+    pub test_force_no_tty: bool,
 }
 
 #[cfg(not(test))]
@@ -49,12 +57,22 @@ impl RebindHomeArgs {
     fn assume_tty_override(&self) -> bool {
         false
     }
+    fn stdin_is_terminal(&self) -> bool {
+        std::io::stdin().is_terminal()
+    }
 }
 
 #[cfg(test)]
 impl RebindHomeArgs {
     fn assume_tty_override(&self) -> bool {
         self.test_assume_tty
+    }
+    fn stdin_is_terminal(&self) -> bool {
+        if self.test_force_no_tty {
+            false
+        } else {
+            std::io::stdin().is_terminal()
+        }
     }
 }
 
@@ -71,7 +89,7 @@ pub async fn run(args: RebindHomeArgs) -> KvendraResult<()> {
     }
 
     // Strict no-TTY policy (D4=A).
-    if !args.assume_tty_override() && !std::io::stdin().is_terminal() {
+    if !args.assume_tty_override() && !args.stdin_is_terminal() {
         return Err(KvendraError::RebindRequiresTty);
     }
 
@@ -368,12 +386,15 @@ mod tests {
     }
 
     /// REQ-KVD-008 AC-REBIND-4 — strict reject when stdin is not a TTY (D4=A).
-    /// Test-only flag `--test-assume-tty=false` keeps the production policy.
+    /// Hermetic via `test_force_no_tty: true` (ISSUE-KVD-CLI-6EA6D4): the guard
+    /// treats stdin as non-terminal regardless of the real terminal, so the
+    /// reject fires BEFORE `rpassword::read_password()` — it can never hang,
+    /// even in an interactive terminal.
     #[tokio::test]
     async fn rebind_home_no_tty_rejects_strict() {
-        // We exercise the production path: `assume_tty_override()` returns
-        // false unless `--test-assume-tty` is passed. In the cargo test
-        // harness `stdin` is typically not a TTY, so the strict reject hits.
+        // `assume_tty_override()` stays false (production policy); `stdin_is_terminal()`
+        // is forced false via `test_force_no_tty`, so the strict reject hits
+        // deterministically without reading any input.
         let tmp = TempDir::new().unwrap();
         let dest = TempDir::new().unwrap();
         let _v = bootstrap_vault(tmp.path());
@@ -387,6 +408,7 @@ mod tests {
             let args = RebindHomeArgs {
                 new_path: dest.path().to_path_buf(),
                 test_assume_tty: false,
+                test_force_no_tty: true,
             };
             // `run` short-circuits on the no-TTY check before the first
             // await — running it as a future and polling once would also

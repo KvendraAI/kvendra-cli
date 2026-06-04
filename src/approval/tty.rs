@@ -21,8 +21,43 @@ const TTY_OUTPUT_PATH: &str = "CONOUT$";
 const TTY_INPUT_PATH: &str = "CONIN$";
 
 /// Backend canónico para producción.
-#[derive(Default)]
-pub struct TtyApprovalBackend;
+///
+/// Holds the terminal paths it opens. Production uses [`Default`]
+/// (`/dev/tty` on Unix, `CONOUT$`/`CONIN$` on Windows). Tests construct it
+/// via [`TtyApprovalBackend::with_paths`] pointing at a non-terminal path
+/// (e.g. `/dev/null`) to obtain a deterministic [`ApprovalDecision::NoTty`]
+/// regardless of the real controlling terminal — making approval tests
+/// hermetic (ISSUE-KVD-CLI-6EA6D4). This is a test seam only: it never reads
+/// any credential and can only make the prompt *more* restrictive (NoTty is
+/// fail-closed), never grant.
+pub struct TtyApprovalBackend {
+    output_path: std::path::PathBuf,
+    input_path: std::path::PathBuf,
+}
+
+impl Default for TtyApprovalBackend {
+    fn default() -> Self {
+        Self {
+            output_path: TTY_OUTPUT_PATH.into(),
+            input_path: TTY_INPUT_PATH.into(),
+        }
+    }
+}
+
+impl TtyApprovalBackend {
+    /// Construct a backend pointing at explicit output/input terminal paths.
+    /// Intended for tests: passing a non-terminal path yields a deterministic
+    /// `NoTty`. Production code uses [`Default`].
+    pub fn with_paths(
+        output_path: impl Into<std::path::PathBuf>,
+        input_path: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            output_path: output_path.into(),
+            input_path: input_path.into(),
+        }
+    }
+}
 
 impl ApprovalBackend for TtyApprovalBackend {
     fn ask(
@@ -30,7 +65,7 @@ impl ApprovalBackend for TtyApprovalBackend {
         ctx: ApprovalContext,
     ) -> Pin<Box<dyn Future<Output = ApprovalDecision> + Send + '_>> {
         Box::pin(async move {
-            let mut output = match OpenOptions::new().write(true).open(TTY_OUTPUT_PATH) {
+            let mut output = match OpenOptions::new().write(true).open(&self.output_path) {
                 Ok(f) => f,
                 Err(_) => return ApprovalDecision::NoTty,
             };
@@ -44,7 +79,7 @@ impl ApprovalBackend for TtyApprovalBackend {
             }
             let _ = output.flush();
 
-            let input = match OpenOptions::new().read(true).open(TTY_INPUT_PATH) {
+            let input = match OpenOptions::new().read(true).open(&self.input_path) {
                 Ok(f) => f,
                 Err(_) => return ApprovalDecision::NoTty,
             };

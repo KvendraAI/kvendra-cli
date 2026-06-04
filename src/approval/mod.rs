@@ -255,7 +255,7 @@ pub async fn check(
     let decision: ApprovalDecision = if ctx.transport.is_mcp() {
         biometric::BiometricApprovalBackend.ask(prompt_ctx).await
     } else {
-        tty::TtyApprovalBackend.ask(prompt_ctx).await
+        tty::TtyApprovalBackend::default().ask(prompt_ctx).await
     };
 
     // The TTY path uses an explicit `[a]pprove-all-5min` button to populate

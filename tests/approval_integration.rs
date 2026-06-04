@@ -6,9 +6,11 @@
 //! - AC-APPROVAL-6 (no TTY en modo `ask*` → audit `approval_no_tty_denied` +
 //!   error MCP estructurado, NUNCA ejecuta el primitive)
 //!
-//! Estos tests son auto-contenidos — no spawn de procesos: aprovechan que
-//! `cargo test` corre sin TTY adjunto, lo que ejercita exactamente el
-//! comportamiento que valida AC-APPROVAL-6.
+//! Estos tests son auto-contenidos — no spawn de procesos: inyectan un path
+//! no-terminal (`/dev/null`) en `TtyApprovalBackend::with_paths`, de modo que
+//! el backend devuelve `NoTty` de forma DETERMINISTA, sea cual sea el entorno
+//! (con o sin terminal de control). Esto los hace herméticos respecto al TTY
+//! (ISSUE-KVD-CLI-6EA6D4) sin dejar de ejercitar AC-APPROVAL-6.
 
 use kvendra::approval::tty::{AutoApproveBackend, AutoDenyBackend, TtyApprovalBackend};
 use kvendra::approval::{ApprovalBackend, ApprovalContext, ApprovalDecision, ApprovalMode};
@@ -34,13 +36,16 @@ fn ctx_destructive() -> ApprovalContext {
 // AC-APPROVAL-6 — sin TTY, modo ask* → NoTty (NUNCA ejecuta)
 // ----------------------------------------------------------------------
 
-/// El test runner de cargo no tiene TTY adjunto: el TtyApprovalBackend
-/// debe responder `NoTty` y NO bloquear esperando input. Es exactamente la
-/// invariante que protege contra ejecuciones silenciosas en CI/automation
-/// con modo `ask*` activo.
+/// Con un path no-terminal inyectado, el TtyApprovalBackend debe responder
+/// `NoTty` y NO bloquear esperando input. Es exactamente la invariante que
+/// protege contra ejecuciones silenciosas en CI/automation con modo `ask*`
+/// activo (y, antes, la que colgaba/timeouteaba en terminal interactiva).
 #[tokio::test(flavor = "current_thread")]
 async fn tty_backend_returns_no_tty_in_cargo_test_environment() {
-    let backend = TtyApprovalBackend;
+    // Hermetic: point at a non-terminal path (/dev/null) so the backend
+    // returns NoTty deterministically, independent of whether the test runner
+    // has a real controlling terminal (ISSUE-KVD-CLI-6EA6D4).
+    let backend = TtyApprovalBackend::with_paths("/dev/null", "/dev/null");
     let decision = tokio::time::timeout(Duration::from_secs(2), backend.ask(ctx_destructive()))
         .await
         .expect("backend must complete within 2s without TTY (no input read)");
@@ -154,7 +159,10 @@ async fn no_tty_environment_does_not_emit_prompt_box() {
     // pero podemos verificar que el backend devuelve NoTty inmediatamente
     // sin esperar input — lo que implica que NO escribe el box (la lógica
     // del backend retorna ANTES de `writeln!` cuando is_terminal()=false).
-    let backend = TtyApprovalBackend;
+    // Hermetic: point at a non-terminal path (/dev/null) so the backend
+    // returns NoTty deterministically, independent of whether the test runner
+    // has a real controlling terminal (ISSUE-KVD-CLI-6EA6D4).
+    let backend = TtyApprovalBackend::with_paths("/dev/null", "/dev/null");
     let start = std::time::Instant::now();
     let decision = backend.ask(ctx_destructive()).await;
     let elapsed = start.elapsed();
