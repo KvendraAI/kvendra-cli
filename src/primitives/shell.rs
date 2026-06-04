@@ -31,6 +31,15 @@ pub async fn execute(args: &Value, _secret: Option<&SecretPlaintext>) -> Kvendra
     if let Some(cwd) = op_args.get("cwd").and_then(Value::as_str) {
         cmd.current_dir(cwd);
     }
+    // Detach the child (and its grandchildren — docker, esbuild, etc.) from
+    // the broker's stdin, which is the JSON-RPC request pipe. If we let it be
+    // inherited, a long-running child (sam deploy, git push) can consume or
+    // corrupt the pipe and the next transport `read` sees EOF → silent
+    // disconnect (ISSUE-KVD-CLI-330251). stdout/stderr are captured by
+    // `.output()`, but we pin them explicitly for clarity.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
     let output = cmd
         .output()

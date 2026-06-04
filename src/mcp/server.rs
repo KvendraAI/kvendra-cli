@@ -97,9 +97,14 @@ impl ServerContext {
     /// `Clone`. Read lock is held only across the clone — never across
     /// `.await`.
     pub fn audit_writer(&self) -> Option<AuditWriter> {
+        // Recover from a poisoned lock instead of panicking: a panic on the
+        // audit side must not be able to tear down the serve task on the next
+        // `tools/call` (ISSUE-KVD-CLI-330251 hardening). The audit writer is
+        // an mpsc::Sender wrapper; reading it after a panic on another thread
+        // is safe.
         self.writer
             .read()
-            .expect("audit writer RwLock poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .clone()
     }
 
@@ -117,14 +122,17 @@ impl ServerContext {
         if self
             .writer
             .read()
-            .expect("audit writer RwLock poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .is_some()
         {
             return Ok(false);
         }
         let key = self.vault.audit_hmac_key()?;
         let db_path = self.vault.home().join("audit.db");
-        let mut guard = self.writer.write().expect("audit writer RwLock poisoned");
+        let mut guard = self
+            .writer
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
         // Re-check inside the write lock to avoid double-spawn under racing
         // self-heal attempts (two `tools/call` arriving within microseconds).
         if guard.is_some() {
@@ -266,14 +274,41 @@ pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
     });
     let mut transport = StdioTransport::new();
 
-    while let Some(req) = transport.read().await? {
-        let resp = dispatch(req, ctx.clone()).await;
-        transport.write(&resp).await?;
-    }
+    // Track how the serve loop ends so a future disconnect leaves a trace
+    // (ISSUE-KVD-CLI-330251 observability). A clean `Ok(None)` is a real EOF
+    // on stdin; an `Err` is a transport/read failure.
+    let mut served: u64 = 0;
+    let exit_result = loop {
+        match transport.read().await {
+            Ok(Some(req)) => {
+                let resp = dispatch(req, ctx.clone()).await;
+                if let Err(e) = transport.write(&resp).await {
+                    break Err(e);
+                }
+                served += 1;
+            }
+            Ok(None) => {
+                tracing::info!(
+                    served_requests = served,
+                    "MCP serve loop ended: clean EOF on stdin (client closed the request pipe)"
+                );
+                break Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    served_requests = served,
+                    error = %e,
+                    "MCP serve loop ended: transport read error on stdin"
+                );
+                break Err(e);
+            }
+        }
+    };
+
     if let Some(w) = ctx.audit_writer() {
         w.shutdown().await;
     }
-    Ok(())
+    exit_result
 }
 
 /// Select the [`SecretResolver`] implementation based on the presence of

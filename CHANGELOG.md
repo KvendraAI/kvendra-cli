@@ -7,6 +7,21 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-06-04 — fix: broker disconnect after long subprocess ops (ISSUE-KVD-CLI-330251)
+
+Bugfix, no breaking, no wire/API change. The MCP broker would silently disconnect after long-running subprocess operations (`sam deploy`, `git push`, etc.). Root cause: spawned child processes inherited the broker's stdin — which is the JSON-RPC request pipe. A child (or grandchild: docker, esbuild) could consume/corrupt that pipe, so the next transport `read` saw an empty line and the serve loop exited cleanly = silent disconnect.
+
+### Fixed
+
+- **Primary**: every subprocess spawn now detaches stdin with `Stdio::null()` (and pins stdout/stderr to `Stdio::piped()`). Sites: `primitives/shell.rs` (the `sam` path), `primitives/git.rs` (all ops), `primitives/aws.rs` (`aws_command`, covers all 4 ops), `primitives/npm.rs` (publish + deprecate), `primitives/pypi.rs` (twine upload), plus the `ps` ancestry probes (`captured_env/ancestry.rs`) and the `osascript` approval dialog (`keychain_acl/macos.rs`).
+- **Transport robustness** (`mcp/transport.rs`): a non-empty read that is blank/whitespace is now skipped (loop continues) instead of being treated as EOF. Only a real `read_line` of `n == 0` (closed pipe) returns `Ok(None)`. A stray newline can no longer terminate the server.
+- **Hardening** (`mcp/server.rs`): the audit-writer `RwLock` accessors recover a poisoned guard (`unwrap_or_else(|p| p.into_inner())`) instead of `.expect(...)` panicking — an audit-side panic can no longer tear down the serve task on the next call.
+- **Observability** (`mcp/server.rs`): the serve loop now logs on exit, distinguishing a clean stdin EOF (`tracing::info!`, with served-request count) from a transport read error (`tracing::warn!`), so any future disconnect leaves a trace.
+
+### Tests
+
+- New unit tests in `mcp/transport.rs` covering: blank line between two valid requests does NOT end the stream; leading blank line skipped; empty input is a clean EOF; blank-only stream terminates without looping or parse errors.
+
 ## [0.5.0] — 2026-05-28 — `kvendra capabilities` subcommand (broker manifest discovery)
 
 Additive, no breaking. Adds a new top-level `kvendra capabilities` subcommand that emits the canonical broker capabilities manifest as JSON on stdout. Wire-public, read-only, auth-less — designed to be consumed by `kvendra-skills` at runtime (`onboard-project` Step 1.5, `release-manager` IF-MANIFEST sync, `lint-claudemd` primitive cross-check).

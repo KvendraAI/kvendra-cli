@@ -35,6 +35,9 @@ async fn upload(op_args: &Value, secret: Option<&SecretPlaintext>) -> KvendraRes
         .unwrap_or("pypi");
 
     let mut cmd = Command::new("python");
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     cmd.arg("-m")
         .arg("twine")
         .arg("upload")

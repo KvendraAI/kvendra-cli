@@ -105,6 +105,13 @@ pub async fn execute(args: &Value, secret: Option<&SecretPlaintext>) -> KvendraR
 
 fn aws_command(creds: &AwsCreds) -> Command {
     let mut cmd = Command::new("aws");
+    // Detach from the broker's stdin (JSON-RPC request pipe) so a long aws
+    // op cannot consume/corrupt it and cause a silent EOF disconnect on the
+    // next transport read (ISSUE-KVD-CLI-330251). Covers all 4 ops since they
+    // all build through this helper.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     cmd.env("AWS_ACCESS_KEY_ID", &creds.access_key_id)
         .env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
     if let Some(t) = &creds.session_token {

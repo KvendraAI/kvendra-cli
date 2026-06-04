@@ -18,6 +18,12 @@ pub async fn execute(args: &Value, _secret: Option<&SecretPlaintext>) -> Kvendra
     let op_args = args.get("args").cloned().unwrap_or(Value::Null);
 
     let mut cmd = Command::new("git");
+    // Never let git inherit the broker's stdin (the JSON-RPC request pipe).
+    // A long push could otherwise consume/corrupt it and trigger a silent
+    // EOF on the next transport read (ISSUE-KVD-CLI-330251).
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     match operation {
         "clone" => {
             let url = op_args

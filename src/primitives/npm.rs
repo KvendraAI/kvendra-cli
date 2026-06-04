@@ -39,6 +39,9 @@ async fn publish(op_args: &Value, secret: Option<&SecretPlaintext>) -> KvendraRe
         .unwrap_or("restricted");
 
     let mut cmd = Command::new("npm");
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     cmd.arg("publish")
         .arg("--access")
         .arg(access)
@@ -56,6 +59,9 @@ async fn deprecate(op_args: &Value, secret: Option<&SecretPlaintext>) -> Kvendra
         .ok_or_else(|| KvendraError::InvalidArgs("npm.deprecate.package required".into()))?;
     let message = op_args.get("message").and_then(Value::as_str).unwrap_or("");
     let mut cmd = Command::new("npm");
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     cmd.arg("deprecate").arg(package).arg(message);
     if let Some(s) = secret {
         cmd.env("NPM_TOKEN", s.as_str()?);

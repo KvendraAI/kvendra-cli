@@ -157,6 +157,9 @@ pub fn request_user_presence_only(reason: &str) -> Result<(), BiometricError> {
     let output = std::process::Command::new("osascript")
         .arg("-e")
         .arg(&script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .output()
         .map_err(|e| {
             BiometricError::Unavailable(format!(

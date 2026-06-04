@@ -104,6 +104,9 @@ fn read_comm_unix(pid: libc::pid_t) -> Option<String> {
     use std::process::Command;
     let out = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "comm="])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .output()
         .ok()?;
     if !out.status.success() {
@@ -118,6 +121,9 @@ fn read_ppid_unix(pid: libc::pid_t) -> Option<libc::pid_t> {
     use std::process::Command;
     let out = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "ppid="])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .output()
         .ok()?;
     if !out.status.success() {
