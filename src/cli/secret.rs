@@ -258,14 +258,23 @@ fn revoke(vault: &Vault, profile_id: &str) -> KvendraResult<()> {
 }
 
 fn set_allowlist(vault: &Vault, home: &Path, args: SetAllowlistArgs) -> KvendraResult<()> {
-    // REQ-KVD-007 / ISSUE-018 — `set-allowlist` persists an HMAC of the YAML
-    // signed with the `kvendra/allowlist-hmac/v1` HKDF sub-key. The sub-key
-    // only exists while the session is unlocked, so we must unlock here even
-    // if the caller assumed locked-vault semantics from prior releases.
-    ensure_unlocked(vault, home, args.password_stdin)?;
-
+    // Parse + validate BEFORE unlocking: a schema typo must fail fast,
+    // without prompting the owner for the master password first.
     let raw = std::fs::read_to_string(&args.file)?;
-    let spec: ProfileSpec = serde_yaml_ng::from_str(&raw)?;
+    // deny_unknown_fields (ISSUE-KVD-CLI-1B6440): an unknown key is a hard
+    // error here — silently dropping it would sign an allowlist laxer than
+    // the owner wrote. Add a "did you mean" hint for the common typos.
+    let spec: ProfileSpec = serde_yaml_ng::from_str(&raw).map_err(|e| {
+        let mut msg = format!("invalid allowlist YAML: {e}");
+        if let Some((unknown, suggestion)) =
+            crate::allowlist::dsl::unknown_field_hint(&e.to_string())
+        {
+            msg.push_str(&format!(
+                " — did you mean `{suggestion}` instead of `{unknown}`?"
+            ));
+        }
+        KvendraError::AllowlistParse(msg)
+    })?;
     if spec.profile_id != args.profile_id {
         return Err(KvendraError::AllowlistParse(format!(
             "allowlist profile_id '{}' does not match argument '{}'",
@@ -273,6 +282,12 @@ fn set_allowlist(vault: &Vault, home: &Path, args: SetAllowlistArgs) -> KvendraR
         )));
     }
     allowlist_validate(&spec)?;
+
+    // REQ-KVD-007 / ISSUE-018 — `set-allowlist` persists an HMAC of the YAML
+    // signed with the `kvendra/allowlist-hmac/v1` HKDF sub-key. The sub-key
+    // only exists while the session is unlocked, so we must unlock here even
+    // if the caller assumed locked-vault semantics from prior releases.
+    ensure_unlocked(vault, home, args.password_stdin)?;
     crate::config::create_dir_secure(&vault.allowlists_dir())?;
     let target = vault.profile_allowlist_path(&args.profile_id);
     std::fs::write(&target, &raw)?;

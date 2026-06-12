@@ -23,14 +23,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ApprovalProfileOverride {
     /// Override del modo de approval per-profile. Acepta `silent`, `ask` o
     /// `ask-destructive`. Aplica sólo a este profile; resto sigue el global.
     pub mode: Option<String>,
 }
 
+// `deny_unknown_fields` on every DSL struct (ISSUE-KVD-CLI-1B6440): an
+// unknown key used to be silently dropped by serde, so a schema typo
+// (`args_exact` instead of `args_constraints`) signed an allowlist LAXER
+// than the owner wrote — the inversion of fail-closed. Unknown keys are now
+// a hard parse error at sign time (`secret set-allowlist`), at validate
+// time, and at broker runtime load (defense in depth).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileSpec {
     pub profile_id: String,
     pub secret: SecretRef,
@@ -48,6 +55,7 @@ fn default_audit_level() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecretRef {
     #[serde(rename = "type")]
     pub kind: String,
@@ -55,11 +63,13 @@ pub struct SecretRef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Allowlist {
     pub primitives: Vec<PrimitiveAllow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrimitiveAllow {
     pub name: String,
     #[serde(default)]
@@ -110,7 +120,7 @@ pub type Operation = BTreeMap<String, OperationConstraints>;
 ///   `is_expired → primitive lookup → operation lookup → forbidden-first
 ///   denylists → allow-list constraints`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OperationConstraints {
     pub repos: Option<Vec<String>>,
     pub refs: Option<Vec<String>>,
@@ -150,6 +160,7 @@ pub struct OperationConstraints {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArgvConstraint {
     pub allowed: Vec<String>,
 }
@@ -162,6 +173,88 @@ impl ProfileSpec {
     pub fn to_yaml(&self) -> Result<String, serde_yaml_ng::Error> {
         serde_yaml_ng::to_string(self)
     }
+}
+
+/// Every field name accepted anywhere in the allowlist DSL. Keep in sync
+/// with the structs above — used only to build "did you mean" hints
+/// (ISSUE-KVD-CLI-1B6440), never for enforcement.
+const KNOWN_FIELDS: &[&str] = &[
+    // ProfileSpec
+    "profile_id",
+    "secret",
+    "allowlist",
+    "expiration",
+    "audit_level",
+    "approval",
+    // SecretRef
+    "type",
+    "encrypted_blob_b64",
+    // Allowlist / PrimitiveAllow
+    "primitives",
+    "name",
+    "operations",
+    "unsafe_raw_token_allowed",
+    "unsafe_max_uses_per_session",
+    "unsafe_reason_min_length",
+    // ApprovalProfileOverride
+    "mode",
+    // ArgvConstraint
+    "allowed",
+    // OperationConstraints
+    "repos",
+    "refs",
+    "forbidden_args",
+    "tag_pattern",
+    "org",
+    "repo",
+    "fields_allowed",
+    "forbidden_fields",
+    "binaries",
+    "args_constraints",
+    "cwd_pattern",
+    "env_vars_to_inject",
+    "forbidden_env_export_to_agent",
+    "url_pattern_regex",
+    "methods",
+    "forbidden_methods",
+    "buckets",
+    "distributions",
+    "functions",
+    "packages",
+    "projects",
+    "endpoints",
+    "accept_broad_scope",
+    "destructive",
+    "accept_destructive",
+];
+
+/// Closest known DSL field for an unknown key, by longest common prefix
+/// (>= 4 shared leading chars). Catches the real-world pairs that signed a
+/// laxer allowlist (`args_exact` → `args_constraints`, `cwd_allowed` →
+/// `cwd_pattern`) without pulling an edit-distance dependency.
+pub fn suggest_known_field(unknown: &str) -> Option<&'static str> {
+    let mut best: Option<(&'static str, usize)> = None;
+    for &known in KNOWN_FIELDS {
+        let lcp = unknown
+            .bytes()
+            .zip(known.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if lcp >= 4 && best.is_none_or(|(_, b)| lcp > b) {
+            best = Some((known, lcp));
+        }
+    }
+    best.map(|(k, _)| k)
+}
+
+/// Extract the offending key from a serde "unknown field `X`, ..." message
+/// and pair it with the closest known DSL field, if any.
+pub fn unknown_field_hint(err_msg: &str) -> Option<(String, &'static str)> {
+    const MARKER: &str = "unknown field `";
+    let start = err_msg.find(MARKER)? + MARKER.len();
+    let rest = &err_msg[start..];
+    let unknown = &rest[..rest.find('`')?];
+    suggest_known_field(unknown).map(|s| (unknown.to_string(), s))
 }
 
 #[cfg(test)]
@@ -211,5 +304,84 @@ allowlist:
         let out = p.to_yaml().unwrap();
         let p2 = ProfileSpec::from_yaml(&out).unwrap();
         assert_eq!(p2.profile_id, "test");
+    }
+
+    // -----------------------------------------------------------------
+    // BLOQUE — deny_unknown_fields (ISSUE-KVD-CLI-1B6440). El fixture del
+    // primer test es literalmente la clase de YAML que firmó una allowlist
+    // sin constraint de argv/cwd en el caso EF451D.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn unknown_field_args_exact_rejected() {
+        let yaml = r#"
+profile_id: aws.kvendra.staging-deploy
+secret:
+  type: generic
+allowlist:
+  primitives:
+    - name: kvendra.shell
+      operations:
+        - exec:
+            binaries: ["sam"]
+            args_exact:
+              - ["deploy", "--profile", "aws_kvendra"]
+            destructive: true
+            accept_destructive: true
+"#;
+        let err = ProfileSpec::from_yaml(yaml).unwrap_err().to_string();
+        assert!(err.contains("unknown field"), "got: {err}");
+        assert!(err.contains("args_exact"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_field_cwd_allowed_rejected() {
+        let yaml = r#"
+profile_id: x
+secret:
+  type: generic
+allowlist:
+  primitives:
+    - name: kvendra.shell
+      operations:
+        - exec:
+            binaries: ["sam"]
+            cwd_allowed: ["/tmp"]
+"#;
+        let err = ProfileSpec::from_yaml(yaml).unwrap_err().to_string();
+        assert!(err.contains("unknown field"), "got: {err}");
+        assert!(err.contains("cwd_allowed"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_field_top_level_rejected() {
+        let yaml = r#"
+profile_id: x
+secret:
+  type: generic
+allowlist:
+  primitives: []
+expirations: "2026-12-31"
+"#;
+        let err = ProfileSpec::from_yaml(yaml).unwrap_err().to_string();
+        assert!(err.contains("unknown field"), "got: {err}");
+        assert!(err.contains("expirations"), "got: {err}");
+    }
+
+    #[test]
+    fn suggest_known_field_pairs() {
+        assert_eq!(suggest_known_field("args_exact"), Some("args_constraints"));
+        assert_eq!(suggest_known_field("cwd_allowed"), Some("cwd_pattern"));
+        assert_eq!(suggest_known_field("expirations"), Some("expiration"));
+        assert_eq!(suggest_known_field("zzz"), None);
+    }
+
+    #[test]
+    fn unknown_field_hint_extracts_key() {
+        let msg = "allowlist.primitives[0].operations[0].exec: unknown field `args_exact`, expected one of `repos`, `refs`";
+        let (unknown, suggestion) = unknown_field_hint(msg).unwrap();
+        assert_eq!(unknown, "args_exact");
+        assert_eq!(suggestion, "args_constraints");
+        assert!(unknown_field_hint("some other parse error").is_none());
     }
 }
