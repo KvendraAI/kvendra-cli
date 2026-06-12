@@ -7,6 +7,49 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-06-12 — fix(security): allowlist DSL rejects unknown keys (ISSUE-KVD-CLI-1B6440)
+
+Security hardening, fail-closed. An unknown key in an allowlist YAML
+(e.g. `args_exact` instead of `args_constraints`) used to be silently
+dropped by serde at sign time, producing an allowlist LAXER than the
+owner wrote — real-world case: a `kvendra.shell` profile signed without
+argv/cwd constraints let `sam deploy` run without `--profile` against
+the wrong AWS account (ISSUE-KVD-ENTERPRISE-EF451D).
+
+### Fixed
+
+- `#[serde(deny_unknown_fields)]` on all 7 allowlist DSL structs
+  (`allowlist/dsl.rs`): an unknown key is now a hard parse error at
+  sign time (`secret set-allowlist`), validate time (`secret validate`)
+  and broker runtime load (defense in depth). Operation names remain
+  free-form `BTreeMap` keys — already fail-closed via the enforcer's
+  operation lookup.
+- `secret set-allowlist` now parses + validates the YAML **before**
+  prompting for the master password (fail fast on schema typos), and
+  appends a ``did you mean `args_constraints` instead of `args_exact`?``
+  hint (longest-common-prefix over the known field list, no new
+  dependencies).
+
+### Migration note
+
+Allowlist YAMLs that only use documented DSL fields are unaffected (the
+owner's 6 production profiles were audited — zero re-signs needed). A
+YAML carrying unknown keys will now fail to sign/load: fix the key
+names and re-sign with `kvendra secret set-allowlist <profile_id>
+--file <yaml>`.
+
+### Tests
+
+- 5 new unit tests in `allowlist/dsl.rs`, including the literal
+  EF451D fixture (`args_exact` rejected), `cwd_allowed` rejected,
+  top-level typo rejected, and the suggestion pairs.
+
+## [0.6.2] — 2026-06-04 — audit.db migración v3 (error_code + error_message + HMAC v3 anti-tamper)
+
+(Entry backfilled 2026-06-12 — this release shipped to crates.io on
+2026-06-04 without a changelog entry; full details in the KB entity
+`REL-KVD-CLI-0.6.2`, git `641b9c5`.)
+
 ## [0.6.1] — 2026-06-04 — fix: broker disconnect after long subprocess ops (ISSUE-KVD-CLI-330251)
 
 Bugfix, no breaking, no wire/API change. The MCP broker would silently disconnect after long-running subprocess operations (`sam deploy`, `git push`, etc.). Root cause: spawned child processes inherited the broker's stdin — which is the JSON-RPC request pipe. A child (or grandchild: docker, esbuild) could consume/corrupt that pipe, so the next transport `read` saw an empty line and the serve loop exited cleanly = silent disconnect.
