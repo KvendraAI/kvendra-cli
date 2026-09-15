@@ -660,28 +660,42 @@ fn looks_like_git_url(s: &str) -> bool {
 /// For a push we honour `pushurl` (which overrides `url` for pushes) before
 /// `url`. Returns `None` if the config, the section, or the field is absent —
 /// which the caller turns into a fail-closed deny (ISSUE-KVD-CLI-B78ED5 N7).
-fn git_config_remote_url(cwd: &str, remote: &str, prefer_pushurl: bool) -> Option<String> {
-    let path = std::path::Path::new(cwd).join(".git").join("config");
-    let content = std::fs::read_to_string(path).ok()?;
-    let header = format!("[remote \"{remote}\"]");
-    let mut in_section = false;
-    let mut url = None;
-    let mut pushurl = None;
-    for line in content.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_section = t.eq_ignore_ascii_case(&header);
-            continue;
-        }
-        if in_section && let Some((k, v)) = t.split_once('=') {
-            match k.trim().to_ascii_lowercase().as_str() {
-                "url" => url = Some(v.trim().to_string()),
-                "pushurl" => pushurl = Some(v.trim().to_string()),
-                _ => {}
-            }
-        }
+fn git_remote_url_via_git(cwd: &str, remote: &str) -> Option<String> {
+    // Never let a `-`-prefixed remote become a git option.
+    if remote.is_empty() || remote.starts_with('-') {
+        return None;
     }
-    if prefer_pushurl { pushurl.or(url) } else { url }
+    // Resolve the effective PUSH URL with git ITSELF rather than hand-parsing
+    // `<cwd>/.git/config` (ISSUE-KVD-CLI-3FD509 item 4). Git applies its own
+    // config resolution — worktrees/submodules (`.git` is a file), `include` /
+    // `includeIf`, `pushurl`, and every URL scheme — which the hand parser could
+    // not replicate (it wrongly DENIED legit worktree/include/ssh pushes).
+    // `remote get-url --push` prints the URL and never contacts the remote.
+    // Residual: `insteadOf`/`pushInsteadOf` rewrites (a same-uid attacker who
+    // can WRITE git config) are still not reflected here — a documented same-uid
+    // boundary, not agent-reachable without a config-write primitive.
+    let mut cmd = std::process::Command::new("git");
+    if let Some(path) = crate::primitives::spawn::sanitized_path() {
+        cmd.env("PATH", path);
+    }
+    cmd.args([
+        "-C",
+        cwd,
+        "-c",
+        "protocol.ext.allow=never",
+        "remote",
+        "get-url",
+        "--push",
+        remote,
+    ]);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if url.is_empty() { None } else { Some(url) }
 }
 
 /// Determine the ACTUAL repository a `kvendra.git` operation targets, so the
@@ -714,11 +728,10 @@ fn git_target_repo(inner: &Value, operation: &str) -> Option<String> {
     if looks_like_git_url(remote) {
         return Some(extract_repo_canonical(remote));
     }
-    // `remote` is a NAME → resolve it to a URL via the repo's own config.
-    // `pushurl` overrides `url` for a push.
+    // `remote` is a NAME → ask git for the effective push URL (worktree/include/
+    // pushurl aware). None (not a repo, unknown remote) → fail closed upstream.
     let cwd = inner.get("cwd").and_then(Value::as_str)?;
-    git_config_remote_url(cwd, remote, operation == "push")
-        .map(|u| extract_repo_canonical(&u))
+    git_remote_url_via_git(cwd, remote).map(|u| extract_repo_canonical(&u))
 }
 
 /// Read the `name` field from `<cwd>/package.json`. Used to enforce a
@@ -2082,17 +2095,28 @@ allowlist:
     }
 
     fn tmp_git_repo(origin_url: &str) -> std::path::PathBuf {
+        // A REAL git repo — the enforcer now resolves the target via
+        // `git remote get-url --push`, so a hand-written `.git/config` is not
+        // enough; git must recognize the directory.
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("kvendra-n7-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
-        std::fs::write(
-            dir.join(".git").join("config"),
-            format!("[remote \"origin\"]\n\turl = {origin_url}\n"),
-        )
-        .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", dir.to_str().unwrap()])
+                .args(args)
+                .output()
+                .expect("git available in test env")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        assert!(
+            git(&["remote", "add", "origin", origin_url])
+                .status
+                .success()
+        );
         dir
     }
 
@@ -2173,6 +2197,42 @@ allowlist:
         assert!(
             check(&s, "kvendra.git", "push", &args).is_err(),
             "a decoy repo field must not mask an attacker remote"
+        );
+    }
+
+    #[test]
+    fn n7_push_from_worktree_resolves_origin() {
+        // A git worktree's `.git` is a FILE, not a directory — the old
+        // hand-parser of `<cwd>/.git/config` failed on it and DENIED a
+        // legitimate push. Resolving via git handles it (item 4 fix).
+        let s = n7_git_spec();
+        let main = tmp_git_repo("git@github.com:KvendraAI/kvendra-cli.git");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", dir.to_str().unwrap()])
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
+        };
+        // A worktree requires at least one commit.
+        git(&main, &["commit", "--allow-empty", "-q", "-m", "init"]);
+        let wt = main.join("wt");
+        let add = git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let args = env_args(serde_json::json!({
+            "cwd": wt.to_str().unwrap(),
+            "remote": "origin",
+            "ref": "refs/heads/main"
+        }));
+        let res = check(&s, "kvendra.git", "push", &args);
+        let _ = std::fs::remove_dir_all(&main);
+        assert!(add.status.success(), "worktree add should succeed in test env");
+        assert!(
+            res.is_ok(),
+            "push from a worktree must resolve origin (hand-parser denied it): {res:?}"
         );
     }
 
