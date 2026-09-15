@@ -315,14 +315,26 @@ fn check_args(
         )));
     }
 
-    // tag_pattern (git tag — regex full-match against `tag` field).
-    if let Some(patterns) = &c.tag_pattern
-        && let Some(tag) = inner.get("tag").and_then(Value::as_str)
-        && !patterns.iter().any(|p| regex_full_match(p, tag))
-    {
-        return Err(KvendraError::AllowlistViolation(format!(
-            "{primitive}.{operation}: tag '{tag}' not allowed"
-        )));
+    // tag_pattern (git tag — full-match against the tag NAME).
+    //
+    // ISSUE-KVD-CLI-B78ED5 finding **N10**: the `kvendra.git` tag primitive
+    // sends the tag as `name`, but the enforcer read `tag` — a field the
+    // primitive never sends — so tag_pattern was silently skipped and any tag
+    // name was allowed (the same field-mismatch / permissive-on-absence class as
+    // C2 and N7; the tests hid it by passing a synthetic `tag` field). Read
+    // `name`, and fail closed if a tag_pattern is declared but no name is
+    // present.
+    if let Some(patterns) = &c.tag_pattern {
+        let Some(tag) = inner.get("name").and_then(Value::as_str) else {
+            return Err(KvendraError::AllowlistViolation(format!(
+                "{primitive}.{operation}: tag name missing but tag_pattern is constrained — refusing (fail-closed)"
+            )));
+        };
+        if !patterns.iter().any(|p| regex_full_match(p, tag)) {
+            return Err(KvendraError::AllowlistViolation(format!(
+                "{primitive}.{operation}: tag '{tag}' not allowed"
+            )));
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -1428,8 +1440,39 @@ allowlist:
             accept_destructive: true
 "#,
         );
-        let args = env_args(serde_json::json!({ "tag": "v1.2.3" }));
+        // Real git-tag shape: the primitive sends the tag as `name` (N10).
+        let args = env_args(serde_json::json!({ "name": "v1.2.3" }));
         assert!(check(&s, "kvendra.git", "tag", &args).is_ok());
+    }
+
+    #[test]
+    fn n10_tag_pattern_enforced_on_real_name_field() {
+        // Regression: a disallowed tag NAME (the field the primitive actually
+        // sends) must be blocked, and a missing name must fail closed.
+        let s = spec_with(
+            r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.git
+      operations:
+        - tag:
+            tag_pattern: ['^v\d+\.\d+\.\d+$']
+            accept_destructive: true
+"#,
+        );
+        // Disallowed name → deny.
+        let bad = env_args(serde_json::json!({ "name": "evil-tag", "message": "x" }));
+        assert!(check(&s, "kvendra.git", "tag", &bad).is_err());
+        // Allowed name → ok.
+        let ok = env_args(serde_json::json!({ "name": "v9.9.9" }));
+        assert!(check(&s, "kvendra.git", "tag", &ok).is_ok());
+        // A synthetic `tag` field (which the real primitive never sends) must
+        // NOT satisfy the constraint — it fails closed on the missing `name`.
+        let synthetic = env_args(serde_json::json!({ "tag": "v1.0.0" }));
+        assert!(check(&s, "kvendra.git", "tag", &synthetic).is_err());
     }
 
     #[test]
@@ -1448,7 +1491,7 @@ allowlist:
             accept_destructive: true
 "#,
         );
-        let args = env_args(serde_json::json!({ "tag": "evil-tag" }));
+        let args = env_args(serde_json::json!({ "name": "evil-tag" }));
         assert!(check(&s, "kvendra.git", "tag", &args).is_err());
     }
 

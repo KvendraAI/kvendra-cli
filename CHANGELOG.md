@@ -263,6 +263,25 @@ against the running broker and re-verified fixed. Behaviour changes are flagged.
   response header (Set-Cookie, X-Api-Key, …). Header values are now redacted
   too. `src/primitives/http.rs`.
 
+### Fixed — cycle 9 (systematic enforcer-vs-primitive field-mapping sweep)
+
+- **N10 — `tag_pattern` was not enforced on `git tag`.** The `kvendra.git` tag
+  primitive sends the tag as `name`, but the enforcer read `tag` — a field the
+  primitive never sends — so a declared `tag_pattern` (e.g. restrict tags to
+  `^v\d+\.\d+\.\d+$`) was silently skipped and any tag name was allowed. This is
+  the same field-mismatch / permissive-on-absence class as C2 and N7, and the
+  tests hid it by passing a synthetic `tag` field. The enforcer now reads `name`
+  and fails closed if a `tag_pattern` is declared with no name; the complicit
+  tests were corrected to the real shape and a regression added.
+  `src/allowlist/enforcer.rs`.
+- The rest of the sweep was clean: `s3_sync`/`s3_cp` (`src`/`dst`), cloudfront
+  (`distribution_id`), lambda (`function_name`), npm/pypi `read_metadata`
+  (`package`/`project`) and `github.update_repo` (a hardcoded field whitelist,
+  aligned with `fields_allowed`) all validate the same fields the primitive
+  actually sends. Note: `env_vars_to_inject` is currently inert — the `shell`
+  primitive does not inject caller-supplied env — so it over-restricts rather
+  than under-restricts (safe), documented for a future cleanup.
+
 ### Known design item — cycle 8 (tracked, owner decision)
 
 - **Approval cache is per-profile, not per-operation.** In the default

@@ -224,6 +224,17 @@ the approval cache is per-profile, so one approval warms a window covering every
 destructive op on that profile — is tracked as `ISSUE-KVD-CLI-B77E33` for an
 owner UX decision (not a fail-open bug).
 
+### Found in the field-mapping sweep (cycle 9)
+
+- **N10 — `tag_pattern` was not enforced on `git tag`.** The primitive sends
+  the tag as `name`; the enforcer read `tag`, a field it never sends, so a
+  `tag_pattern` restriction was silently skipped (the C2/N7 field-mismatch
+  class). The enforcer now reads `name` and fails closed if a pattern is
+  declared with no name. A systematic sweep of every primitive's fields against
+  the enforcer's constraints found no other mismatch: s3 (`src`/`dst`),
+  cloudfront (`distribution_id`), lambda (`function_name`), `read_metadata`
+  (`package`/`project`) and `github.update_repo` all align.
+
 ## Design-level items — documented, not code-patched
 
 These are threat-model boundaries, not one-line bugs. They are stated honestly
