@@ -349,31 +349,38 @@ impl Vault {
         Ok(*session.peek_key()?)
     }
 
-    /// Reset the master password using the BIP-39 mnemonic. Pase B simplified
-    /// flow: the mnemonic re-seeds the sentinel ciphertext deterministically
-    /// (we encrypt the marker under a fresh KDF derived from `new_password`).
-    /// For Pase B we rotate the sentinel; profile blobs continue to use the
-    /// old key until re-saved (real rotation is a Beta concern).
+    /// Reset the master password using the BIP-39 mnemonic.
+    ///
+    /// **DISABLED — fail closed (ISSUE-KVD-CLI-DAC4E1 / R1).** The previous
+    /// implementation only validated the mnemonic's BIP-39 SHAPE and then
+    /// discarded it: the phrase was never bound to the vault (no `recovery.blob`
+    /// is written at init, no mnemonic→key derivation exists), so it accepted
+    /// ANY valid BIP-39 phrase and rotated the sentinel to the caller's chosen
+    /// password — a takeover / lock-out for anyone who can run `recover` against
+    /// the vault files. It also never recovered the original key, so the
+    /// existing secrets (sealed under the OLD key) became unreadable afterwards.
+    ///
+    /// Rather than provide a fake recovery gate that both fails to verify the
+    /// mnemonic AND destroys access to the secrets, this refuses. Real
+    /// mnemonic-bound recovery (wrap the master key under the mnemonic in
+    /// `recovery.blob` at init; verify + recover + re-encrypt here) is the
+    /// tracked fix in ISSUE-KVD-CLI-DAC4E1.
     pub fn reset_password_with_mnemonic(
         &self,
         mnemonic_phrase: &str,
-        new_password: &[u8],
+        _new_password: &[u8],
     ) -> KvendraResult<()> {
-        // Validate mnemonic shape (the mnemonic itself does not seed the
-        // sentinel — it acts as proof that the user previously held the
-        // recovery material; per Alpha 0.1 we accept any valid BIP-39).
+        // Still validate the phrase shape first so a typo gets a clear error
+        // before the "not available" message.
         let _ = crate::vault::recovery::parse_mnemonic(mnemonic_phrase)?;
-        // Rotate the sentinel.
-        let salt = random_salt();
-        let params = KdfParams::high_cost(salt);
-        let derived = derive(new_password, &params)?;
-        let nonce = random_nonce();
-        let ct = aes_seal(derived.as_bytes(), &nonce, b"kvendra-sentinel-v1")?;
-        let blob = Blob::new(params, nonce.to_vec(), ct);
-        let sentinel = self.sentinel_path();
-        std::fs::write(&sentinel, blob.to_json()?)?;
-        set_file_mode_secure(&sentinel)?;
-        Ok(())
+        Err(KvendraError::Vault(
+            "mnemonic recovery is not available: this vault has no mnemonic-bound \
+             recovery material, so the phrase cannot be verified and the master key \
+             cannot be recovered. Accepting it would only take over the password \
+             without restoring access to your secrets. Restore from a `kvendra backup` \
+             instead. (tracked: ISSUE-KVD-CLI-DAC4E1)"
+                .into(),
+        ))
     }
 
     /// Encrypt + persist a secret blob for `profile_id`. Requires unlocked.
@@ -584,6 +591,31 @@ mod tests {
         v.create_with_params(b"correct", fast_params()).unwrap();
         let r = v.unlock(b"wrong", 30);
         assert!(matches!(r, Err(KvendraError::InvalidMasterPassword)));
+    }
+
+    #[test]
+    fn recover_refuses_unverifiable_mnemonic_and_leaves_vault_intact() {
+        // R1 (ISSUE-KVD-CLI-DAC4E1): the mnemonic is not bound to the vault, so
+        // recovery must NOT accept an arbitrary valid BIP-39 phrase and rotate
+        // the password. It fails closed and leaves the vault untouched.
+        let (_dir, v) = open_test_vault();
+        v.create_with_params(b"orig-pass", fast_params()).unwrap();
+        // The canonical all-zeros BIP-39 phrase — a valid phrase the attacker
+        // did NOT get from the owner.
+        let canonical = "abandon abandon abandon abandon abandon abandon \
+                         abandon abandon abandon abandon abandon about";
+        assert!(
+            v.reset_password_with_mnemonic(canonical, b"attacker-pass").is_err(),
+            "an unverifiable mnemonic must be refused, not accepted"
+        );
+        // The vault is unchanged: the ORIGINAL password still unlocks; the
+        // attacker's chosen password does not.
+        assert!(v.unlock(b"orig-pass", 30).is_ok(), "original password must still work");
+        v.lock();
+        assert!(
+            matches!(v.unlock(b"attacker-pass", 30), Err(KvendraError::InvalidMasterPassword)),
+            "the attacker's password must NOT have been set"
+        );
     }
 
     /// AC-AUDIT-2 cross-process verify (FAIL #3 fix): `audit_hmac_key_from_password`

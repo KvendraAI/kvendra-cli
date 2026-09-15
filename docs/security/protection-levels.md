@@ -55,10 +55,14 @@ manager has.
   an attacker who already owns your account is a documented residual.
 - **Replacing the `kvendra` binary itself** defeats everything. Install from a
   trusted source and, when we ship signed releases, verify the signature.
-- **Losing your vault backup AND your recovery mnemonic** means the secrets are
-  gone. They are not irreplaceable: the vault holds tokens you can re-issue at
-  GitHub, AWS, etc. Keep your `kvendra backup` and your written-down mnemonic in
-  two separate safe places.
+- **Losing your vault backup** means the secrets are gone. They are not
+  irreplaceable: the vault holds tokens you can re-issue at GitHub, AWS, etc.
+  Keep your `kvendra backup` somewhere safe.
+  Note: mnemonic-based password recovery (`kvendra recover`) is **temporarily
+  disabled** while a secure, mnemonic-bound implementation is built
+  (tracked internally). Until then, an encrypted `kvendra backup` is the
+  recovery path — keep it, and still keep your written-down mnemonic for when
+  recovery ships.
 
 ## What you can do TODAY to raise your protection
 
@@ -69,7 +73,8 @@ None of this needs a new release:
   (`kvendra unlock --ttl 1h`). This shrinks the Case-B window.
 - **Keep allowlists minimal.** Grant each profile only the operations and
   targets it needs. The broker is only as tight as your allowlists.
-- **Keep a backup + your mnemonic**, stored apart, so device loss is survivable.
+- **Keep an encrypted `kvendra backup`** (and your mnemonic for later), so
+  device loss is survivable. Backup is currently the reliable recovery path.
 - **Prefer short-lived provider credentials** where the provider offers them
   (for example, AWS STS session credentials over long-lived keys), so a leak is
   time-bounded.

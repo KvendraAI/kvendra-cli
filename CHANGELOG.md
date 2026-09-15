@@ -331,6 +331,24 @@ A5 config not re-verified on `mcp serve` locked boot; `unsafe` quota burned on a
 transient failure; `packages:` unenforced on `npm publish`; git `insteadOf` via
 the hand-parsed `.git/config`; the userinfo-floating canary residual.
 
+### Fixed — vault/keys review (R1: fake mnemonic-recovery gate)
+
+- **R1 — `kvendra recover` accepted ANY valid BIP-39 phrase.** The recovery
+  mnemonic was never bound to the vault: `init` displays it but stores no
+  commitment, `recovery.blob` is never written, and
+  `reset_password_with_mnemonic` only validated the phrase's SHAPE (BIP-39
+  checksum) and then discarded it. So any valid phrase (even the canonical
+  `abandon abandon … about`) reset the master password to a caller-chosen value —
+  a takeover / lock-out for anyone who could run `recover` against the vault
+  files (same-uid or a stolen copy), defeating the "recovery requires the
+  mnemonic" guarantee. It also never recovered the original key, so the existing
+  secrets became unreadable after any `recover`. `reset_password_with_mnemonic`
+  now **fails closed** with a clear message (restore from `kvendra backup`);
+  `docs/security/protection-levels.md` is corrected. The proper mnemonic-bound
+  recovery (`recovery.blob` + verify + re-encrypt) is tracked as
+  `ISSUE-KVD-CLI-DAC4E1`. `src/vault/mod.rs`. Not agent-reachable (`recover` is a
+  CLI command, not an MCP primitive).
+
 ### Known design item — cycle 8 (tracked, owner decision)
 
 - **Approval cache is per-profile, not per-operation.** In the default
