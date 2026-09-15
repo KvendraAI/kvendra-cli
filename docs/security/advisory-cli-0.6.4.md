@@ -179,6 +179,27 @@ encrypted files are bounded by the master password), and fuzzing found no crashe
   exploitable for `twine` (reads `~/.pypirc`, not the cwd) and the `aws` CLI
   (no cwd config).
 
+### Found in the test-suite audit (cycle 7: the most serious finding)
+
+- **N7 — the per-repo allowlist was not enforced for `kvendra.git` writes.**
+  The enforcer read the repository from a `repo`/`url` argument, but the
+  `kvendra.git` primitive sends `{cwd, remote, ref}` for push/pull/tag/commit
+  and carries no such field. So the `repos` constraint was silently skipped for
+  every git write, while `refs` (read from the `ref` field, which push does
+  send) was enforced — the asymmetry that gave it away. An agent holding a git
+  profile could therefore push any local checkout to any repository, or set
+  `remote` to an attacker URL, exfiltrating the owner's private code and
+  potentially the credential with the owner's own GitHub token — a complete
+  bypass of the control the broker exists to provide, for its most-used
+  primitive. The enforcer now resolves the real target (a `remote` URL, or a
+  remote name resolved from `<cwd>/.git/config`), keeps the host in the
+  comparison, matches it against `repos`, and fails closed when the target
+  cannot be determined. It was surfaced by auditing the tests themselves: the
+  git-push tests asserted enforcement using a synthetic `repo` field the real
+  primitive never sends, so they stayed green while production was open — the
+  same false-green class as C2. Those tests were corrected and the real
+  `{cwd, remote, ref}` shape is now covered.
+
 ## Design-level items — documented, not code-patched
 
 These are threat-model boundaries, not one-line bugs. They are stated honestly

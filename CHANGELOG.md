@@ -211,10 +211,45 @@ against the running broker and re-verified fixed. Behaviour changes are flagged.
   repository name; the `aws` CLI does not read cwd config — neither is
   redirectable this way.
 
+### Fixed — cycle 7 (test-suite audit: the most serious finding — git repo allowlist bypass)
+
+- **N7 — the `repos` allowlist was NOT enforced for `kvendra.git`
+  push/pull/tag/commit, so an agent could push any local checkout to any
+  repository (code + credential exfiltration) with the owner's GitHub token.**
+  The enforcer derived the repository only from a `repo`/`url` argument, but the
+  real `kvendra.git` primitive sends `{cwd, remote, ref}` and carries no such
+  field — so `repo_input` was always `None` and the `repos` check was silently
+  skipped (permissive-on-absence, the PAT-KVD-CLI-003 anti-pattern). The `refs`
+  constraint, which reads `ref` (a field push DOES send), *was* enforced — that
+  asymmetry is the tell. Impact: with `remote` set to an attacker URL an agent
+  pushes the owner's private code to an attacker repo and can leak the token to
+  an attacker host; with `remote=origin` it can push any checkout on disk. The
+  fix resolves the ACTUAL target — `remote` as a URL, or a remote name resolved
+  from `<cwd>/.git/config` (honouring `pushurl`) — normalizes the host (so an
+  attacker-host repo with the same owner/name does not match a `github.com`
+  pattern), matches it against `repos`, and **fails closed** when the target
+  cannot be determined. The legitimate `remote=origin` flow (origin resolving to
+  an allowlisted repo) still passes. `src/allowlist/enforcer.rs`. Regression:
+  `cargo test --lib allowlist::enforcer` (`n7_*`).
+- **Complicit tests corrected.** The pre-existing git-push tests asserted repo
+  enforcement by injecting a synthetic `repo` field the real primitive never
+  sends, so they stayed green while production was unprotected — the same class
+  of false-green that hid C2. Two tests that *asserted* the permissive-on-
+  absence behaviour (`empty_inner_args_blocks_when_field_required`,
+  `flat_shape_top_level_repo_is_invisible`) are flipped to the fail-closed
+  contract, and five new tests exercise the real `{cwd, remote, ref}` shape.
+
 ### Robustness confirmations (no fix needed)
 
 - `kvendra init` on an existing vault refuses (no clobber, no data loss, no
   password change) — it points to `kvendra recover`.
+- Enforcer/executor input consistency: the allowlist enforcer, the approval
+  layer, and the primitive all receive the SAME `arguments` envelope and read
+  `.get("args")` — no C2/H2-style field- or level-divergence remains for
+  shell/argv/cwd.
+- `argv` templates are strict-length with per-token match; the HTTP destructive
+  predicate upper-cases the method (no case-bypass); `git`'s global
+  `protocol.ext.allow=never` covers `remote` too (no `ext::` RCE via push).
 - On-disk Argon2id params are production high-cost (m = 64 MiB, t = 3, p = 1) for
   the sentinel and every secret blob, so an offline attack on the encrypted files
   is bounded by the KDF + master-password strength (threat vector V8).

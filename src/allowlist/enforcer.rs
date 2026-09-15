@@ -370,28 +370,55 @@ fn check_args(
 
     // repos UNION repo (D1 — any-match across both lists).
     //
-    // Accept either `args.repo` (legacy/short form) or `args.url` (canonical
-    // form used by `clone`). Both are normalized via `extract_repo_canonical`
-    // so allowlist patterns like `github.com/Org/*` match regardless of
-    // whether the caller passed `https://github.com/Org/Repo.git`,
-    // `git@github.com:Org/Repo.git`, or the bare `github.com/Org/Repo`.
-    let repo_input: Option<String> = inner
-        .get("repo")
-        .or_else(|| inner.get("url"))
-        .and_then(Value::as_str)
-        .map(extract_repo_canonical);
-    if (c.repos.is_some() || c.repo.is_some())
-        && let Some(repo) = repo_input.as_deref()
-    {
-        let repos_ok = c
-            .repos
-            .as_ref()
-            .is_some_and(|pats| pats.iter().any(|p| glob_match(p, repo)));
-        let repo_alias_ok = c
-            .repo
-            .as_ref()
-            .is_some_and(|pats| pats.iter().any(|p| glob_match(p, repo)));
-        if !repos_ok && !repo_alias_ok {
+    // For `kvendra.github` the target is `args.repo` (or `args.url`). For
+    // `kvendra.git` push/pull/tag/commit there is NO `repo`/`url` field — the
+    // target is the `remote` (a URL, or a name resolved from the `cwd`'s git
+    // config). ISSUE-KVD-CLI-B78ED5 finding **N7**: the enforcer only looked at
+    // `repo`/`url`, so for git ops the `repos` constraint was silently SKIPPED
+    // (a false-green suite hid it by injecting a synthetic `repo` field that the
+    // real `kvendra.git` primitive never sends). An agent could therefore push
+    // any local checkout to any repository — or, with `remote` set to an
+    // attacker URL, exfiltrate code and the credential — with the owner's token.
+    let is_git = primitive == "kvendra.git";
+    let repo_input: Option<String> = if is_git {
+        git_target_repo(&inner, operation == "push")
+    } else {
+        inner
+            .get("repo")
+            .or_else(|| inner.get("url"))
+            .and_then(Value::as_str)
+            .map(extract_repo_canonical)
+    };
+    if c.repos.is_some() || c.repo.is_some() {
+        let Some(repo) = repo_input.as_deref() else {
+            // Fail closed for git: a `repos` constraint with an undeterminable
+            // target is a deny, never a skip (N7). Non-git callers always carry
+            // the repo, so absence there keeps the prior semantics.
+            if is_git {
+                return Err(KvendraError::AllowlistViolation(format!(
+                    "{primitive}.{operation}: cannot determine the target repository \
+                     (no url and no resolvable remote in cwd) — refusing (fail-closed)"
+                )));
+            }
+            return Ok(());
+        };
+        // Host-normalize so `Owner/Name` patterns compare against a URL-derived
+        // `host/Owner/Name` for git (and keep the host in the comparison so an
+        // attacker-host repo does not match a github.com pattern).
+        let cand = if is_git {
+            normalize_repo_host(repo)
+        } else {
+            repo.to_string()
+        };
+        let matches_pat = |pats: &Option<Vec<String>>| {
+            pats.as_ref().is_some_and(|ps| {
+                ps.iter().any(|p| {
+                    let pat = if is_git { normalize_repo_host(p) } else { p.clone() };
+                    glob_match(&pat, &cand)
+                })
+            })
+        };
+        if !matches_pat(&c.repos) && !matches_pat(&c.repo) {
             return Err(KvendraError::AllowlistViolation(format!(
                 "{primitive}.{operation}: repo '{repo}' not allowed"
             )));
@@ -560,6 +587,87 @@ fn extract_repo_canonical(input: &str) -> String {
     s.strip_suffix(".git").unwrap_or(s).to_string()
 }
 
+/// Does `s` look like a git remote URL (scheme, `git@`, or `user@host:` scp
+/// form) rather than a bare remote NAME like `origin`? Used to decide whether
+/// a git `remote` argument is itself the target or a name to resolve from the
+/// repo's config. Misclassification is safe: a URL treated as a name fails to
+/// resolve (deny), and a name treated as a URL canonicalizes to a
+/// non-matching repo (deny) — both fail closed.
+fn looks_like_git_url(s: &str) -> bool {
+    s.contains("://") || s.starts_with("git@") || (s.contains('@') && s.contains(':'))
+}
+
+/// Resolve a git remote NAME to its URL by reading `<cwd>/.git/config`.
+/// For a push we honour `pushurl` (which overrides `url` for pushes) before
+/// `url`. Returns `None` if the config, the section, or the field is absent —
+/// which the caller turns into a fail-closed deny (ISSUE-KVD-CLI-B78ED5 N7).
+fn git_config_remote_url(cwd: &str, remote: &str, prefer_pushurl: bool) -> Option<String> {
+    let path = std::path::Path::new(cwd).join(".git").join("config");
+    let content = std::fs::read_to_string(path).ok()?;
+    let header = format!("[remote \"{remote}\"]");
+    let mut in_section = false;
+    let mut url = None;
+    let mut pushurl = None;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_section = t.eq_ignore_ascii_case(&header);
+            continue;
+        }
+        if in_section && let Some((k, v)) = t.split_once('=') {
+            match k.trim().to_ascii_lowercase().as_str() {
+                "url" => url = Some(v.trim().to_string()),
+                "pushurl" => pushurl = Some(v.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+    if prefer_pushurl { pushurl.or(url) } else { url }
+}
+
+/// Determine the ACTUAL repository a `kvendra.git` operation targets, so the
+/// `repos` allowlist can be enforced against it. `git push`/`pull`/`tag`/
+/// `commit` carry no `repo`/`url` field — the target lives in the `remote`
+/// (which may be a URL or a name) resolved against the `cwd`'s git config.
+/// Pre-fix, the enforcer only looked at `repo`/`url`, so for these ops the
+/// `repos` constraint was silently skipped and an agent could push to any
+/// repository with the owner's credential (ISSUE-KVD-CLI-B78ED5 N7).
+fn git_target_repo(inner: &Value, prefer_pushurl: bool) -> Option<String> {
+    // An explicit url/repo (clone, or any caller that passes it) wins.
+    if let Some(r) = inner
+        .get("repo")
+        .or_else(|| inner.get("url"))
+        .and_then(Value::as_str)
+    {
+        return Some(extract_repo_canonical(r));
+    }
+    // Otherwise the target is the `remote` (default `origin`).
+    let remote = inner
+        .get("remote")
+        .and_then(Value::as_str)
+        .unwrap_or("origin");
+    if looks_like_git_url(remote) {
+        return Some(extract_repo_canonical(remote));
+    }
+    // `remote` is a NAME → resolve it to a URL via the repo's own config.
+    let cwd = inner.get("cwd").and_then(Value::as_str)?;
+    git_config_remote_url(cwd, remote, prefer_pushurl)
+        .map(|u| extract_repo_canonical(&u))
+}
+
+/// Normalize a canonical repo (`host/owner/name` or `owner/name`) so a
+/// host-less allowlist pattern (`Owner/Name`) and a URL-derived repo
+/// (`github.com/Owner/Name`) compare on equal footing. A host-less value
+/// defaults to `github.com/…`; this keeps the host in the comparison, so a
+/// same-owner/name repo on an ATTACKER host (`evil.com/Owner/Name`) does NOT
+/// match a `github.com` pattern (would otherwise leak the credential).
+fn normalize_repo_host(s: &str) -> String {
+    match s.split_once('/') {
+        Some((first, _)) if first.contains('.') => s.to_string(),
+        _ => format!("github.com/{s}"),
+    }
+}
+
 /// Compare a call's argv against a template. The template's tokens may use:
 /// - exact-string match (literal token);
 /// - the same `prefix/*` glob suffix used for repos;
@@ -705,16 +813,16 @@ allowlist:
         }));
         assert!(check(&s, "kvendra.git", "push", &inner_force).is_err());
 
-        // Flat shape: top-level `argv` is not visible to the enforcer, so
-        // there's nothing for `forbidden_args` to inspect. The check is
-        // permissive-on-absence (no argv at all → no rejection). The
-        // contract is: malformed/legacy shapes cannot satisfy nor weaponise
-        // any constraint — they simply get bypassed at the input layer.
+        // Flat shape: top-level fields are not visible to the enforcer (they
+        // live under `args`). Pre-N7 this was permissively ALLOWED, which was
+        // the bug — a git push whose target the enforcer cannot see must not
+        // slip through. With a `repos` constraint declared, an undeterminable
+        // target now fails closed. (`kvendra.git` N7 fix.)
         let flat = serde_json::json!({
             "repo": "github.com/Foo/bar",
             "argv": ["push", "--force"]
         });
-        assert!(check(&s, "kvendra.git", "push", &flat).is_ok());
+        assert!(check(&s, "kvendra.git", "push", &flat).is_err());
     }
 
     #[test]
@@ -1736,11 +1844,11 @@ allowlist:
 
     #[test]
     fn empty_inner_args_blocks_when_field_required() {
-        // Allowlist requires `repos`; envelope has no `repo` field. Today the
-        // enforcer is permissive when the input field is missing (caller
-        // didn't pass anything to validate), but with `args` containing other
-        // keys the caller must still satisfy declared constraints if the
-        // field IS present. We assert the permissive-on-absence semantics.
+        // A `kvendra.git` op with a `repos` constraint but no determinable
+        // target (no url, no resolvable remote in cwd) now FAILS CLOSED
+        // (ISSUE-KVD-CLI-B78ED5 N7). This corrects the previous permissive-on-
+        // absence semantics (PAT-KVD-CLI-003 anti-pattern) that let the repo
+        // constraint be skipped whenever the enforcer could not see a repo.
         let s = spec_with(
             r#"
 profile_id: x
@@ -1755,8 +1863,119 @@ allowlist:
 "#,
         );
         let args = env_args(serde_json::json!({}));
-        // Permissive: no repo provided ⇒ no repo to reject.
-        assert!(check(&s, "kvendra.git", "clone", &args).is_ok());
+        // Fail-closed: no target repo to validate ⇒ deny, not allow.
+        assert!(check(&s, "kvendra.git", "clone", &args).is_err());
+    }
+
+    // ---- N7: repo enforcement on the REAL git push shape {cwd, remote, ref} --
+    // These use no synthetic `repo` field (which the real kvendra.git primitive
+    // never sends), so they exercise the production path the old tests missed.
+
+    fn n7_git_spec() -> ProfileSpec {
+        spec_with(
+            r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.git
+      operations:
+        - push:
+            repos: ["KvendraAI/kvendra-cli"]
+            refs: ["refs/heads/main"]
+            accept_destructive: true
+"#,
+        )
+    }
+
+    fn tmp_git_repo(origin_url: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("kvendra-n7-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(
+            dir.join(".git").join("config"),
+            format!("[remote \"origin\"]\n\turl = {origin_url}\n"),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn n7_push_with_attacker_url_remote_is_denied() {
+        // remote = an attacker URL. Pre-N7 the enforcer saw no `repo`/`url`
+        // field and SKIPPED the repos check → push allowed. Now the URL is the
+        // target and does not match the allowlist → deny.
+        let s = n7_git_spec();
+        let args = env_args(serde_json::json!({
+            "cwd": "/tmp/whatever",
+            "remote": "https://github.com/attacker/evil.git",
+            "ref": "refs/heads/main"
+        }));
+        assert!(check(&s, "kvendra.git", "push", &args).is_err());
+    }
+
+    #[test]
+    fn n7_push_to_attacker_host_same_name_is_denied() {
+        // Credential-exfil shape: same owner/name but an attacker HOST. The
+        // host stays in the comparison, so this must NOT match a github.com
+        // pattern.
+        let s = n7_git_spec();
+        let args = env_args(serde_json::json!({
+            "cwd": "/tmp/whatever",
+            "remote": "https://evil.com/KvendraAI/kvendra-cli.git",
+            "ref": "refs/heads/main"
+        }));
+        assert!(check(&s, "kvendra.git", "push", &args).is_err());
+    }
+
+    #[test]
+    fn n7_push_origin_resolves_from_cwd_config_and_matches_allowlist() {
+        // The legitimate flow: remote = "origin", resolved from the cwd's git
+        // config to an allowlisted repo → allowed. (This is the owner's own
+        // push path; the fix must not break it.)
+        let s = n7_git_spec();
+        let dir = tmp_git_repo("git@github.com:KvendraAI/kvendra-cli.git");
+        let args = env_args(serde_json::json!({
+            "cwd": dir.to_str().unwrap(),
+            "remote": "origin",
+            "ref": "refs/heads/main"
+        }));
+        let res = check(&s, "kvendra.git", "push", &args);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(res.is_ok(), "legit origin push must be allowed: {res:?}");
+    }
+
+    #[test]
+    fn n7_push_origin_pointing_at_disallowed_repo_is_denied() {
+        // remote = "origin" but the cwd's origin is a NON-allowlisted repo →
+        // deny (an agent cannot smuggle a push by choosing a checkout).
+        let s = n7_git_spec();
+        let dir = tmp_git_repo("git@github.com:attacker/evil.git");
+        let args = env_args(serde_json::json!({
+            "cwd": dir.to_str().unwrap(),
+            "remote": "origin",
+            "ref": "refs/heads/main"
+        }));
+        let res = check(&s, "kvendra.git", "push", &args);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(res.is_err(), "push to a disallowed origin must be denied");
+    }
+
+    #[test]
+    fn n7_push_unresolvable_remote_fails_closed() {
+        // remote = a name with no cwd config to resolve → cannot determine the
+        // target → fail closed.
+        let s = n7_git_spec();
+        let args = env_args(serde_json::json!({
+            "cwd": "/tmp/not-a-git-repo-xyz",
+            "remote": "origin",
+            "ref": "refs/heads/main"
+        }));
+        assert!(check(&s, "kvendra.git", "push", &args).is_err());
     }
 
     #[test]
