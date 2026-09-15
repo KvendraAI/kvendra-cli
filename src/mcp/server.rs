@@ -148,18 +148,31 @@ impl ServerContext {
         Ok(true)
     }
 
-    /// Enforce the per-session quota for the `kvendra.unsafe.raw_token` escape
-    /// hatch (ISSUE-KVD-CLI-B78ED5 finding H4). Reads the profile's
-    /// `unsafe_max_uses_per_session` (DSL default = 1), then checks and
-    /// increments the per-session counter. Returns `UnsafeQuotaExceeded` once
-    /// the profile has spent its budget in this `mcp serve` session.
-    ///
-    /// Called AFTER the allowlist + approval gates and BEFORE the plaintext is
-    /// resolved, so a call that consumes a use is one that would actually
-    /// expose the raw credential. Conservative: a call that later fails inside
-    /// the primitive (e.g. hatch disabled in profile meta) still consumes a
-    /// use — an attempt to pull the plaintext spends budget.
-    fn enforce_unsafe_quota(&self, profile_id: &str) -> KvendraResult<()> {
+    /// Per-session quota for the `kvendra.unsafe.raw_token` escape hatch
+    /// (ISSUE-KVD-CLI-B78ED5 finding H4). Split into a non-mutating `check`
+    /// (called early, after the allowlist + approval gates) and a `consume`
+    /// (called only once the plaintext has actually been resolved and is about
+    /// to be exposed). Splitting it means a transient PRE-exposure failure —
+    /// `BrokerUnreachable`, `RateLimited`, a stale-cache refusal — no longer
+    /// burns the (default 1) budget on a call that exposed nothing
+    /// (ISSUE-KVD-CLI-3FD509 item 2). On stdio `mcp serve` requests are
+    /// processed serially, so no other request interleaves between check and
+    /// consume; a concurrent racer at worst spends one extra use (bounded).
+
+    /// Peek: is a use still available for this profile? No mutation.
+    fn check_unsafe_quota(&self, profile_id: &str) -> KvendraResult<()> {
+        let max = self.unsafe_max_uses_for(profile_id);
+        let map = self.unsafe_usage.lock().unwrap_or_else(|p| p.into_inner());
+        let used = map.get(profile_id).copied().unwrap_or(0);
+        if used >= max {
+            return Err(KvendraError::UnsafeQuotaExceeded { used, max });
+        }
+        Ok(())
+    }
+
+    /// Consume one use (atomic check-and-increment). Call ONLY when the token
+    /// will actually be exposed.
+    fn consume_unsafe_quota(&self, profile_id: &str) -> KvendraResult<()> {
         let max = self.unsafe_max_uses_for(profile_id);
         let mut map = self.unsafe_usage.lock().unwrap_or_else(|p| p.into_inner());
         let used = map.entry(profile_id.to_string()).or_insert(0);
@@ -885,15 +898,13 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         );
     }
 
-    // ISSUE-KVD-CLI-B78ED5 finding H4 — enforce the per-session quota on the
-    // plaintext escape hatch. `unsafe_max_uses_per_session` existed in the DSL
-    // but was never read, so a compromised agent could pull the raw token an
-    // unbounded number of times per session. Enforced here, after approval and
-    // before the secret is resolved, so a consumed use is one that would
-    // actually expose the credential.
+    // ISSUE-KVD-CLI-B78ED5 finding H4 — the per-session quota on the plaintext
+    // escape hatch. CHECK here (after approval), so an over-budget call is
+    // refused before we even resolve the secret; the use is CONSUMED later, only
+    // once the token is actually resolved and about to be exposed.
     if name == "kvendra.unsafe.raw_token"
         && !profile_id.is_empty()
-        && let Err(quota_err) = ctx.enforce_unsafe_quota(&profile_id)
+        && let Err(quota_err) = ctx.check_unsafe_quota(&profile_id)
     {
         flags.push(crate::audit::FLAG_UNSAFE_QUOTA_EXCEEDED.to_string());
         let _ = record_audit(
@@ -990,6 +1001,25 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         // still execute.
         None
     };
+
+    // H4 — consume the escape-hatch use ONLY now, after the secret is resolved
+    // and immediately before it is exposed, so a transient pre-exposure failure
+    // above never spent the budget (ISSUE-KVD-CLI-3FD509 item 2).
+    if name == "kvendra.unsafe.raw_token"
+        && !profile_id.is_empty()
+        && let Err(quota_err) = ctx.consume_unsafe_quota(&profile_id)
+    {
+        flags.push(crate::audit::FLAG_UNSAFE_QUOTA_EXCEEDED.to_string());
+        let _ = record_audit(
+            &ctx, &arguments, name, &profile_id, &action, &flags, true, None, Some(&quota_err),
+        )
+        .await;
+        return JsonRpcResponse::error(
+            id,
+            codes::APPLICATION_ERROR,
+            crate::detection::sanitize_output(&quota_err.to_string()),
+        );
+    }
 
     // Started event. `0` indicates audit was disabled (vault locked). The
     // `remote_audit_id` (when present) commits to the chain via the v2

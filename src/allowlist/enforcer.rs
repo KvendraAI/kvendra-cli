@@ -285,14 +285,42 @@ fn check_args(
         }
     }
 
-    // packages (npm/pypi package name).
-    if let Some(allowed) = &c.packages
-        && let Some(pkg) = inner.get("package").and_then(Value::as_str)
-        && !allowed.iter().any(|pat| glob_match(pat, pkg))
-    {
-        return Err(KvendraError::AllowlistViolation(format!(
-            "{primitive}.{operation}: package '{pkg}' not allowed"
-        )));
+    // packages (npm/pypi package name). Most ops carry the name in the
+    // `package` arg; `npm.publish` does NOT — the name lives in
+    // `<cwd>/package.json`, which the enforcer must read (the same class as N7's
+    // git-repo resolution / N10's tag `name`). ISSUE-KVD-CLI-3FD509 item 3: a
+    // `packages` constraint on `npm.publish` was silently skipped
+    // (permissive-on-absence) because there is no `package` field.
+    if let Some(allowed) = &c.packages {
+        let is_npm_publish = primitive == "kvendra.npm" && operation == "publish";
+        let pkg: Option<String> = if is_npm_publish {
+            inner
+                .get("cwd")
+                .and_then(Value::as_str)
+                .and_then(npm_package_name_from_cwd)
+        } else {
+            inner
+                .get("package")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        match pkg.as_deref() {
+            Some(name) => {
+                if !allowed.iter().any(|pat| glob_match(pat, name)) {
+                    return Err(KvendraError::AllowlistViolation(format!(
+                        "{primitive}.{operation}: package '{name}' not allowed"
+                    )));
+                }
+            }
+            None if is_npm_publish => {
+                return Err(KvendraError::AllowlistViolation(format!(
+                    "{primitive}.{operation}: cannot determine the package name from \
+                     cwd/package.json but a `packages` constraint is declared — \
+                     refusing (fail-closed)"
+                )));
+            }
+            None => { /* non-publish ops always carry `package`; nothing to reject */ }
+        }
     }
 
     // projects (e.g. pypi project, gcp project, etc.).
@@ -691,6 +719,18 @@ fn git_target_repo(inner: &Value, operation: &str) -> Option<String> {
     let cwd = inner.get("cwd").and_then(Value::as_str)?;
     git_config_remote_url(cwd, remote, operation == "push")
         .map(|u| extract_repo_canonical(&u))
+}
+
+/// Read the `name` field from `<cwd>/package.json`. Used to enforce a
+/// `packages` constraint on `npm.publish`, whose wire args carry no package
+/// name (it lives in the manifest). Returns `None` if the file is missing or
+/// unparseable → the caller fails closed when a constraint is declared.
+fn npm_package_name_from_cwd(cwd: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(std::path::Path::new(cwd).join("package.json")).ok()?;
+    let pkg: Value = serde_json::from_str(&raw).ok()?;
+    pkg.get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Normalize a canonical repo (`host/owner/name` or `owner/name`) so a
@@ -1322,9 +1362,8 @@ allowlist:
         assert!(check(&s, "kvendra.shell", "run", &empty).is_err());
     }
 
-    #[test]
-    fn packages_happy() {
-        let s = spec_with(
+    fn npm_publish_packages_spec() -> ProfileSpec {
+        spec_with(
             r#"
 profile_id: x
 secret:
@@ -1337,29 +1376,57 @@ allowlist:
             packages: ["@kvendra/*"]
             accept_destructive: true
 "#,
-        );
-        let args = env_args(serde_json::json!({ "package": "@kvendra/cli" }));
-        assert!(check(&s, "kvendra.npm", "publish", &args).is_ok());
+        )
+    }
+
+    fn tmp_npm_pkg(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("kvendra-pkg-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!("{{\"name\":\"{name}\",\"version\":\"1.0.0\"}}"),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn packages_happy() {
+        // Real npm.publish shape: NO `package` arg — the name is read from
+        // <cwd>/package.json (ISSUE-KVD-CLI-3FD509 item 3).
+        let s = npm_publish_packages_spec();
+        let dir = tmp_npm_pkg("@kvendra/cli");
+        let args = env_args(serde_json::json!({ "cwd": dir.to_str().unwrap() }));
+        let res = check(&s, "kvendra.npm", "publish", &args);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(res.is_ok(), "allowlisted scope must pass: {res:?}");
     }
 
     #[test]
     fn packages_blocks_other_scope() {
-        let s = spec_with(
-            r#"
-profile_id: x
-secret:
-  type: t
-allowlist:
-  primitives:
-    - name: kvendra.npm
-      operations:
-        - publish:
-            packages: ["@kvendra/*"]
-            accept_destructive: true
-"#,
-        );
-        let args = env_args(serde_json::json!({ "package": "@evil/typosquat" }));
-        assert!(check(&s, "kvendra.npm", "publish", &args).is_err());
+        let s = npm_publish_packages_spec();
+        let dir = tmp_npm_pkg("@evil/typosquat");
+        let args = env_args(serde_json::json!({ "cwd": dir.to_str().unwrap() }));
+        let res = check(&s, "kvendra.npm", "publish", &args);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(res.is_err(), "disallowed scope must be denied");
+    }
+
+    #[test]
+    fn packages_publish_fails_closed_without_package_json() {
+        // A `packages` constraint with no determinable name (no package.json,
+        // or a synthetic `package` decoy the real primitive never sends) must
+        // fail closed — not silently skip.
+        let s = npm_publish_packages_spec();
+        let decoy = env_args(serde_json::json!({
+            "cwd": "/tmp/no-such-kvendra-pkg-xyz",
+            "package": "@kvendra/cli"  // decoy: ignored for publish
+        }));
+        assert!(check(&s, "kvendra.npm", "publish", &decoy).is_err());
     }
 
     #[test]
