@@ -239,10 +239,51 @@ against the running broker and re-verified fixed. Behaviour changes are flagged.
   `flat_shape_top_level_repo_is_invisible`) are flipped to the fail-closed
   contract, and five new tests exercise the real `{cwd, remote, ref}` shape.
 
+### Fixed — cycle 8 (the `kvendra.http` primitive: broad-scope guardrail + header redaction)
+
+- **N8 — the broad-scope guardrail on `url_pattern_regex` was literal, so an
+  effectively host-unrestricted pattern bypassed the `accept_broad_scope`
+  gate.** `kvendra.http` is the most powerful primitive (a permissive allowlist
+  hands the agent network egress with the profile's secret), so the validator
+  is meant to force an explicit opt-in for broad URL scopes. But it only
+  rejected the three literal strings `.*`, `^.*$`, `.+` — so `^https?://`,
+  `^http`, `.`, or a bare scheme prefix passed validation while matching ANY
+  host. The check is now semantic: a pattern is compiled with the SAME anchoring
+  the enforcer uses (`regex_match_url`, reused rather than re-implemented to
+  avoid drift) and tested against canary URLs on reserved/bogus hosts
+  (`.invalid`, `.test`, TEST-NET-1); a pattern that matches an arbitrary host
+  does not pin a host and is rejected without `accept_broad_scope`. Host-pinned
+  patterns (`^https://api\.example\.com/.*`, subdomain and alternation forms)
+  still pass. `src/allowlist/validator.rs`.
+- **N9 — `kvendra.http` response headers were returned to the agent
+  unsanitized.** The response body was passed through the secret-detection
+  redactor but the response headers were not, an asymmetry an agent could use
+  to read a secret back — the caller controls `auth_scheme`/`headers`, and an
+  allowlisted endpoint can reflect a request header or return a token in a
+  response header (Set-Cookie, X-Api-Key, …). Header values are now redacted
+  too. `src/primitives/http.rs`.
+
+### Known design item — cycle 8 (tracked, owner decision)
+
+- **Approval cache is per-profile, not per-operation.** In the default
+  `ask-destructive` mode, a single human approval warms a TTL window keyed on
+  `(profile_id, allowlist_hmac)` — so approving one destructive op (e.g. a
+  benign `github.create_issue`) silently authorizes every OTHER destructive op
+  on that profile (e.g. `git.push` to `main`, `github.release`) for the window,
+  across all repos the profile covers. This is the documented sudo-style window,
+  but the cross-operation blast radius is broad. Scoping the cache key to the
+  operation (or warning the user what the window covers) is tracked as a
+  follow-up (`ISSUE-KVD-CLI-B77E33`); left as an owner UX/security decision
+  rather than changed unilaterally in a security patch.
+
 ### Robustness confirmations (no fix needed)
 
 - `kvendra init` on an existing vault refuses (no clobber, no data loss, no
   password change) — it points to `kvendra recover`.
+- The `unsafe.raw_token` per-session quota is atomic (check-and-increment under
+  one lock), enforced after approval and before the secret is resolved.
+- `s3_sync`/`s3_cp` validate BOTH `src` and `dst` buckets. The audit log stores
+  only a SHA-256 of the arguments, never the raw args or the token.
 - Enforcer/executor input consistency: the allowlist enforcer, the approval
   layer, and the primitive all receive the SAME `arguments` envelope and read
   `.get("args")` — no C2/H2-style field- or level-divergence remains for

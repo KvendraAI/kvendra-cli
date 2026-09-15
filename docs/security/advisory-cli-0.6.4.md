@@ -200,6 +200,30 @@ encrypted files are bounded by the master password), and fuzzing found no crashe
   same false-green class as C2. Those tests were corrected and the real
   `{cwd, remote, ref}` shape is now covered.
 
+### Found in the pentest (cycle 8: the `kvendra.http` primitive)
+
+- **N8 — the broad-scope guardrail was literal.** `kvendra.http` is the
+  highest-blast-radius primitive, so the validator is meant to force an explicit
+  `accept_broad_scope` opt-in for URL patterns that are not host-specific. It
+  only rejected the exact strings `.*`, `^.*$`, `.+`, so an effectively
+  host-unrestricted pattern (`^https?://`, `^http`, `.`, a bare scheme prefix)
+  passed validation and handed the agent the profile's secret for any host. The
+  check is now semantic: patterns are tested (with the enforcer's own anchoring)
+  against canary URLs on reserved hosts; anything matching an arbitrary host is
+  rejected without `accept_broad_scope`. Host-pinned patterns still pass.
+- **N9 — HTTP response headers were returned unsanitized** while the body was
+  redacted, an asymmetry an agent could use to read a secret back (it controls
+  `auth_scheme`/request headers, and an endpoint can reflect a header or return
+  a token in one). Header values now go through the same redactor as the body.
+
+Also confirmed with no finding this cycle: the `unsafe.raw_token` quota is
+atomic (check-and-increment under one lock, before the secret is resolved);
+`s3_sync`/`s3_cp` validate both `src` and `dst`; the audit log stores only a
+SHA-256 of the arguments, never the raw args or the token. One design item —
+the approval cache is per-profile, so one approval warms a window covering every
+destructive op on that profile — is tracked as `ISSUE-KVD-CLI-B77E33` for an
+owner UX decision (not a fail-open bug).
+
 ## Design-level items — documented, not code-patched
 
 These are threat-model boundaries, not one-line bugs. They are stated honestly

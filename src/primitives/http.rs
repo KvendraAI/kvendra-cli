@@ -124,13 +124,21 @@ async fn request(op_args: &Value, secret: Option<&SecretPlaintext>) -> KvendraRe
 
     let resp = builder.send().await?;
     let status = resp.status();
+    // Sanitize header VALUES too, not just the body: an allowlisted endpoint can
+    // reflect a request header (the agent controls `auth_scheme`/`headers`) or
+    // return a token in a response header (Set-Cookie, X-Api-Key, …). The body
+    // was already passed through the detection redactor; headers were not, an
+    // asymmetry an agent could use to read a secret back (ISSUE-KVD-CLI-B78ED5).
     let headers_map: serde_json::Map<String, Value> = resp
         .headers()
         .iter()
         .filter_map(|(k, v)| {
-            v.to_str()
-                .ok()
-                .map(|vs| (k.as_str().to_string(), Value::String(vs.to_string())))
+            v.to_str().ok().map(|vs| {
+                (
+                    k.as_str().to_string(),
+                    Value::String(crate::detection::sanitize_output(vs)),
+                )
+            })
         })
         .collect();
     let bytes = resp.bytes().await.unwrap_or_default();

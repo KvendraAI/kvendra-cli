@@ -7,6 +7,18 @@ use crate::allowlist::catalog;
 use crate::allowlist::dsl::{OperationConstraints, ProfileSpec};
 use crate::error::{KvendraError, KvendraResult};
 
+/// Canary URLs on reserved / bogus hosts (RFC 2606 `.invalid`/`.test`, RFC 5737
+/// TEST-NET-1) that no legitimate allowlist would ever target. A
+/// `url_pattern_regex` that matches ANY of these does not pin a host and is
+/// therefore effectively host-unrestricted (broad scope). Used to reject broad
+/// HTTP patterns that are not literally `.*` (finding N8).
+const BROAD_SCOPE_CANARIES: &[&str] = &[
+    "https://canary-8f3a2b9c.invalid/probe",
+    "http://c4n4ry.attacker.test/x?y=z",
+    "https://192.0.2.77/latest/meta-data/",
+    "ftp://nope.invalid/",
+];
+
 pub fn validate(spec: &ProfileSpec) -> KvendraResult<()> {
     if spec.profile_id.is_empty() {
         return Err(KvendraError::AllowlistParse("profile_id is empty".into()));
@@ -115,16 +127,31 @@ fn check_constraints(primitive: &str, op: &str, c: &OperationConstraints) -> Kve
                     )));
                 }
                 for pat in patterns {
-                    let trimmed = pat.trim();
-                    if (trimmed == ".*" || trimmed == "^.*$" || trimmed == ".+") && !accept_broad {
-                        return Err(KvendraError::AllowlistParse(format!(
-                            "{primitive}.{op}: wildcard regex '{pat}' rejected without accept_broad_scope"
-                        )));
-                    }
                     // Compile to validate well-formedness.
                     if regex::Regex::new(pat).is_err() {
                         return Err(KvendraError::AllowlistParse(format!(
                             "{primitive}.{op}: invalid url_pattern_regex '{pat}'"
+                        )));
+                    }
+                    // ISSUE-KVD-CLI-B78ED5 finding N8 — broad-scope detection was
+                    // literal (only `.*`, `^.*$`, `.+`), so an effectively
+                    // host-unrestricted regex (`^https?://`, `^http`, `.`, a bare
+                    // scheme prefix, …) slipped past the `accept_broad_scope` gate
+                    // and handed the agent the profile's secret for ANY host. Test
+                    // the pattern the SAME way the enforcer will (`regex_match_url`
+                    // anchoring — reused, not re-implemented, to avoid drift)
+                    // against canary URLs on reserved/bogus hosts no real allowlist
+                    // targets. A pattern that matches an arbitrary host does not pin
+                    // a host and is broad by definition.
+                    if !accept_broad
+                        && BROAD_SCOPE_CANARIES
+                            .iter()
+                            .any(|c| crate::allowlist::enforcer::regex_match_url(pat, c))
+                    {
+                        return Err(KvendraError::AllowlistParse(format!(
+                            "{primitive}.{op}: url_pattern_regex '{pat}' is effectively \
+                             host-unrestricted (it matches arbitrary hosts) — pin a host \
+                             or set accept_broad_scope: true"
                         )));
                     }
                 }
@@ -266,6 +293,63 @@ allowlist:
 "#;
         let p = ProfileSpec::from_yaml(yaml).unwrap();
         assert!(validate(&p).is_ok());
+    }
+
+    // ---- N8: effectively-broad regexes that are not literally `.*` ----------
+
+    fn http_spec_with_pattern(pat: &str, accept_broad: bool) -> String {
+        let broad = if accept_broad {
+            "\n            accept_broad_scope: true"
+        } else {
+            ""
+        };
+        format!(
+            r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.http
+      operations:
+        - request:
+            methods: ["GET"]
+            url_pattern_regex: ['{pat}']{broad}
+"#
+        )
+    }
+
+    #[test]
+    fn n8_rejects_effectively_broad_regexes() {
+        // None of these is literally `.*`, yet each matches arbitrary hosts.
+        for pat in ["^https?://", "^http", "^https://", ".", "^.", "^https?://.*"] {
+            let p = ProfileSpec::from_yaml(&http_spec_with_pattern(pat, false)).unwrap();
+            assert!(
+                validate(&p).is_err(),
+                "pattern '{pat}' is host-unrestricted and must be rejected without accept_broad_scope"
+            );
+        }
+    }
+
+    #[test]
+    fn n8_host_pinned_patterns_still_pass() {
+        for pat in [
+            r"^https://api\.example\.com/.*",
+            r"^https://[^/]+\.example\.com/v1/.*",
+            r"^https://(api|cdn)\.example\.com/.*",
+        ] {
+            let p = ProfileSpec::from_yaml(&http_spec_with_pattern(pat, false)).unwrap();
+            assert!(validate(&p).is_ok(), "host-pinned pattern '{pat}' must pass");
+        }
+    }
+
+    #[test]
+    fn n8_accept_broad_scope_allows_broad_pattern() {
+        let p = ProfileSpec::from_yaml(&http_spec_with_pattern("^https?://", true)).unwrap();
+        assert!(
+            validate(&p).is_ok(),
+            "an explicit accept_broad_scope must allow a broad pattern"
+        );
     }
 
     #[test]

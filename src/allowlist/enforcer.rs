@@ -519,7 +519,7 @@ fn glob_match(pattern: &str, candidate: &str) -> bool {
 /// host prefix is what closes the exfiltration bypass. Every production
 /// profile already writes `^https://…`, so this is a no-op for well-formed
 /// allowlists and a hard deny for the bypass shape.
-fn regex_match_url(pattern: &str, candidate: &str) -> bool {
+pub(crate) fn regex_match_url(pattern: &str, candidate: &str) -> bool {
     let anchored = if pattern.starts_with('^') {
         pattern.to_string()
     } else {
