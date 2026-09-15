@@ -393,7 +393,7 @@ fn check_args(
     // attacker URL, exfiltrate code and the credential — with the owner's token.
     let is_git = primitive == "kvendra.git";
     let repo_input: Option<String> = if is_git {
-        git_target_repo(&inner, operation == "push")
+        git_target_repo(&inner, operation)
     } else {
         inner
             .get("repo")
@@ -644,16 +644,22 @@ fn git_config_remote_url(cwd: &str, remote: &str, prefer_pushurl: bool) -> Optio
 /// Pre-fix, the enforcer only looked at `repo`/`url`, so for these ops the
 /// `repos` constraint was silently skipped and an agent could push to any
 /// repository with the owner's credential (ISSUE-KVD-CLI-B78ED5 N7).
-fn git_target_repo(inner: &Value, prefer_pushurl: bool) -> Option<String> {
-    // An explicit url/repo (clone, or any caller that passes it) wins.
-    if let Some(r) = inner
-        .get("repo")
-        .or_else(|| inner.get("url"))
-        .and_then(Value::as_str)
-    {
-        return Some(extract_repo_canonical(r));
+fn git_target_repo(inner: &Value, operation: &str) -> Option<String> {
+    // `clone` is the ONLY git op whose target is a caller-supplied `url`/`repo`
+    // field (the clone primitive reads `url`). For push/pull/tag/commit the
+    // primitive pushes/operates against the `remote` (a URL or a name resolved
+    // from the cwd's config) and NEVER reads `repo`/`url` — so honouring a
+    // caller-supplied `repo`/`url` on those ops would let a decoy allowlisted
+    // `repo` pass the check while the primitive pushes to an attacker `remote`,
+    // re-opening N7. Ignore `repo`/`url` for those ops.
+    if operation == "clone" {
+        return inner
+            .get("url")
+            .or_else(|| inner.get("repo"))
+            .and_then(Value::as_str)
+            .map(extract_repo_canonical);
     }
-    // Otherwise the target is the `remote` (default `origin`).
+    // The target is the `remote` (default `origin`).
     let remote = inner
         .get("remote")
         .and_then(Value::as_str)
@@ -662,8 +668,9 @@ fn git_target_repo(inner: &Value, prefer_pushurl: bool) -> Option<String> {
         return Some(extract_repo_canonical(remote));
     }
     // `remote` is a NAME → resolve it to a URL via the repo's own config.
+    // `pushurl` overrides `url` for a push.
     let cwd = inner.get("cwd").and_then(Value::as_str)?;
-    git_config_remote_url(cwd, remote, prefer_pushurl)
+    git_config_remote_url(cwd, remote, operation == "push")
         .map(|u| extract_repo_canonical(&u))
 }
 
@@ -742,7 +749,7 @@ allowlist:
             repos: ["github.com/Foo/*"]
 "#,
         );
-        let args = env_args(serde_json::json!({ "repo": "github.com/Foo/bar" }));
+        let args = env_args(serde_json::json!({ "remote": "https://github.com/Foo/bar.git" }));
         assert!(check(&s, "kvendra.git", "push", &args).is_ok());
     }
 
@@ -763,7 +770,7 @@ allowlist:
 "#,
         );
         let args = env_args(serde_json::json!({
-            "repo": "github.com/Foo/bar",
+            "remote": "https://github.com/Foo/bar.git",
             "argv": ["push", "--force"]
         }));
         assert!(check(&s, "kvendra.git", "push", &args).is_err());
@@ -820,7 +827,7 @@ allowlist:
 
         // Inner-args shape: forbidden arg is detected and rejected.
         let inner_force = env_args(serde_json::json!({
-            "repo": "github.com/Foo/bar",
+            "remote": "https://github.com/Foo/bar.git",
             "argv": ["push", "--force"]
         }));
         assert!(check(&s, "kvendra.git", "push", &inner_force).is_err());
@@ -831,7 +838,7 @@ allowlist:
         // slip through. With a `repos` constraint declared, an undeterminable
         // target now fails closed. (`kvendra.git` N7 fix.)
         let flat = serde_json::json!({
-            "repo": "github.com/Foo/bar",
+            "remote": "https://github.com/Foo/bar.git",
             "argv": ["push", "--force"]
         });
         assert!(check(&s, "kvendra.git", "push", &flat).is_err());
@@ -854,7 +861,7 @@ allowlist:
 "#,
         );
         let args = env_args(serde_json::json!({
-            "repo": "github.com/Foo/bar",
+            "remote": "https://github.com/Foo/bar.git",
             "argv": ["push", "--force-with-lease"]
         }));
         let err = check(&s, "kvendra.git", "push", &args).unwrap_err();
@@ -1394,7 +1401,7 @@ allowlist:
 "#,
         );
         let args = env_args(serde_json::json!({
-            "repo": "github.com/Foo/bar",
+            "remote": "https://github.com/Foo/bar.git",
             "ref": "refs/heads/main"
         }));
         assert!(check(&s, "kvendra.git", "push", &args).is_ok());
@@ -1418,7 +1425,7 @@ allowlist:
 "#,
         );
         let args = env_args(serde_json::json!({
-            "repo": "github.com/Foo/bar",
+            "remote": "https://github.com/Foo/bar.git",
             "ref": "refs/heads/release/1.0"
         }));
         assert!(check(&s, "kvendra.git", "push", &args).is_err());
@@ -2009,6 +2016,25 @@ allowlist:
     }
 
     #[test]
+    fn n7_push_decoy_repo_field_does_not_mask_attacker_remote() {
+        // A real git push carries NO repo/url (the primitive targets `remote`).
+        // An agent adding a benign allowlisted `repo` DECOY must not let a push
+        // to an attacker `remote` through: the enforcer must validate the actual
+        // target (the remote), never a caller-supplied repo/url on push.
+        let s = n7_git_spec();
+        let args = env_args(serde_json::json!({
+            "repo": "KvendraAI/kvendra-cli",                    // decoy: allowlisted
+            "remote": "https://github.com/attacker/evil.git",  // real push target
+            "ref": "refs/heads/main",
+            "cwd": "/tmp/whatever"
+        }));
+        assert!(
+            check(&s, "kvendra.git", "push", &args).is_err(),
+            "a decoy repo field must not mask an attacker remote"
+        );
+    }
+
+    #[test]
     fn n7_push_unresolvable_remote_fails_closed() {
         // remote = a name with no cwd config to resolve → cannot determine the
         // target → fail closed.
@@ -2147,7 +2173,7 @@ allowlist:
 "#,
         );
         let args = env_args(serde_json::json!({
-            "repo": "github.com/Foo/bar",
+            "remote": "https://github.com/Foo/bar.git",
             "ref": "refs/tags/v0.4.0-alpha.3"
         }));
         assert!(check(&s, "kvendra.git", "push", &args).is_ok());
@@ -2172,7 +2198,7 @@ allowlist:
 "#,
         );
         let args = env_args(serde_json::json!({
-            "repo": "github.com/Foo/bar",
+            "remote": "https://github.com/Foo/bar.git",
             "ref": "refs/heads/release/v1"
         }));
         assert!(check(&s, "kvendra.git", "push", &args).is_ok());
@@ -2199,7 +2225,7 @@ allowlist:
 "#,
         );
         let args = env_args(serde_json::json!({
-            "repo": "github.com/Foo/bar",
+            "remote": "https://github.com/Foo/bar.git",
             "ref": "refs/heads/release/v1/sub"
         }));
         let err = check(&s, "kvendra.git", "push", &args).unwrap_err();
@@ -2250,7 +2276,7 @@ allowlist:
 "#,
         );
         let args = env_args(serde_json::json!({
-            "repo": "github.com/OrgX/KvendraAI-evil",
+            "remote": "https://github.com/OrgX/KvendraAI-evil.git",
             "ref": "refs/heads/main"
         }));
         let err = check(&s, "kvendra.git", "push", &args).unwrap_err();
@@ -2280,7 +2306,7 @@ allowlist:
 "#,
         );
         let args = env_args(serde_json::json!({
-            "repo": "github.com/Foo/bar",
+            "remote": "https://github.com/Foo/bar.git",
             "ref": "refs/heads/main"
         }));
         let err = check(&s, "kvendra.git", "push", &args).unwrap_err();
