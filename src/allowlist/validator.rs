@@ -106,6 +106,19 @@ fn validate_destructive_opt_in(spec: &ProfileSpec) -> KvendraResult<()> {
 fn check_constraints(primitive: &str, op: &str, c: &OperationConstraints) -> KvendraResult<()> {
     let accept_broad = c.accept_broad_scope.unwrap_or(false);
 
+    // ISSUE-KVD-CLI-3FD509 (projects sibling) — a `projects` constraint on
+    // `pypi.upload` cannot be enforced: the project name is not in the wire args
+    // (it lives in the dist filename / metadata), so it would be silently skipped
+    // (permissive-on-absence, the C2/N7/N10 class). Surface the misconfiguration
+    // at sign time rather than failing open at runtime.
+    if primitive == "kvendra.pypi" && op == "upload" && c.projects.is_some() {
+        return Err(KvendraError::AllowlistParse(format!(
+            "{primitive}.{op}: `projects` cannot be enforced on pypi upload (the project \
+             name is not in the call args) — restrict uploads with a project-scoped PyPI \
+             token, and use `projects` only on read_metadata"
+        )));
+    }
+
     if let Some(methods) = &c.methods
         && methods.is_empty()
         && !accept_broad
@@ -169,6 +182,25 @@ fn check_constraints(primitive: &str, op: &str, c: &OperationConstraints) -> Kve
                              host-unrestricted (it matches arbitrary hosts) — pin a host \
                              or set accept_broad_scope: true"
                         )));
+                    }
+                    // ISSUE-KVD-CLI-3FD509 item 5 — userinfo-floating host. A `@`
+                    // in the AUTHORITY position (`^https://github.com@[^/]+/`)
+                    // makes the part after `@` the real host, so the pattern is
+                    // host-unrestricted even though it names a host — a footgun the
+                    // canaries can't catch generically. Reject an `@` that appears
+                    // before the first path `/` (the authority); a `@` in the PATH
+                    // (npm scope `/@org/…`) is fine.
+                    if !accept_broad
+                        && let Some((_, after_scheme)) = pat.split_once("://")
+                    {
+                        let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+                        if authority.contains('@') {
+                            return Err(KvendraError::AllowlistParse(format!(
+                                "{primitive}.{op}: url_pattern_regex '{pat}' has `@` in the host \
+                                 position (userinfo floats the real host) — pin a host or set \
+                                 accept_broad_scope: true"
+                            )));
+                        }
                     }
                 }
             }
@@ -380,6 +412,61 @@ allowlist:
                 "TLD-only broad pattern '{pat}' must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn projects_on_pypi_upload_rejected_at_sign_time() {
+        let bad = r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.pypi
+      operations:
+        - upload:
+            projects: ["myproj"]
+"#;
+        assert!(
+            validate(&ProfileSpec::from_yaml(bad).unwrap()).is_err(),
+            "projects on pypi.upload cannot be enforced — must be rejected at sign time"
+        );
+        let ok = r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.pypi
+      operations:
+        - read_metadata:
+            projects: ["myproj"]
+"#;
+        assert!(
+            validate(&ProfileSpec::from_yaml(ok).unwrap()).is_ok(),
+            "projects on read_metadata is enforceable and must pass"
+        );
+    }
+
+    #[test]
+    fn item5_rejects_userinfo_authority_allows_scope_path() {
+        // `@` in the AUTHORITY (userinfo floats the host) → reject.
+        let bad = ProfileSpec::from_yaml(&http_spec_with_pattern(
+            r"^https://github\.com@[^/]+/",
+            false,
+        ))
+        .unwrap();
+        assert!(
+            validate(&bad).is_err(),
+            "userinfo-authority pattern must be rejected"
+        );
+        // `@` in the PATH (npm scope) → allowed (not a host-floating footgun).
+        let ok = ProfileSpec::from_yaml(&http_spec_with_pattern(
+            r"^https://registry\.npmjs\.org/@myorg/.*",
+            false,
+        ))
+        .unwrap();
+        assert!(validate(&ok).is_ok(), "npm scope path with @ must pass");
     }
 
     #[test]
