@@ -46,8 +46,18 @@ async fn request(op_args: &Value, secret: Option<&SecretPlaintext>) -> KvendraRe
         .unwrap_or("bearer");
     let body = op_args.get("body").cloned();
 
+    // ISSUE-KVD-CLI-B78ED5 (medium) — do NOT auto-follow redirects. This is
+    // the generic broker: the caller supplies an arbitrary URL and the
+    // profile's secret rides as a Bearer/API-key header. reqwest's default
+    // policy follows up to 10 redirects, so a server answering 302 with a
+    // `Location:` it controls could pull the credential to a host the
+    // allowlist never vetted. With `Policy::none()` a 3xx is returned to the
+    // caller verbatim (status + headers) and the secret never leaves the
+    // allowlisted origin; the agent can issue an explicit follow-up if it
+    // genuinely needs the redirect target.
     let client = reqwest::Client::builder()
         .user_agent(concat!("kvendra/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let m = method.to_ascii_uppercase();
     let mut builder = match m.as_str() {

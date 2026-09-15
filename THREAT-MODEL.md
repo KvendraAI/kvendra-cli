@@ -17,6 +17,20 @@ change.
 > memory while the vault is unlocked), the only thing visible is encrypted
 > blobs that are mathematically useless without your master password.
 
+> **Honest boundary (corrected v0.6.4, external audit finding C3).** The
+> promise above holds **while the vault is LOCKED**. While the vault is
+> UNLOCKED, `~/.kvendra/sessions/active.blob` stores the Argon2id-derived key
+> encrypted under a *machine-bound* wrap key that is derived from **public**
+> inputs (hostname + uid + the canonical `~/.kvendra` path) and a hardcoded
+> sentinel IKM (`ADR-KVD-029`). A process running **as your uid** can therefore
+> read that blob (mode 0600) and recover the derived key **without your master
+> password**, for the lifetime of the session. This is the deliberate
+> trade-off that lets `kvendra mcp serve` run without re-prompting; it does NOT
+> break the at-rest guarantee (a locked vault exposes nothing), but it means an
+> unlocked session's derived key is only as protected as your user account.
+> The real fix is hardware-backed wrapping (Secure Enclave / TPM / FIDO2),
+> deferred post-MVP — see O1 and "Future mitigation" below.
+
 Concretely:
 - No code path in the `kvendra` binary writes the master password, the
   Argon2id-derived key, or any decrypted secret to disk.
@@ -61,9 +75,20 @@ Out of scope (handled in later phases):
 |---|---|
 | Attacker | Backup leak, disk snapshot, unprivileged malware. |
 | Capabilities | Reads ciphertext blobs and the audit log. |
-| Plaintext exposed | None without the master password. |
+| Plaintext exposed | None without the master password **while the vault is
+  locked**. See the caveat below for the unlocked-session blob. |
 | Mitigation | Argon2id (m_cost = 64 MiB, t_cost = 3, p_cost = 1) +
   AES-256-GCM client-side (AC-VAULT-2, AC-VAULT-4).
+
+> **Caveat — unlocked-session blob (audit finding C3, v0.6.4).** When the vault
+> is unlocked, `sessions/active.blob` is decryptable by a process running as
+> your uid **without** the master password (its wrap key comes from public,
+> machine-bound inputs — `ADR-KVD-029`). So V2's "none without the master
+> password" applies to the secret blobs and the at-rest state; it does NOT
+> apply to the derived key while a session is live. An attacker who already has
+> code execution as your user during an unlocked session is close to the O1
+> boundary (RAM dump) anyway. Locking the vault (`kvendra lock`, idle timeout,
+> or process exit) removes the blob's usefulness immediately.
 
 ### V3 — Malicious Kvendra-team insider (post-MVP cloud sync)
 
@@ -198,6 +223,38 @@ Mitigation: every `tools/call` is audited; primitives are reviewed
 before merge; sensitive buffers use `zeroize`. The detection layer
 (REQ-KVD-002 Bloque 7) is the safety net for tokens the agent
 accidentally re-emits.
+
+### O7 — Offline audit-export authenticity (audit finding H1, v0.6.4)
+
+The signed audit export bundle is **self-contained** so it can be verified
+offline. To do that it embeds `chain_key_seed_hex`, the **symmetric** HMAC key
+of the chain. Offline `kvendra audit verify` therefore proves the rows are
+internally **consistent** with that seed — it detects accidental corruption and
+in-place tampering of a bundle you already trust — but it does **not** prove
+**authenticity**: anyone holding the bundle can recompute the whole chain and
+forge rows. Real authenticity requires server-side verification against the key
+Kvendra retained at issue time (the bundle's `verifier_url`). As of v0.6.4 the
+bundle carries an explicit `security_note` field stating this, so no reviewer
+mistakes offline integrity for offline authenticity.
+
+Future mitigation: asymmetric (public-key) signing of the bundle — sign with a
+private key held only by the issuer, verify with a published public key — so an
+offline verifier can confirm authenticity without being able to forge. Tracked
+as a design follow-up.
+
+### O8 — Presence-gated approval is macOS-only (audit finding H3)
+
+The interactive per-`tools/call` approval prompt (`ask` / `ask-destructive`)
+is backed by an OS-presence popup that exists only on macOS. On Linux/Windows
+the backend returns `Unavailable`, which **fails closed** (the op is blocked),
+so the only way to operate a broker on Linux today is
+`KVENDRA_APPROVAL_MODE=silent` — i.e. turning the interactive confirmation off.
+This is safe-by-default (deny on absence) but limits the protection available
+to non-macOS users to the allowlist + audit layers.
+
+Future mitigation: a Linux presence backend (polkit / D-Bus / a TTY-isolated
+prompt) so `ask-destructive` is usable without disabling it. Tracked as a
+future ROAD item.
 
 ## Cryptographic primitives
 

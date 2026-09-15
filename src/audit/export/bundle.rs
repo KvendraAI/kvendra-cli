@@ -65,6 +65,29 @@ pub struct ExportBundle {
     pub chain_end_hmac_hex: String,
     pub chain_key_seed_hex: String,
     pub verifier_url: String,
+    /// Honest trust-model disclosure (ISSUE-KVD-CLI-B78ED5 finding H1). The
+    /// bundle embeds `chain_key_seed_hex`, the SYMMETRIC HMAC key. Offline
+    /// `kvendra audit verify` therefore proves the rows are internally
+    /// consistent with that seed, but NOT that they are authentic: anyone
+    /// holding the bundle can recompute the whole chain and forge rows. Real
+    /// authenticity requires server-side verification against the key Kvendra
+    /// stored at issue time (`verifier_url`). Asymmetric (public-key) signing
+    /// of the bundle is tracked as a design follow-up. Present so no consumer
+    /// mistakes offline integrity for offline authenticity.
+    #[serde(default = "default_security_note")]
+    pub security_note: String,
+}
+
+/// Default value for [`ExportBundle::security_note`]. A function (not a const)
+/// so serde can use it as a `#[serde(default = …)]` and older bundles without
+/// the field deserialize cleanly.
+pub fn default_security_note() -> String {
+    "Offline verification with the embedded chain_key_seed_hex proves INTEGRITY \
+     (rows are consistent with that symmetric key) but NOT AUTHENTICITY — the \
+     seed is symmetric, so a holder of this bundle can recompute/forge the \
+     chain. For authenticity, verify server-side at verifier_url against the \
+     key Kvendra retained at issue time. See ISSUE-KVD-CLI-B78ED5 (H1)."
+        .to_string()
 }
 
 /// Build the bundle from already-filtered + already-redacted stored events.
@@ -123,6 +146,7 @@ pub fn build_bundle(
         chain_end_hmac_hex,
         chain_key_seed_hex,
         verifier_url: "https://app.kvendra.cloud/audit-verify".to_string(),
+        security_note: default_security_note(),
     }
 }
 

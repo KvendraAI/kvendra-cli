@@ -1,5 +1,17 @@
 # Security Policy
 
+## Kvendra CLI — what protection you have
+
+If you use the `kvendra` CLI vault, read
+[**what protects you and what does not**](docs/security/protection-levels.md)
+before you rely on it. In short: your encrypted files are safe at rest (bounded
+by your master password) and your AI agent never holds the plaintext, but a
+process that has fully taken over your user account while the vault is unlocked
+can read what you can read. That limit, and the opt-in ways to raise it
+(hardware-backed keys, remote broker), are documented plainly. The most recent
+security release is described in the
+[0.6.4 advisory](docs/security/advisory-cli-0.6.4.md).
+
 ## Reporting a Vulnerability
 
 We take security seriously. If you discover a vulnerability in any Kvendra product, please report it responsibly.

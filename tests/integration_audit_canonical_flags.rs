@@ -86,6 +86,7 @@ async fn bootstrap_ctx(yaml: &str, profile_id: &str) -> (TempDir, Arc<ServerCont
         resolver: None,
         session: None,
         workspace_id: None,
+        unsafe_usage: Default::default(),
     });
     (dir, ctx)
 }
@@ -240,9 +241,13 @@ async fn network_failure_does_not_emit_allowlist_denied() {
 /// auto-migrates on first read AND emits a dedicated audit row tagged
 /// `allowlist_hmac_migrated`.
 #[tokio::test]
-async fn migration_legacy_profile_emits_allowlist_hmac_migrated_flag() {
+async fn missing_allowlist_signature_fails_closed() {
+    // ISSUE-KVD-CLI-B78ED5 finding A6 (v0.6.4) — a profile whose stored
+    // allowlist HMAC is absent (an attacker nulled `allowlist_hmac_hex` after
+    // rewriting the YAML permissively) must be REFUSED, not auto-signed and
+    // adopted. Pre-0.6.4 the enforcer re-signed the on-disk YAML on this path
+    // ("legacy migration"), which was an allowlist-integrity bypass.
     let (_dir, ctx) = bootstrap_ctx(SHELL_ECHO_ONLY_YAML, "p").await;
-    // Reset the HMAC to None to simulate a legacy profile.
     let mut profile = ctx.vault.load_profile_meta("p").unwrap();
     profile.allowlist_hmac_hex = None;
     ctx.vault.save_profile_meta(&profile).unwrap();
@@ -253,53 +258,67 @@ async fn migration_legacy_profile_emits_allowlist_hmac_migrated_flag() {
         "run",
         serde_json::json!({ "binary": "echo", "argv": ["hi"] }),
     );
-    let _resp = dispatch(req, ctx.clone()).await;
+    let resp = dispatch(req, ctx.clone()).await;
+    assert!(
+        resp.error.is_some(),
+        "a missing allowlist signature must be refused (A6)"
+    );
 
     let rows = collect_flags(&ctx).await;
     assert!(
-        rows.iter().any(
-            |(action, primitive, flags, _s)| action == "allowlist_hmac_migrated"
-                && primitive == kvendra::audit::PRIMITIVE_SYSTEM
-                && flags.contains("allowlist_hmac_migrated")
-        ),
-        "expected dedicated migration row, got: {rows:?}"
+        !rows
+            .iter()
+            .any(|(action, _p, _f, _s)| action == "allowlist_hmac_migrated"),
+        "must NOT auto-migrate / launder the tampered allowlist: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(_a, _p, flags, _s)| flags.contains("allowlist_tampered_detected")),
+        "must emit allowlist_tampered_detected: {rows:?}"
+    );
+    // No laundering: the profile stays unsigned after the refused call.
+    let after = ctx.vault.load_profile_meta("p").unwrap();
+    assert!(
+        after.allowlist_hmac_hex.is_none(),
+        "a refused call must NOT re-sign the allowlist"
     );
 }
 
-/// REQ-KVD-CLI-002 / ISSUE-023 — second invocation on a now-signed profile
-/// must NOT emit a second `allowlist_hmac_migrated` row (idempotent).
+/// A6 (v0.6.4) — a refused missing-signature call stays refused on repeat and
+/// never launders the allowlist (the auto-migration path that used to re-sign
+/// it was removed).
 #[tokio::test]
-async fn migration_idempotent_second_call_no_extra_flag() {
+async fn missing_allowlist_signature_stays_refused_on_repeat() {
     let (_dir, ctx) = bootstrap_ctx(SHELL_ECHO_ONLY_YAML, "p").await;
     let mut profile = ctx.vault.load_profile_meta("p").unwrap();
     profile.allowlist_hmac_hex = None;
     ctx.vault.save_profile_meta(&profile).unwrap();
 
-    // First call — triggers migration row.
-    let req1 = tools_call(
-        "p",
-        "kvendra.shell",
-        "run",
-        serde_json::json!({ "binary": "echo", "argv": ["hi"] }),
-    );
-    let _ = dispatch(req1, ctx.clone()).await;
-    // Second call — already signed, no migration.
-    let req2 = tools_call(
-        "p",
-        "kvendra.shell",
-        "run",
-        serde_json::json!({ "binary": "echo", "argv": ["hello"] }),
-    );
-    let _ = dispatch(req2, ctx.clone()).await;
+    for _ in 0..2 {
+        let req = tools_call(
+            "p",
+            "kvendra.shell",
+            "run",
+            serde_json::json!({ "binary": "echo", "argv": ["hi"] }),
+        );
+        let resp = dispatch(req, ctx.clone()).await;
+        assert!(
+            resp.error.is_some(),
+            "each call must be refused (no laundering)"
+        );
+    }
 
     let rows = collect_flags(&ctx).await;
-    let migration_count = rows
-        .iter()
-        .filter(|(action, _p, _f, _s)| action == "allowlist_hmac_migrated")
-        .count();
-    assert_eq!(
-        migration_count, 1,
-        "migration row must be idempotent (1 row only), got: {rows:?}"
+    assert!(
+        !rows
+            .iter()
+            .any(|(action, _p, _f, _s)| action == "allowlist_hmac_migrated"),
+        "no migration row must ever be emitted: {rows:?}"
+    );
+    let after = ctx.vault.load_profile_meta("p").unwrap();
+    assert!(
+        after.allowlist_hmac_hex.is_none(),
+        "must never be re-signed"
     );
 }
 

@@ -104,14 +104,10 @@ pub async fn execute(args: &Value, secret: Option<&SecretPlaintext>) -> KvendraR
 }
 
 fn aws_command(creds: &AwsCreds) -> Command {
-    let mut cmd = Command::new("aws");
-    // Detach from the broker's stdin (JSON-RPC request pipe) so a long aws
-    // op cannot consume/corrupt it and cause a silent EOF disconnect on the
-    // next transport read (ISSUE-KVD-CLI-330251). Covers all 4 ops since they
-    // all build through this helper.
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    // Hardened spawn: sensitive KVENDRA_* env stripped (N1), PATH sanitised
+    // (A2), stdin detached (ISSUE-KVD-CLI-330251), stdout/stderr piped. The
+    // credential env vars are added AFTER the scrub so they survive.
+    let mut cmd = crate::primitives::spawn::hardened_command("aws");
     cmd.env("AWS_ACCESS_KEY_ID", &creds.access_key_id)
         .env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
     if let Some(t) = &creds.session_token {
@@ -132,6 +128,9 @@ async fn s3_sync(op_args: &Value, creds: &AwsCreds) -> KvendraResult<Value> {
         .get("dst")
         .and_then(Value::as_str)
         .ok_or_else(|| KvendraError::InvalidArgs("aws.s3_sync.dst required".into()))?;
+    // N5 — reject option-injection (e.g. src=`--endpoint-url=http://evil/`).
+    crate::primitives::spawn::reject_option_like("aws.s3_sync.src", src)?;
+    crate::primitives::spawn::reject_option_like("aws.s3_sync.dst", dst)?;
     let mut cmd = aws_command(creds);
     cmd.arg("s3").arg("sync").arg(src).arg(dst);
     if op_args
@@ -153,6 +152,9 @@ async fn s3_cp(op_args: &Value, creds: &AwsCreds) -> KvendraResult<Value> {
         .get("dst")
         .and_then(Value::as_str)
         .ok_or_else(|| KvendraError::InvalidArgs("aws.s3_cp.dst required".into()))?;
+    // N5 — reject option-injection on the positional src/dst.
+    crate::primitives::spawn::reject_option_like("aws.s3_cp.src", src)?;
+    crate::primitives::spawn::reject_option_like("aws.s3_cp.dst", dst)?;
     let mut cmd = aws_command(creds);
     cmd.arg("s3").arg("cp").arg(src).arg(dst);
     run("s3_cp", cmd).await
@@ -165,6 +167,10 @@ async fn cloudfront_invalidate(op_args: &Value, creds: &AwsCreds) -> KvendraResu
         .ok_or_else(|| {
             KvendraError::InvalidArgs("aws.cloudfront_invalidate.distribution_id required".into())
         })?;
+    crate::primitives::spawn::reject_option_like(
+        "aws.cloudfront_invalidate.distribution_id",
+        distribution_id,
+    )?;
     let paths_default = vec![Value::String("/*".into())];
     let paths = op_args
         .get("paths")
@@ -191,6 +197,7 @@ async fn lambda_invoke(op_args: &Value, creds: &AwsCreds) -> KvendraResult<Value
         .ok_or_else(|| {
             KvendraError::InvalidArgs("aws.lambda_invoke.function_name required".into())
         })?;
+    crate::primitives::spawn::reject_option_like("aws.lambda_invoke.function_name", function)?;
     let payload = op_args
         .get("payload")
         .map(|v| v.to_string())

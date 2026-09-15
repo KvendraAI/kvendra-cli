@@ -8,7 +8,75 @@
 use crate::error::{KvendraError, KvendraResult};
 use crate::vault::SecretPlaintext;
 use serde_json::{Value, json};
-use tokio::process::Command;
+
+/// Validate a git remote URL before it reaches `git clone` (ISSUE-KVD-CLI-B78ED5
+/// finding H5). `git` treats an argument like `ext::sh -c '<cmd>'` as a remote
+/// helper that executes an arbitrary command — a clone of such a URL is RCE.
+/// A URL beginning with `-` is parsed as a git option (option injection). This
+/// guard is defense in depth ON TOP of the global `protocol.ext.allow=never`
+/// config applied to every git invocation below.
+///
+/// Accepts: `https://`, `http://`, `ssh://`, `git://`, and the scp-like
+/// `[user@]host:path` form. Rejects: a leading `-`, and any
+/// `<transport>::<address>` remote-helper prefix (ext::, fd::, …). IPv6
+/// literals such as `https://[::1]/x` are preserved (the `::` there follows a
+/// scheme separator, not a bare transport token).
+pub fn validate_git_url(url: &str) -> KvendraResult<()> {
+    let u = url.trim();
+    if u.is_empty() {
+        return Err(KvendraError::InvalidArgs("git: empty url".into()));
+    }
+    if u.starts_with('-') {
+        return Err(KvendraError::InvalidArgs(
+            "git: url must not start with '-' (option injection)".into(),
+        ));
+    }
+    // Reject the `transport::address` remote-helper syntax. Split on the FIRST
+    // `::`; if the text before it carries no scheme separator (`//`), it is a
+    // bare transport token (ext, fd, …) and we refuse it.
+    if let Some((prefix, _)) = u.split_once("::")
+        && !prefix.contains("//")
+    {
+        return Err(KvendraError::InvalidArgs(
+            "git: 'transport::' remote helpers are not allowed (ext:: enables RCE)".into(),
+        ));
+    }
+    let ok = u.starts_with("https://")
+        || u.starts_with("http://")
+        || u.starts_with("ssh://")
+        || u.starts_with("git://")
+        || is_scp_like(u);
+    if !ok {
+        return Err(KvendraError::InvalidArgs(
+            "git: unsupported url scheme (allowed: https, http, ssh, git, scp-like git@host:path)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// scp-like remote syntax `[user@]host:path` (no URL scheme). Requires a single
+/// `:` whose left side is a non-empty host without a `/`, and no whitespace.
+fn is_scp_like(u: &str) -> bool {
+    if u.contains("://") || u.chars().any(char::is_whitespace) {
+        return false;
+    }
+    match u.split_once(':') {
+        Some((host, _path)) => !host.is_empty() && !host.contains('/'),
+        None => false,
+    }
+}
+
+/// Reject an argument that would be parsed as a git option because it begins
+/// with `-` (option injection on `remote` / `ref` / `tag` positionals).
+fn no_leading_dash(field: &str, value: &str) -> KvendraResult<()> {
+    if value.starts_with('-') {
+        return Err(KvendraError::InvalidArgs(format!(
+            "git: {field} must not start with '-' (option injection)"
+        )));
+    }
+    Ok(())
+}
 
 pub async fn execute(args: &Value, _secret: Option<&SecretPlaintext>) -> KvendraResult<Value> {
     let operation = args
@@ -17,21 +85,29 @@ pub async fn execute(args: &Value, _secret: Option<&SecretPlaintext>) -> Kvendra
         .ok_or_else(|| KvendraError::InvalidArgs("operation missing".into()))?;
     let op_args = args.get("args").cloned().unwrap_or(Value::Null);
 
-    let mut cmd = Command::new("git");
-    // Never let git inherit the broker's stdin (the JSON-RPC request pipe).
-    // A long push could otherwise consume/corrupt it and trigger a silent
-    // EOF on the next transport read (ISSUE-KVD-CLI-330251).
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    // Hardened spawn: scrub KVENDRA_* env (N1) + sanitised PATH (A2) + stdin
+    // detached (ISSUE-KVD-CLI-330251). SSH_AUTH_SOCK and the rest of the env
+    // are preserved so SSH-key auth still works.
+    let mut cmd = crate::primitives::spawn::hardened_command("git");
+    // Global hardening (ISSUE-KVD-CLI-B78ED5 finding H5): disable the `ext`
+    // remote helper (arbitrary command execution) and restrict the `file`
+    // helper for EVERY git operation — clone, push, pull, etc. This neutralises
+    // the `ext::sh -c …` RCE vector regardless of which field carries the URL.
+    cmd.arg("-c")
+        .arg("protocol.ext.allow=never")
+        .arg("-c")
+        .arg("protocol.file.allow=user");
     match operation {
         "clone" => {
             let url = op_args
                 .get("url")
                 .and_then(Value::as_str)
                 .ok_or_else(|| KvendraError::InvalidArgs("clone.url required".into()))?;
+            validate_git_url(url)?;
             let dst = op_args.get("dst").and_then(Value::as_str);
-            cmd.arg("clone").arg(url);
+            // `--` terminates option parsing: the URL and dst are positionals,
+            // so even a value that slips past validation cannot become a flag.
+            cmd.arg("clone").arg("--").arg(url);
             if let Some(d) = dst {
                 cmd.arg(d);
             }
@@ -41,10 +117,12 @@ pub async fn execute(args: &Value, _secret: Option<&SecretPlaintext>) -> Kvendra
                 .get("remote")
                 .and_then(Value::as_str)
                 .unwrap_or("origin");
+            no_leading_dash("push.remote", remote)?;
             let r#ref = op_args
                 .get("ref")
                 .and_then(Value::as_str)
                 .ok_or_else(|| KvendraError::InvalidArgs("push.ref required".into()))?;
+            no_leading_dash("push.ref", r#ref)?;
             if let Some(cwd) = op_args.get("cwd").and_then(Value::as_str) {
                 cmd.current_dir(cwd);
             }
@@ -55,10 +133,12 @@ pub async fn execute(args: &Value, _secret: Option<&SecretPlaintext>) -> Kvendra
                 .get("remote")
                 .and_then(Value::as_str)
                 .unwrap_or("origin");
+            no_leading_dash("pull.remote", remote)?;
             let r#ref = op_args
                 .get("ref")
                 .and_then(Value::as_str)
                 .ok_or_else(|| KvendraError::InvalidArgs("pull.ref required".into()))?;
+            no_leading_dash("pull.ref", r#ref)?;
             if let Some(cwd) = op_args.get("cwd").and_then(Value::as_str) {
                 cmd.current_dir(cwd);
             }
@@ -79,6 +159,7 @@ pub async fn execute(args: &Value, _secret: Option<&SecretPlaintext>) -> Kvendra
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or_else(|| KvendraError::InvalidArgs("tag.name required".into()))?;
+            no_leading_dash("tag.name", name)?;
             if let Some(cwd) = op_args.get("cwd").and_then(Value::as_str) {
                 cmd.current_dir(cwd);
             }

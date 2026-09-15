@@ -5,8 +5,10 @@
 //! Three behaviours:
 //! - default: full unlock — anti-captured-env defense, password from TTY,
 //!   write `~/.kvendra/sessions/active.blob`.
-//! - `--extend`: refresh the TTL of an existing active session without
-//!   asking for the password again.
+//! - `--extend`: refresh the TTL of an existing active session. Since v0.6.4
+//!   this RE-AUTHENTICATES with the master password (finding A1): extending a
+//!   privileged session is a privileged action, so it can no longer be looped
+//!   to keep a session alive forever without the password.
 //! - `KVENDRA_PASSWORD` env var: legacy CI path. Skips the TTY guard
 //!   because there is no terminal to begin with — caller is responsible
 //!   for the captured-env risk in that case.
@@ -36,6 +38,7 @@ use clap::Args;
 use std::path::Path;
 use std::time::Duration;
 use time::OffsetDateTime;
+use zeroize::Zeroize;
 
 #[derive(Debug, Args)]
 pub struct UnlockArgs {
@@ -44,10 +47,13 @@ pub struct UnlockArgs {
     /// definition.
     #[arg(long, env = "KVENDRA_PASSWORD")]
     pub password_env: Option<String>,
-    /// Refresh the TTL of the existing session without re-prompting. Fails
-    /// if there is no active session or if it has expired (run `kvendra
-    /// unlock` without `--extend` instead).
-    #[arg(long, conflicts_with = "password_env")]
+    /// Refresh the TTL of the existing session. Re-authenticates with the
+    /// master password (v0.6.4, finding A1) — reads it from the TTY, or from
+    /// `KVENDRA_PASSWORD` for unattended automation. Fails if there is no
+    /// active session or if it has expired (run `kvendra unlock` without
+    /// `--extend` instead). No longer conflicts with `KVENDRA_PASSWORD`, since
+    /// extension now needs the password like a full unlock.
+    #[arg(long)]
     pub extend: bool,
     /// Override the TTL (e.g. `30m`, `4h`, `8h`, `1d`). Default `4h`.
     /// Subject to `session.max_ttl` cap once configurable (Turn 5).
@@ -72,29 +78,13 @@ pub async fn run(args: UnlockArgs) -> KvendraResult<()> {
 
     let ttl = resolve_ttl(args.ttl.as_deref(), &cfg.session)?;
 
-    if args.extend {
-        let new_expires = session_extend_ttl(&home, ttl)?;
-        // Audit FLAG_UNLOCK_EXTENDED — requires a temporary unlock to obtain
-        // the HMAC sub-key. The blob carries the derived key by design, so
-        // we can install it cheaply without paying the Argon2id cost.
-        let _ = audit_session_event(
-            &home,
-            cfg.vault.idle_timeout_minutes,
-            FLAG_UNLOCK_EXTENDED,
-            Severity::Info,
-            "session_extended",
-        )
-        .await;
-        println!(
-            "Session extended. New TTL: {} (expires {}).",
-            format_ttl(ttl),
-            format_human_iso(new_expires)
-        );
-        return Ok(());
-    }
-
     // Anti-captured-env defense (PAT-KVD-CLI-008). Skipped only when the
     // caller passed `KVENDRA_PASSWORD` — non-interactive by definition.
+    //
+    // Hoisted above the `--extend` branch in v0.6.4: extending a session's
+    // TTL now re-authenticates too (finding A1 below), so BOTH a full unlock
+    // and an extend read the master password here, TTY-guarded when
+    // interactive.
     let tty_handle = if args.password_env.is_none() {
         match ensure_real_terminal() {
             Ok(h) => Some(h),
@@ -129,12 +119,56 @@ pub async fn run(args: UnlockArgs) -> KvendraResult<()> {
         }
     };
 
+    if args.extend {
+        // ISSUE-KVD-CLI-B78ED5 cycle-3 finding A1 — RE-AUTHENTICATE on extend.
+        // Pre-0.6.4 `--extend` bumped the session TTL straight from the
+        // on-disk blob with NO password, no presence, no anti-captured-env
+        // guard. So any process running as the owner could keep a session —
+        // and therefore the broker's credential access — alive indefinitely
+        // by looping `kvendra unlock --extend --ttl <max>`, defeating the
+        // absolute-TTL gate the design advertises, all without ever knowing
+        // the master password.
+        //
+        // Extension is a privileged action, so it now proves knowledge of the
+        // master password, exactly like `kvendra bypass` (whose own comment
+        // reads "never extends a live session"). We verify in a TRANSIENT
+        // vault that we lock immediately, so no new live session is created
+        // by the check itself.
+        let transient = Vault::new(home.clone());
+        let mut pw = password;
+        let unlock_result = transient.unlock(pw.as_bytes(), cfg.vault.idle_timeout_minutes);
+        pw.zeroize();
+        unlock_result?; // InvalidMasterPassword bubbles up cleanly.
+        transient.lock();
+
+        let new_expires = session_extend_ttl(&home, ttl)?;
+        // Audit FLAG_UNLOCK_EXTENDED — the transient unlock above gives us the
+        // HMAC sub-key so this row persists to audit.db.
+        let _ = audit_session_event(
+            &home,
+            cfg.vault.idle_timeout_minutes,
+            FLAG_UNLOCK_EXTENDED,
+            Severity::Info,
+            "session_extended",
+        )
+        .await;
+        println!(
+            "Session extended. New TTL: {} (expires {}).",
+            format_ttl(ttl),
+            format_human_iso(new_expires)
+        );
+        return Ok(());
+    }
+
     vault.unlock(password.as_bytes(), cfg.vault.idle_timeout_minutes)?;
 
-    // REQ-KVD-008: auto-migrate a pre-REQ-008 config.toml on first unlock
-    // post-upgrade (silent if already signed). Then re-load with the vault
-    // attached so the HMAC verification + home_canonical check run.
-    crate::config::auto_migrate_config_if_needed(&home, &vault)?;
+    // REQ-KVD-008 + finding A5: re-load the config with the vault attached so
+    // the HMAC verification + home_canonical check run. A config that is not
+    // validly signed (tampered: trailer removed or content appended after it)
+    // is now REJECTED here rather than silently adopted and re-signed — the
+    // pre-0.6.4 `auto_migrate_config_if_needed` re-sign was the launderer that
+    // made the config-integrity bypass invisible, so it is no longer invoked
+    // on unlock.
     let _signed_cfg = Config::load(&home, Some(&vault))?;
 
     // Persist the local session blob so `kvendra mcp serve` can unlock the
@@ -238,4 +272,96 @@ fn resolve_ttl(
 
 fn format_human_iso(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::local::{
+        build_state_for_current_machine, persist_atomic, status as local_status,
+    };
+    use crate::vault::kdf::KdfParams;
+    use std::time::Duration as StdDuration;
+
+    fn fast_params() -> KdfParams {
+        KdfParams {
+            m_cost_kib: 19_456,
+            t_cost: 2,
+            p_cost: 1,
+            salt: vec![1u8; 16],
+        }
+    }
+
+    /// Seed a vault + a live session blob (TTL 1h) in `home`, then leave the
+    /// vault locked (fresh-process shape).
+    fn seed_vault_and_session(home: &std::path::Path, password: &[u8]) {
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(password, fast_params()).unwrap();
+        v.unlock(password, 30).unwrap();
+        let derived = v.peek_session_derived_key().unwrap();
+        let state =
+            build_state_for_current_machine(derived, StdDuration::from_secs(3600), home).unwrap();
+        persist_atomic(&state, home).unwrap();
+        v.lock();
+    }
+
+    /// ISSUE-KVD-CLI-B78ED5 cycle-3 finding A1 — `kvendra unlock --extend`
+    /// must re-authenticate: a wrong password is rejected and leaves the
+    /// session TTL untouched; the correct password extends it. Pre-0.6.4 the
+    /// extend path took NO password at all.
+    #[tokio::test]
+    async fn extend_requires_master_password() {
+        let _guard = crate::test_env_lock().lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        seed_vault_and_session(home, b"hunter2-extend");
+
+        let expires_before = local_status(home).expires_at.expect("session active");
+
+        unsafe {
+            std::env::set_var("KVENDRA_HOME", home);
+            std::env::remove_var("KVENDRA_APPROVAL_MODE");
+        }
+
+        // Wrong password → rejected, blob untouched.
+        let wrong = run(UnlockArgs {
+            password_env: Some("wrong-password".into()),
+            extend: true,
+            ttl: Some("2h".into()),
+            no_keychain: true,
+        })
+        .await;
+        assert!(
+            matches!(wrong, Err(KvendraError::InvalidMasterPassword)),
+            "extend with a wrong password must be rejected, got {wrong:?}"
+        );
+        let expires_after_wrong = local_status(home).expires_at.expect("still active");
+        assert_eq!(
+            expires_before, expires_after_wrong,
+            "a rejected extend must NOT change the session TTL"
+        );
+
+        // Correct password → extends.
+        let ok = run(UnlockArgs {
+            password_env: Some("hunter2-extend".into()),
+            extend: true,
+            ttl: Some("2h".into()),
+            no_keychain: true,
+        })
+        .await;
+        assert!(
+            ok.is_ok(),
+            "extend with the correct password must succeed: {ok:?}"
+        );
+        let expires_after_ok = local_status(home).expires_at.expect("still active");
+        assert!(
+            expires_after_ok > expires_before,
+            "a correct extend must push expires_at out (was {expires_before}, now {expires_after_ok})"
+        );
+
+        unsafe {
+            std::env::remove_var("KVENDRA_HOME");
+        }
+    }
 }

@@ -72,6 +72,7 @@ async fn bootstrap_ctx(yaml: &str, profile_id: &str) -> (TempDir, Arc<ServerCont
         resolver: None,
         session: None,
         workspace_id: None,
+        unsafe_usage: Default::default(),
     });
     (dir, ctx)
 }

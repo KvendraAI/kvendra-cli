@@ -86,6 +86,47 @@ pub const FLAG_BYPASS_USED: &str = "bypass_used";
 /// A grant failed signature verification — tamper or a foreign/rotated key.
 pub const FLAG_BYPASS_SIG_INVALID: &str = "bypass_sig_invalid";
 
+// ─── Fail-closed enforcement hardening (ISSUE-KVD-CLI-B78ED5, external audit
+//     by Salva Ferrer / avtn.es, 2026-09). Canonical flags for the boundary
+//     rejections introduced by the v0.6.4 security patch. Each marks a call
+//     the dispatcher refused BEFORE dispatch so the AC-AUDIT-1 trace can tell
+//     these deliberate denials apart from network / parse errors.
+
+/// A `tools/call` for a vault-dependent primitive arrived with an empty
+/// `profile_id`. Pre-0.6.4 this silently skipped the allowlist AND the
+/// approval layer (audit finding C1). The dispatcher now fails closed.
+pub const FLAG_EMPTY_PROFILE_DENIED: &str = "empty_profile_denied";
+
+/// A `tools/call` arrived with a `profile_id` outside the safe character set
+/// `[A-Za-z0-9._-]`. The id is interpolated into vault filesystem paths
+/// (`allowlists/<id>.yaml`, `secrets/<id>.blob`, `profiles/<id>.json`), so an
+/// id containing `/` or `..` was a path-traversal vector. Found during the
+/// v0.6.4 adversarial pass (cycle 2, beyond the external audit); the
+/// dispatcher now rejects it before any path is built.
+pub const FLAG_INVALID_PROFILE_DENIED: &str = "invalid_profile_denied";
+
+/// A profile carried a secret but no allowlist YAML on disk. Pre-0.6.4 this
+/// was fail-open (any op allowed — audit finding C4). The dispatcher now
+/// refuses the call and points the user at `kvendra secret set-allowlist`.
+pub const FLAG_MISSING_ALLOWLIST_DENIED: &str = "missing_allowlist_denied";
+
+/// The `kvendra.unsafe.raw_token` escape hatch exceeded its per-session
+/// `unsafe_max_uses_per_session` quota. Pre-0.6.4 the counter was declared
+/// in the DSL but never read (audit finding H4); it is now enforced.
+pub const FLAG_UNSAFE_QUOTA_EXCEEDED: &str = "unsafe_quota_exceeded";
+
+/// A `kvendra.git` call was rejected because its URL used a dangerous
+/// transport (`ext::`, option-injection via a leading `-`, or a
+/// non-allowlisted scheme). Pre-0.6.4 `git clone` passed the URL through
+/// unvalidated, enabling `ext::sh -c ...` RCE (audit finding H5).
+pub const FLAG_GIT_URL_REJECTED: &str = "git_url_rejected";
+
+/// A `kvendra.shell` allowlist declared a `binaries:` constraint but the
+/// call payload carried no `binary` field the enforcer could check. Pre-0.6.4
+/// the enforcer read the wrong key (`bin` vs `binary`) so the constraint was
+/// inert (audit finding C2); it now fails closed on shape mismatch.
+pub const FLAG_SHELL_BINARY_SHAPE_MISMATCH: &str = "shell_binary_shape_mismatch";
+
 /// Status field of an audit row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

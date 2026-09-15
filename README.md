@@ -13,7 +13,11 @@ Built in Rust. Open source under Apache-2.0. Repository: [`KvendraAI/kvendra-cli
 
 ## Status
 
-Pre-alpha. Placeholder crate — the `kvendra` binary does not yet exist. Namespace reserved on crates.io ahead of the Alpha 0.1 MVP.
+Pre-1.0 (`0.6.x`). The `kvendra` binary is functional and published to
+crates.io; the CLI surface and on-disk formats may still change before 1.0.
+Security fixes ship promptly — see the [security policy](SECURITY.md), the
+[0.6.4 advisory](docs/security/advisory-cli-0.6.4.md), and
+[what protection you have and what does not](docs/security/protection-levels.md).
 
 ## What will live here
 

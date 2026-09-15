@@ -185,10 +185,18 @@ pub fn request_user_presence_only(reason: &str) -> Result<(), BiometricError> {
 }
 
 /// Escape characters that would break the AppleScript string literal we
-/// embed into the `osascript -e` argument. Only `"` and `\` are special
-/// inside an AppleScript double-quoted string.
+/// embed into the `osascript -e` argument. `"` and `\` are the escape-sensitive
+/// characters inside an AppleScript double-quoted string; additionally we drop
+/// control characters (newlines, tabs, NUL, …). The `reason` is built partly
+/// from the agent-supplied `profile_id`, so a raw newline could otherwise
+/// terminate the string literal and turn a benign dialog into a malformed
+/// script (which would fail closed, but is better prevented). v0.6.4 cycle-2.
 fn sanitize_for_applescript(raw: &str) -> String {
-    raw.replace('\\', "\\\\").replace('"', "\\\"")
+    raw.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
 }
 
 #[cfg(test)]

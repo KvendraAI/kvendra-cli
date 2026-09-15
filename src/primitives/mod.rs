@@ -15,6 +15,7 @@ pub mod http;
 pub mod npm;
 pub mod pypi;
 pub mod shell;
+pub mod spawn;
 pub mod unsafe_raw_token;
 
 use serde_json::{Value, json};
@@ -171,6 +172,24 @@ const CATALOG: [PrimitiveInfo; 8] = [
         requires_vault: true,
     },
 ];
+
+/// Validate an agent-supplied `profile_id` before it is interpolated into any
+/// vault filesystem path (`allowlists/<id>.yaml`, `secrets/<id>.blob`,
+/// `profiles/<id>.json`). Only `[A-Za-z0-9._-]` is accepted, and the literal
+/// `..` component is rejected outright. This blocks path traversal (`/`, `\`,
+/// `../…`) and control-character filenames from an untrusted `tools/call`.
+///
+/// Found during the v0.6.4 adversarial pass (cycle 2, beyond the external
+/// audit): the MCP dispatcher previously passed `profile_id` straight to the
+/// vault path builders with no character validation.
+pub fn is_valid_profile_id(profile_id: &str) -> bool {
+    !profile_id.is_empty()
+        && profile_id.len() <= 256
+        && !profile_id.contains("..")
+        && profile_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
 
 /// REQ-KVD-CLI-42CB74 — look up `requires_vault` for a tool by name. Used
 /// by the MCP dispatcher's `LockedPendingUnlock` gate. Returns `true` as

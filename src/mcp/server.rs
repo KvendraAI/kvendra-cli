@@ -15,8 +15,7 @@ use crate::allowlist::{ProfileSpec, check as allowlist_check, validate as allowl
 use crate::approval::{self, ApprovalCache, Transport};
 use crate::audit::reader::args_hash_hex;
 use crate::audit::{
-    AuditEvent, AuditWriter, FLAG_TOOL_CALL_BLOCKED_PENDING_UNLOCK, PRIMITIVE_SYSTEM, Severity,
-    Status,
+    AuditEvent, AuditWriter, FLAG_TOOL_CALL_BLOCKED_PENDING_UNLOCK, Severity, Status,
 };
 use crate::config::Config;
 use crate::detection::{Decision, detect};
@@ -88,6 +87,13 @@ pub struct ServerContext {
     /// Workspace identifier this server is bound to (mirrors
     /// `session.workspace_id`). Used by allowlist sync + stale-blocked checks.
     pub workspace_id: Option<String>,
+    /// Per-session usage counter for the `kvendra.unsafe.raw_token` escape
+    /// hatch, keyed by profile_id. Enforces `unsafe_max_uses_per_session`
+    /// from the profile's allowlist DSL (audit finding H4 — the field was
+    /// declared but never read, so the plaintext hatch had no per-session
+    /// cap). Lives for the process (session) lifetime; reset on restart, so a
+    /// fresh `mcp serve` starts every profile's budget at zero.
+    pub unsafe_usage: std::sync::Mutex<std::collections::HashMap<String, u32>>,
 }
 
 impl ServerContext {
@@ -140,6 +146,48 @@ impl ServerContext {
         }
         *guard = Some(AuditWriter::spawn(db_path, key)?);
         Ok(true)
+    }
+
+    /// Enforce the per-session quota for the `kvendra.unsafe.raw_token` escape
+    /// hatch (ISSUE-KVD-CLI-B78ED5 finding H4). Reads the profile's
+    /// `unsafe_max_uses_per_session` (DSL default = 1), then checks and
+    /// increments the per-session counter. Returns `UnsafeQuotaExceeded` once
+    /// the profile has spent its budget in this `mcp serve` session.
+    ///
+    /// Called AFTER the allowlist + approval gates and BEFORE the plaintext is
+    /// resolved, so a call that consumes a use is one that would actually
+    /// expose the raw credential. Conservative: a call that later fails inside
+    /// the primitive (e.g. hatch disabled in profile meta) still consumes a
+    /// use — an attempt to pull the plaintext spends budget.
+    fn enforce_unsafe_quota(&self, profile_id: &str) -> KvendraResult<()> {
+        let max = self.unsafe_max_uses_for(profile_id);
+        let mut map = self.unsafe_usage.lock().unwrap_or_else(|p| p.into_inner());
+        let used = map.entry(profile_id.to_string()).or_insert(0);
+        if *used >= max {
+            return Err(KvendraError::UnsafeQuotaExceeded { used: *used, max });
+        }
+        *used += 1;
+        Ok(())
+    }
+
+    /// Read `unsafe_max_uses_per_session` for the escape hatch from a profile's
+    /// allowlist YAML. Falls back to the DSL default (1) when the allowlist is
+    /// absent, unparsable, or does not declare the primitive — the
+    /// conservative floor, matching `PrimitiveAllow`'s serde default.
+    fn unsafe_max_uses_for(&self, profile_id: &str) -> u32 {
+        let path = self.vault.profile_allowlist_path(profile_id);
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return crate::allowlist::dsl::DEFAULT_UNSAFE_MAX_USES;
+        };
+        let Ok(spec) = serde_yaml_ng::from_str::<ProfileSpec>(&raw) else {
+            return crate::allowlist::dsl::DEFAULT_UNSAFE_MAX_USES;
+        };
+        spec.allowlist
+            .primitives
+            .iter()
+            .find(|p| p.name == "kvendra.unsafe.raw_token")
+            .map(|p| p.unsafe_max_uses_per_session)
+            .unwrap_or(crate::allowlist::dsl::DEFAULT_UNSAFE_MAX_USES)
     }
 }
 
@@ -271,6 +319,7 @@ pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
         resolver,
         session: session_arc,
         workspace_id,
+        unsafe_usage: Default::default(),
     });
     let mut transport = StdioTransport::new();
 
@@ -295,6 +344,25 @@ pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
                 break Ok(());
             }
             Err(e) => {
+                // Pentest finding S4c — a MALFORMED JSON-RPC line is
+                // recoverable, not fatal. Pre-0.6.4 any un-parseable line
+                // terminated the serve loop, so a single bad line (a hostile
+                // client, or a stray non-blank write from a subprocess that
+                // touched the pipe) killed the broker session = DoS. We now
+                // reply with a JSON-RPC parse error (-32700) and KEEP SERVING.
+                // Only a genuine transport I/O error ends the loop.
+                if matches!(e, KvendraError::McpProtocol(_)) {
+                    tracing::warn!(
+                        served_requests = served,
+                        error = %e,
+                        "skipped a malformed JSON-RPC line — continuing"
+                    );
+                    let resp = JsonRpcResponse::error(None, codes::PARSE_ERROR, "Parse error");
+                    if let Err(werr) = transport.write(&resp).await {
+                        break Err(werr);
+                    }
+                    continue;
+                }
                 tracing::warn!(
                     served_requests = served,
                     error = %e,
@@ -575,6 +643,68 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         );
     }
 
+    // ISSUE-KVD-CLI-B78ED5 finding C1 — FAIL CLOSED on an empty profile_id.
+    // Every catalog primitive is credential-bound (`tool_requires_vault`), so
+    // a call with no profile has no allowlist to enforce and no secret to
+    // resolve. Pre-0.6.4 the empty-profile path silently SKIPPED both the
+    // allowlist enforcement (guarded by `if !profile_id.is_empty()`) AND the
+    // approval layer (which mapped an empty profile to destructive=false), so
+    // `kvendra.shell` with no `profile_id` executed an arbitrary binary with
+    // no allowlist and no confirmation. Refuse before any dispatch.
+    if profile_id.is_empty() && crate::primitives::tool_requires_vault(name) {
+        flags.push(crate::audit::FLAG_EMPTY_PROFILE_DENIED.to_string());
+        let err = KvendraError::AllowlistViolation(format!(
+            "{name}: a non-empty profile_id is required — this primitive is credential-bound and \
+             its allowlist + approval gates cannot run without one"
+        ));
+        let _ = record_audit(
+            &ctx,
+            &arguments,
+            name,
+            &profile_id,
+            &action,
+            &flags,
+            true,
+            None,
+            Some(&err),
+        )
+        .await;
+        return JsonRpcResponse::error(
+            id,
+            codes::APPLICATION_ERROR,
+            crate::detection::sanitize_output(&err.to_string()),
+        );
+    }
+
+    // v0.6.4 cycle-2 hardening — reject a `profile_id` that is not path-safe
+    // BEFORE it is interpolated into any vault path (`allowlists/<id>.yaml`,
+    // `secrets/<id>.blob`, `profiles/<id>.json`). An id containing `/` or `..`
+    // was a path-traversal vector; the dispatcher never validated it.
+    if !profile_id.is_empty() && !crate::primitives::is_valid_profile_id(&profile_id) {
+        flags.push(crate::audit::FLAG_INVALID_PROFILE_DENIED.to_string());
+        let err = KvendraError::AllowlistViolation(
+            "profile_id contains characters outside [A-Za-z0-9._-] or a '..' component — refused"
+                .to_string(),
+        );
+        let _ = record_audit(
+            &ctx,
+            &arguments,
+            name,
+            &profile_id,
+            &action,
+            &flags,
+            true,
+            None,
+            Some(&err),
+        )
+        .await;
+        return JsonRpcResponse::error(
+            id,
+            codes::APPLICATION_ERROR,
+            crate::detection::sanitize_output(&err.to_string()),
+        );
+    }
+
     // Detection (REQ-KVD-002 Bloque 7) — inspect arguments JSON BEFORE dispatch.
     let args_text = serde_json::to_string(&arguments).unwrap_or_default();
     let detection_hits = detect(&args_text);
@@ -752,6 +882,36 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             codes::APPLICATION_ERROR,
             format!("approval not granted: {error_type}"),
             data,
+        );
+    }
+
+    // ISSUE-KVD-CLI-B78ED5 finding H4 — enforce the per-session quota on the
+    // plaintext escape hatch. `unsafe_max_uses_per_session` existed in the DSL
+    // but was never read, so a compromised agent could pull the raw token an
+    // unbounded number of times per session. Enforced here, after approval and
+    // before the secret is resolved, so a consumed use is one that would
+    // actually expose the credential.
+    if name == "kvendra.unsafe.raw_token"
+        && !profile_id.is_empty()
+        && let Err(quota_err) = ctx.enforce_unsafe_quota(&profile_id)
+    {
+        flags.push(crate::audit::FLAG_UNSAFE_QUOTA_EXCEEDED.to_string());
+        let _ = record_audit(
+            &ctx,
+            &arguments,
+            name,
+            &profile_id,
+            &action,
+            &flags,
+            true,
+            None,
+            Some(&quota_err),
+        )
+        .await;
+        return JsonRpcResponse::error(
+            id,
+            codes::APPLICATION_ERROR,
+            crate::detection::sanitize_output(&quota_err.to_string()),
         );
     }
 
@@ -1007,8 +1167,10 @@ async fn record_audit(
 fn audit_flag_for_error(err: &KvendraError) -> Option<&'static str> {
     match err {
         KvendraError::AllowlistViolation(_) => Some("allowlist_denied"),
+        KvendraError::MissingAllowlist(_) => Some(crate::audit::FLAG_MISSING_ALLOWLIST_DENIED),
         KvendraError::ProfileExpired => Some("profile_expired"),
         KvendraError::UnsafeNotEnabled => Some("unsafe_not_enabled"),
+        KvendraError::UnsafeQuotaExceeded { .. } => Some(crate::audit::FLAG_UNSAFE_QUOTA_EXCEEDED),
         // AllowlistTampered is handled in a dedicated branch in tools_call
         // and gets `allowlist_tampered_detected`; do not double-count it
         // here.
@@ -1025,9 +1187,14 @@ async fn enforce_allowlist(
 ) -> KvendraResult<MigrationOutcome> {
     let path = ctx.vault.profile_allowlist_path(profile_id);
     if !path.exists() {
-        // No allowlist on disk → defer to existing behaviour: allowed.
-        // Documented: profiles must declare an allowlist for production use.
-        return Ok(MigrationOutcome::Unchanged);
+        // ISSUE-KVD-CLI-B78ED5 finding C4 — FAIL CLOSED. Pre-0.6.4 a profile
+        // with a secret but no allowlist YAML on disk was allowed to run any
+        // operation (`return Ok(Unchanged)`), and `kvendra secret add` never
+        // creates an allowlist, so this permissive state was reachable in
+        // normal use. A profile with credentials MUST declare an allowlist;
+        // absence is now a hard deny (same anti-pattern PAT-KVD-CLI-003
+        // warned about, closed at the enforcer).
+        return Err(KvendraError::MissingAllowlist(profile_id.to_string()));
     }
     let raw = std::fs::read_to_string(&path)?;
 
@@ -1036,8 +1203,7 @@ async fn enforce_allowlist(
     // (legacy profile) → auto-sign on first read post-update (D4 silent).
     let key = ctx.vault.allowlist_hmac_key()?;
     let current_hmac = crate::vault::compute_allowlist_hmac(&key, raw.as_bytes());
-    let mut profile = ctx.vault.load_profile_meta(profile_id)?;
-    let mut migration_outcome = MigrationOutcome::Unchanged;
+    let profile = ctx.vault.load_profile_meta(profile_id)?;
     match profile.allowlist_hmac_hex.as_deref() {
         Some(stored) if stored == current_hmac => { /* OK, continue */ }
         Some(_stored) => {
@@ -1050,55 +1216,49 @@ async fn enforce_allowlist(
             return Err(KvendraError::AllowlistTampered(profile_id.to_string()));
         }
         None => {
-            // Migration on first read (REQ-KVD-007 AC-6, D4 silent).
-            profile.allowlist_hmac_hex = Some(current_hmac.clone());
-            ctx.vault.save_profile_meta(&profile)?;
-            tracing::info!(
+            // ISSUE-KVD-CLI-B78ED5 finding A6 — FAIL CLOSED on a missing
+            // signature. Pre-0.6.4 this auto-signed the on-disk YAML ("legacy
+            // migration", REQ-KVD-007 AC-6). But a same-uid attacker could
+            // rewrite `allowlists/<id>.yaml` permissively AND set
+            // `allowlist_hmac_hex: null` in `profiles/<id>.json`; the enforcer
+            // then re-signed the attacker's allowlist and adopted it — an
+            // allowlist-integrity bypass exactly parallel to the config one
+            // (A5). `secret set-allowlist` always writes the HMAC, so a YAML
+            // present with no stored signature is either a pre-REQ-007 legacy
+            // profile (which no longer exists in practice) or tampering. Refuse
+            // and require an explicit, password-gated re-sign; never auto-sign.
+            tracing::error!(
                 target: "kvendra::mcp",
-                flag = "allowlist_hmac_migrated",
+                flag = "allowlist_tampered_detected",
                 profile_id,
-                "Auto-signed legacy allowlist on first read post-REQ-007"
+                "allowlist YAML present but its HMAC signature is missing — refusing to auto-sign"
             );
-            // REQ-KVD-CLI-002 / ISSUE-023 — emit a DEDICATED audit row for the
-            // migration event (owner D4 decision, TXN-KVD-20260508-012). A
-            // separate row preserves the literal AC of ISSUE-023 ("audit row
-            // ... contains flag allowlist_hmac_migrated") without forcing the
-            // boundary call row to also carry the flag.
-            if let Some(writer) = ctx.audit_writer() {
-                let event = AuditEvent {
-                    ts_unix_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 / 1_000_000,
-                    profile_id: profile_id.to_string(),
-                    primitive: PRIMITIVE_SYSTEM.to_string(),
-                    action: "allowlist_hmac_migrated".to_string(),
-                    args_hash_hex: sha256_hex(profile_id.as_bytes()),
-                    status: Status::Ok,
-                    severity: Severity::Info,
-                    flags: "allowlist_hmac_migrated".to_string(),
-                    remote_audit_id: None,
-                    error_code: None,
-                    error_message: None,
-                };
-                writer.record(event).await?;
-            }
-            migration_outcome = MigrationOutcome::Migrated;
+            return Err(KvendraError::AllowlistTampered(profile_id.to_string()));
         }
     }
 
     let spec: ProfileSpec = serde_yaml_ng::from_str(&raw)?;
+    // Pentest finding S1b — bind the allowlist to the profile_id it is being
+    // enforced for. The HMAC authenticates the YAML *content* but not WHICH
+    // profile it belongs to, so a same-uid attacker (even with the vault
+    // locked) could copy profile A's allowlist YAML + its valid stored HMAC
+    // into profile B's slots and thereby widen B's permissions. The enforcer
+    // now rejects a spec whose declared `profile_id` does not match the
+    // profile being used. `secret set-allowlist` already enforces this at sign
+    // time; this closes the runtime gap.
+    if spec.profile_id != profile_id {
+        tracing::error!(
+            target: "kvendra::mcp",
+            flag = "allowlist_tampered_detected",
+            profile_id,
+            spec_profile_id = %spec.profile_id,
+            "allowlist declares a different profile_id than the profile it is used for — refusing"
+        );
+        return Err(KvendraError::AllowlistTampered(profile_id.to_string()));
+    }
     allowlist_validate(&spec)?;
     allowlist_check(&spec, primitive, operation, arguments)?;
-    Ok(migration_outcome)
-}
-
-/// SHA-256 over arbitrary bytes, hex-encoded. Local helper used to derive
-/// `args_hash_hex` for system-level audit rows that are not driven by a
-/// JSON args payload (e.g. the `allowlist_hmac_migrated` row, which only
-/// references the `profile_id`).
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(bytes);
-    hex::encode(h.finalize())
+    Ok(MigrationOutcome::Unchanged)
 }
 
 async fn invoke_primitive(
@@ -1201,13 +1361,16 @@ mod tests {
             resolver: None,
             session: None,
             workspace_id: None,
+            unsafe_usage: Default::default(),
         };
         (dir, ctx)
     }
 
     const TEST_ALLOWLIST_YAML: &str = "profile_id: p\nsecret:\n  type: github_pat\nallowlist:\n  primitives:\n    - name: kvendra.shell\n      operations:\n        - run:\n            binaries: [\"echo\"]\n";
 
-    /// REQ-KVD-007 AC-2 — a YAML matching the persisted HMAC must pass.
+    /// REQ-KVD-007 AC-2 — a YAML matching the persisted HMAC must pass. Drives
+    /// the enforcer with the canonical MCP envelope (`args.binary`) so the
+    /// v0.6.4 fail-closed `binaries` check (finding C2) is satisfied.
     #[tokio::test]
     async fn enforce_allowlist_passes_on_match() {
         let (_dir, ctx) = fixture_with_allowlist(TEST_ALLOWLIST_YAML);
@@ -1216,7 +1379,7 @@ mod tests {
             "p",
             "kvendra.shell",
             "run",
-            &serde_json::json!({ "argv": ["echo", "hi"] }),
+            &serde_json::json!({ "operation": "run", "args": { "binary": "echo", "argv": ["echo", "hi"] } }),
         )
         .await;
         assert!(
@@ -1256,9 +1419,14 @@ mod tests {
     /// dedicated `allowlist_hmac_migrated` audit row is appended (REQ-KVD-CLI-002,
     /// owner D4 decision).
     #[tokio::test]
-    async fn enforce_allowlist_auto_migrates_legacy_profile() {
+    async fn enforce_allowlist_missing_signature_fails_closed() {
+        // ISSUE-KVD-CLI-B78ED5 finding A6 (v0.6.4) — a profile whose stored
+        // allowlist HMAC is absent (an attacker nulled `allowlist_hmac_hex` in
+        // `profiles/<id>.json` after rewriting the YAML permissively) must be
+        // REFUSED, not silently auto-signed and adopted. Pre-0.6.4 this path
+        // re-signed the on-disk YAML — an allowlist-integrity bypass.
         let (_dir, ctx) = fixture_with_allowlist_and_writer(TEST_ALLOWLIST_YAML);
-        // Reset the migrated HMAC to None to simulate a legacy profile.
+        // Simulate the attack: null the stored signature.
         let mut profile = ctx.vault.load_profile_meta("p").unwrap();
         profile.allowlist_hmac_hex = None;
         ctx.vault.save_profile_meta(&profile).unwrap();
@@ -1268,52 +1436,35 @@ mod tests {
             "p",
             "kvendra.shell",
             "run",
-            &serde_json::json!({ "argv": ["echo", "hi"] }),
+            &serde_json::json!({ "operation": "run", "args": { "binary": "echo", "argv": ["echo", "hi"] } }),
         )
         .await;
         assert!(
-            matches!(res, Ok(MigrationOutcome::Migrated)),
-            "auto-migration must surface Migrated outcome: {res:?}"
+            matches!(res, Err(KvendraError::AllowlistTampered(ref pid)) if pid == "p"),
+            "a missing allowlist signature must fail closed as AllowlistTampered: {res:?}"
         );
+        // The enforcer must NOT have re-signed the profile (no laundering).
         let after = ctx.vault.load_profile_meta("p").unwrap();
         assert!(
-            after.allowlist_hmac_hex.is_some(),
-            "auto-migration must populate allowlist_hmac_hex"
-        );
-
-        // Drain the writer and inspect the SQLite DB directly for the
-        // dedicated row.
-        ctx.audit_writer().unwrap().shutdown().await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let conn = rusqlite::Connection::open(ctx.vault.audit_db_path()).unwrap();
-        let (action, primitive, flags): (String, String, String) = conn
-            .query_row(
-                "SELECT action, primitive, flags FROM audit_events \
-                 WHERE action = 'allowlist_hmac_migrated' ORDER BY id DESC LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .expect("dedicated allowlist_hmac_migrated row must be present");
-        assert_eq!(action, "allowlist_hmac_migrated");
-        assert_eq!(primitive, PRIMITIVE_SYSTEM);
-        assert!(
-            flags.contains("allowlist_hmac_migrated"),
-            "dedicated row must carry canonical flag, got: {flags}"
+            after.allowlist_hmac_hex.is_none(),
+            "a refused call must NOT populate/launder the allowlist signature"
         );
     }
 
-    /// REQ-KVD-007 — when no allowlist YAML is on disk, `enforce_allowlist`
-    /// is a no-op (existing behaviour preserved). The HMAC code path must
-    /// not panic / error in this case.
+    /// ISSUE-KVD-CLI-B78ED5 finding C4 (v0.6.4) — a profile with a secret but
+    /// NO allowlist YAML on disk must now FAIL CLOSED. Pre-0.6.4 this was a
+    /// no-op that allowed every operation (`Ok(Unchanged)`), and `secret add`
+    /// never creates an allowlist, so the permissive state was reachable in
+    /// normal use. The enforcer now returns `MissingAllowlist`.
     #[tokio::test]
-    async fn enforce_allowlist_noop_when_no_allowlist_on_disk() {
+    async fn enforce_allowlist_denies_when_no_allowlist_on_disk() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         crate::config::ensure_layout(home).unwrap();
         let v = Vault::new(home.to_path_buf());
-        v.create_with_params(b"hunter2-noop-test", fast_params())
+        v.create_with_params(b"hunter2-noallowlist-test", fast_params())
             .unwrap();
-        v.unlock(b"hunter2-noop-test", 30).unwrap();
+        v.unlock(b"hunter2-noallowlist-test", 30).unwrap();
         let ctx = ServerContext {
             vault: v,
             config: Config::default(),
@@ -1324,18 +1475,19 @@ mod tests {
             resolver: None,
             session: None,
             workspace_id: None,
+            unsafe_usage: Default::default(),
         };
         let res = enforce_allowlist(
             &ctx,
             "p",
             "kvendra.shell",
             "run",
-            &serde_json::json!({ "argv": ["echo", "hi"] }),
+            &serde_json::json!({ "operation": "run", "args": { "binary": "echo", "argv": ["echo", "hi"] } }),
         )
         .await;
         assert!(
-            matches!(res, Ok(MigrationOutcome::Unchanged)),
-            "no allowlist on disk → allow + Unchanged: {res:?}"
+            matches!(res, Err(KvendraError::MissingAllowlist(ref pid)) if pid == "p"),
+            "no allowlist on disk → fail-closed MissingAllowlist: {res:?}"
         );
     }
 
@@ -1427,6 +1579,7 @@ mod tests {
             resolver: None,
             session: None,
             workspace_id: None,
+            unsafe_usage: Default::default(),
         };
 
         super::try_self_heal_vault(&ctx);
@@ -1490,6 +1643,7 @@ mod tests {
             resolver: None,
             session: None,
             workspace_id: None,
+            unsafe_usage: Default::default(),
         };
 
         // Capture tracing events emitted during the self-heal call.
@@ -1597,6 +1751,7 @@ mod tests {
             resolver: None,
             session: None,
             workspace_id: None,
+            unsafe_usage: Default::default(),
         };
 
         #[derive(Default)]
@@ -1676,6 +1831,7 @@ mod tests {
             resolver: None,
             session: None,
             workspace_id: None,
+            unsafe_usage: Default::default(),
         });
 
         let resp = super::tools_call(
@@ -1743,6 +1899,7 @@ mod tests {
             resolver: None,
             session: None,
             workspace_id: None,
+            unsafe_usage: Default::default(),
         });
 
         let resp = super::tools_call(
@@ -1810,6 +1967,7 @@ mod tests {
             resolver: None,
             session: None,
             workspace_id: None,
+            unsafe_usage: Default::default(),
         });
 
         let resp = super::tools_call(
@@ -1875,6 +2033,7 @@ mod tests {
             resolver: None,
             session: None,
             workspace_id: None,
+            unsafe_usage: Default::default(),
         };
 
         super::try_self_heal_vault(&ctx);
@@ -1928,6 +2087,7 @@ mod tests {
             resolver: None,
             session: None,
             workspace_id: None,
+            unsafe_usage: Default::default(),
         };
         assert!(
             ctx.audit_writer().is_none(),
@@ -1983,6 +2143,7 @@ mod tests {
             resolver: None,
             session: None,
             workspace_id: None,
+            unsafe_usage: Default::default(),
         };
 
         // Trigger self-heal (sync) → writer should be lazy-spawned.

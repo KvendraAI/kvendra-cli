@@ -7,7 +7,6 @@
 use crate::error::{KvendraError, KvendraResult};
 use crate::vault::SecretPlaintext;
 use serde_json::{Value, json};
-use tokio::process::Command;
 
 pub async fn execute(args: &Value, secret: Option<&SecretPlaintext>) -> KvendraResult<Value> {
     let operation = args
@@ -33,18 +32,21 @@ async fn upload(op_args: &Value, secret: Option<&SecretPlaintext>) -> KvendraRes
         .get("repository")
         .and_then(Value::as_str)
         .unwrap_or("pypi");
+    // N5 — option-injection guard on the caller-controlled repository + dist.
+    crate::primitives::spawn::reject_option_like("pypi.upload.repository", repository)?;
+    crate::primitives::spawn::reject_option_like("pypi.upload.dist", dist)?;
 
-    let mut cmd = Command::new("python");
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    // Hardened spawn: scrub KVENDRA_* env (N1) + sanitised PATH (A2). `--`
+    // terminates option parsing so the positional dist can never become a flag.
+    let mut cmd = crate::primitives::spawn::hardened_command("python");
     cmd.arg("-m")
         .arg("twine")
         .arg("upload")
         .arg("--repository")
         .arg(repository)
-        .arg(dist)
-        .arg("--non-interactive");
+        .arg("--non-interactive")
+        .arg("--")
+        .arg(dist);
     cmd.env("TWINE_USERNAME", "__token__");
     if let Some(s) = secret {
         cmd.env("TWINE_PASSWORD", s.as_str()?);

@@ -29,4 +29,13 @@ pub const PROVIDER_PATTERNS: &[(&str, &str)] = &[
     ("anthropic_key", r"sk-ant-[A-Za-z0-9_\-]{60,}"),
     // OpenAI sk-… (≥48 chars after prefix).
     ("openai_key", r"sk-[A-Za-z0-9]{48,}"),
+    // Slack bot/user/app/refresh tokens (xoxb-/xoxp-/xoxa-/xoxr-/xoxs-).
+    ("slack_token", r"xox[baprs]-[0-9A-Za-z-]{10,}"),
+    // Stripe live secret / restricted keys (test keys sk_test_ intentionally
+    // NOT matched — those are non-sensitive by Stripe's own guidance).
+    ("stripe_secret_key", r"(?:sk|rk)_live_[0-9A-Za-z]{24,}"),
+    // Google API key (Maps, Cloud, …).
+    ("google_api_key", r"AIza[0-9A-Za-z_\-]{35}"),
+    // GitLab personal access token.
+    ("gitlab_pat", r"glpat-[0-9A-Za-z_\-]{20,}"),
 ];

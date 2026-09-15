@@ -83,8 +83,15 @@ pub struct PrimitiveAllow {
     pub unsafe_reason_min_length: u32,
 }
 
+/// Default per-session budget for the `kvendra.unsafe.raw_token` escape hatch
+/// when the allowlist does not set `unsafe_max_uses_per_session`. The
+/// conservative floor: the plaintext hatch is usable once per `mcp serve`
+/// session unless the owner explicitly widens it. Enforced by the dispatcher
+/// (audit finding H4 — the value was previously declared but never read).
+pub const DEFAULT_UNSAFE_MAX_USES: u32 = 1;
+
 fn default_unsafe_max() -> u32 {
-    1
+    DEFAULT_UNSAFE_MAX_USES
 }
 fn default_reason_min() -> u32 {
     10

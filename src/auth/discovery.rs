@@ -117,10 +117,16 @@ pub async fn discover(auth_base: &Url) -> KvendraResult<OidcConfig> {
 mod tests {
     use super::*;
 
+    // `KVENDRA_AUTH_URL` is process-global; both tests below mutate it. cargo
+    // runs tests in one process on multiple threads, so without serialization
+    // one test's set/remove races the other's expectation (intermittent
+    // failure). This mutex serializes the two env-mutating tests.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn auth_base_defaults_to_kvendra_cloud_when_env_absent() {
-        // SAFETY: same-process env access; serialized at the function level.
-        // SAFETY: test mutates env at process scope.
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test mutates env at process scope; serialized by ENV_GUARD.
         unsafe { std::env::remove_var("KVENDRA_AUTH_URL") };
         let base = auth_base_from_env().unwrap();
         assert_eq!(base.as_str(), "https://auth.kvendra.cloud/");
@@ -128,11 +134,12 @@ mod tests {
 
     #[test]
     fn auth_base_honors_env_override() {
-        // SAFETY: test mutates env at process scope.
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test mutates env at process scope; serialized by ENV_GUARD.
         unsafe { std::env::set_var("KVENDRA_AUTH_URL", "https://idp.example.com") };
         let base = auth_base_from_env().unwrap();
         assert_eq!(base.as_str(), "https://idp.example.com/");
-        // SAFETY: test mutates env at process scope.
+        // SAFETY: test mutates env at process scope; serialized by ENV_GUARD.
         unsafe { std::env::remove_var("KVENDRA_AUTH_URL") };
     }
 }

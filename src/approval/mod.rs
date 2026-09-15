@@ -183,6 +183,17 @@ pub async fn check(
         .ok()
         .and_then(|s| policy::parse_mode(&s));
 
+    // ISSUE-KVD-CLI-B78ED5 finding H2 — the destructive-catalog predicates
+    // (`s3_sync.delete`, `git.tag.force`, `http.request.method`,
+    // `github.update_issue.state`) read FLAT fields that live in the inner
+    // `args` payload of the MCP envelope `{profile_id, operation, args:{…}}`,
+    // exactly like the allowlist enforcer's `inner_args`. Pre-0.6.4 this call
+    // passed the whole envelope, so those predicates read `arguments.delete`
+    // etc. (always absent) and reported destructive=false — meaning
+    // `s3 sync --delete`, `git tag --force` and mutating HTTP verbs slipped
+    // past `ask-destructive` with NO confirmation prompt. Read the inner
+    // payload so the predicates see the real fields.
+    let inner_args = arguments.get("args").cloned().unwrap_or(Value::Null);
     let (profile_override_mode, destructive) = if profile_id.is_empty() {
         (None, false)
     } else {
@@ -194,7 +205,7 @@ pub async fn check(
                     .and_then(|a| a.mode.as_deref())
                     .and_then(policy::parse_mode);
                 let destructive =
-                    policy::lookup_destructive(&spec, primitive, operation, arguments);
+                    policy::lookup_destructive(&spec, primitive, operation, &inner_args);
                 (mode, destructive)
             }
             None => (None, false),

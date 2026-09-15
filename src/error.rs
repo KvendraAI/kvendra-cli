@@ -62,6 +62,14 @@ pub enum KvendraError {
     )]
     AllowlistTampered(String),
 
+    /// A profile carries a secret but no allowlist YAML exists on disk. Pre-
+    /// 0.6.4 this was fail-open (any op allowed — audit finding C4). The broker
+    /// now refuses the call. `0` is the profile id.
+    #[error(
+        "no allowlist configured for profile '{0}' — run `kvendra secret set-allowlist {0} --file <yaml>` (fail-closed: a profile with a secret but no allowlist is refused)"
+    )]
+    MissingAllowlist(String),
+
     #[error("profile not found")]
     ProfileNotFound,
 

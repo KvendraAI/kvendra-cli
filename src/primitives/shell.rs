@@ -8,16 +8,29 @@
 use crate::error::{KvendraError, KvendraResult};
 use crate::vault::SecretPlaintext;
 use serde_json::{Value, json};
-use tokio::process::Command;
+
+/// Single source of truth for the wire field name that carries the binary to
+/// execute. The allowlist enforcer (`allowlist::enforcer`) MUST read the
+/// `binaries:` constraint against this exact key. Pre-0.6.4 the enforcer read
+/// `"bin"` while this primitive emitted `"binary"`, so the `binaries:`
+/// allowlist was never checked (audit finding C2 / PAT-KVD-CLI-1A99C5).
+/// Keeping the field name here, referenced from both sides, makes a rename a
+/// compile-time break rather than a silent security regression.
+pub const BINARY_FIELD: &str = "binary";
+
+/// Single source of truth for the wire field name that carries the argument
+/// vector, used by both this primitive and the enforcer's `args_constraints`
+/// check.
+pub const ARGV_FIELD: &str = "argv";
 
 pub async fn execute(args: &Value, _secret: Option<&SecretPlaintext>) -> KvendraResult<Value> {
     let op_args = args.get("args").cloned().unwrap_or(Value::Null);
     let binary = op_args
-        .get("binary")
+        .get(BINARY_FIELD)
         .and_then(Value::as_str)
         .ok_or_else(|| KvendraError::InvalidArgs("shell.binary required".into()))?;
     let argv = op_args
-        .get("argv")
+        .get(ARGV_FIELD)
         .and_then(Value::as_array)
         .ok_or_else(|| KvendraError::InvalidArgs("shell.argv required".into()))?;
     let argv: Vec<String> = argv
@@ -25,21 +38,15 @@ pub async fn execute(args: &Value, _secret: Option<&SecretPlaintext>) -> Kvendra
         .map(|v| v.as_str().unwrap_or_default().to_string())
         .collect();
 
-    // Direct binary invocation — never `sh -c`.
-    let mut cmd = Command::new(binary);
+    // Direct binary invocation — never `sh -c`. Hardened spawn: scrub
+    // KVENDRA_* env (N1) + sanitised PATH (A2) + stdin detached
+    // (ISSUE-KVD-CLI-330251). The binary itself is gated by the allowlist's
+    // `binaries:` constraint; argv are the binary's own arguments.
+    let mut cmd = crate::primitives::spawn::hardened_command(binary);
     cmd.args(&argv);
     if let Some(cwd) = op_args.get("cwd").and_then(Value::as_str) {
         cmd.current_dir(cwd);
     }
-    // Detach the child (and its grandchildren — docker, esbuild, etc.) from
-    // the broker's stdin, which is the JSON-RPC request pipe. If we let it be
-    // inherited, a long-running child (sam deploy, git push) can consume or
-    // corrupt the pipe and the next transport `read` sees EOF → silent
-    // disconnect (ISSUE-KVD-CLI-330251). stdout/stderr are captured by
-    // `.output()`, but we pin them explicitly for clarity.
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
 
     let output = cmd
         .output()

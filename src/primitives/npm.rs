@@ -38,11 +38,16 @@ async fn publish(op_args: &Value, secret: Option<&SecretPlaintext>) -> KvendraRe
         .and_then(Value::as_str)
         .unwrap_or("restricted");
 
-    let mut cmd = Command::new("npm");
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    // Hardened spawn: scrub KVENDRA_* env (N1) + sanitised PATH (A2).
+    let mut cmd = crate::primitives::spawn::hardened_command("npm");
+    // ISSUE-KVD-CLI-B78ED5 finding N2 — `--ignore-scripts` is MANDATORY.
+    // Without it, `npm publish` runs the package's `prepublishOnly` / `prepare`
+    // / `prepack` lifecycle scripts from the caller-controlled `cwd`, which is
+    // arbitrary code execution via a primitive that is meant to be a safe,
+    // allowlisted "publish" — bypassing the whole allowlist/approval model and
+    // the shell primitive's "no arbitrary exec" guarantee (PoC in the pentest).
     cmd.arg("publish")
+        .arg("--ignore-scripts")
         .arg("--access")
         .arg(access)
         .current_dir(cwd);
@@ -57,12 +62,15 @@ async fn deprecate(op_args: &Value, secret: Option<&SecretPlaintext>) -> Kvendra
         .get("package")
         .and_then(Value::as_str)
         .ok_or_else(|| KvendraError::InvalidArgs("npm.deprecate.package required".into()))?;
+    // N5 — a package spec beginning with `-` is an option-injection vector.
+    crate::primitives::spawn::reject_option_like("npm.deprecate.package", package)?;
     let message = op_args.get("message").and_then(Value::as_str).unwrap_or("");
-    let mut cmd = Command::new("npm");
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    cmd.arg("deprecate").arg(package).arg(message);
+    let mut cmd = crate::primitives::spawn::hardened_command("npm");
+    cmd.arg("deprecate")
+        .arg("--ignore-scripts")
+        .arg("--")
+        .arg(package)
+        .arg(message);
     if let Some(s) = secret {
         cmd.env("NPM_TOKEN", s.as_str()?);
     }

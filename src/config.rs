@@ -213,6 +213,34 @@ impl Config {
                      verify deferred to post-unlock"
                 );
             }
+        } else if vault.is_some() {
+            // ISSUE-KVD-CLI-B78ED5 finding A5 — the config carries NO valid
+            // signature trailer. Pre-0.6.4 this was silently adopted (and
+            // `auto_migrate_config_if_needed` re-signed it during unlock),
+            // which let a same-uid attacker append a setting after the `_hmac`
+            // line (or drop the trailer entirely) to change `approval.mode`,
+            // `detection.severity`, session TTLs, etc. UNDETECTED and get the
+            // tampered file laundered into a "legitimately signed" one. When a
+            // vault is available to verify, an unsigned config is now treated
+            // as tampered and REFUSED — we never adopt or re-sign it.
+            let orphan = raw_has_hmac_line(&raw);
+            tracing::error!(
+                target: "kvendra::config",
+                flag = "config_tampered_detected",
+                orphan_hmac_line = orphan,
+                "~/.kvendra/config.toml is not validly signed — refusing to start"
+            );
+            return Err(KvendraError::Config(format!(
+                "config_tampered_detected: ~/.kvendra/config.toml is not validly signed{}. \
+                 Refusing to start. Restore from backup, or delete ~/.kvendra/config.toml to \
+                 reset to signed defaults.",
+                if orphan {
+                    " (an `_hmac` line is present but is not the last line — content was appended \
+                     after the signature)"
+                } else {
+                    ""
+                }
+            )));
         }
 
         let cfg: Config = toml::from_str(&raw).map_err(|e| KvendraError::Config(e.to_string()))?;
@@ -341,6 +369,15 @@ fn strip_hmac_trailer(raw: &str) -> (String, Option<String>) {
     (raw.to_string(), None)
 }
 
+/// True if `raw` contains any line that parses as an `_hmac = "…"` line. Used
+/// to distinguish a truly-unsigned config (legacy) from one whose signature was
+/// displaced by content appended after the trailer (ISSUE-KVD-CLI-B78ED5
+/// finding A5 — the append-after-trailer / trailer-removal config-integrity
+/// bypass).
+fn raw_has_hmac_line(raw: &str) -> bool {
+    raw.lines().any(|l| parse_hmac_line(l).is_some())
+}
+
 fn parse_hmac_line(line: &str) -> Option<String> {
     let line = line.trim_end_matches('\r');
     let rest = line.strip_prefix("_hmac")?.trim_start();
@@ -462,6 +499,53 @@ mod tests {
             .unwrap();
         v.unlock(b"hunter2-test", 30).unwrap();
         v
+    }
+
+    /// ISSUE-KVD-CLI-B78ED5 finding A5 (v0.6.4) — an UNSIGNED config (no
+    /// `_hmac` trailer) must be REFUSED when a vault is available, not silently
+    /// adopted. Pre-0.6.4 a same-uid attacker could overwrite config.toml with
+    /// `approval.mode = "silent"` and no trailer; it took effect and was then
+    /// re-signed as legitimate on the next unlock.
+    #[test]
+    fn load_rejects_unsigned_config_when_vault_present() {
+        let tmp = TempDir::new().unwrap();
+        ensure_layout(tmp.path()).unwrap();
+        let v = unlocked_vault(tmp.path());
+        // Attacker's clean overwrite: valid TOML, security-relevant setting, no
+        // `_hmac` trailer.
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[approval]\nmode = \"silent\"\n",
+        )
+        .unwrap();
+        let res = Config::load(tmp.path(), Some(&v));
+        assert!(
+            matches!(&res, Err(KvendraError::Config(m)) if m.contains("config_tampered_detected")),
+            "unsigned config must be refused as tampered: {res:?}"
+        );
+    }
+
+    /// A5 — appending content AFTER the `_hmac` trailer (so it is no longer the
+    /// last line) must also be refused: the trailer is displaced, the file is
+    /// treated as unsigned, and the orphan `_hmac` line is flagged.
+    #[test]
+    fn load_rejects_config_with_content_after_trailer() {
+        let tmp = TempDir::new().unwrap();
+        ensure_layout(tmp.path()).unwrap();
+        let v = unlocked_vault(tmp.path());
+        // Start from a legitimately signed config, then append a setting after
+        // the signature line.
+        Config::default().save(tmp.path(), &v).unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str("renew_on_activity = true\n");
+        std::fs::write(&path, raw).unwrap();
+        let res = Config::load(tmp.path(), Some(&v));
+        assert!(
+            matches!(&res, Err(KvendraError::Config(m))
+                if m.contains("config_tampered_detected") && m.contains("appended")),
+            "append-after-trailer must be refused with the orphan-hmac note: {res:?}"
+        );
     }
 
     /// REQ-KVD-008 AC-CONFIG-HMAC-1 — `Config::save` writes a trailing

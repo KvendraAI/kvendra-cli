@@ -181,7 +181,7 @@ fn check_args(
         let regex_ok = c
             .url_pattern_regex
             .as_ref()
-            .is_some_and(|patterns| patterns.iter().any(|p| regex_match(p, url)));
+            .is_some_and(|patterns| patterns.iter().any(|p| regex_match_url(p, url)));
         let endpoint_ok = c
             .endpoints
             .as_ref()
@@ -255,14 +255,34 @@ fn check_args(
         )));
     }
 
-    // binaries (shell).
-    if let Some(allowed) = &c.binaries
-        && let Some(bin) = inner.get("bin").and_then(Value::as_str)
-        && !allowed.iter().any(|pat| pat == bin)
-    {
-        return Err(KvendraError::AllowlistViolation(format!(
-            "{primitive}.{operation}: binary '{bin}' not allowed"
-        )));
+    // binaries (shell). Reads the SAME wire key the shell primitive emits
+    // (`crate::primitives::shell::BINARY_FIELD` == "binary"). Pre-0.6.4 this
+    // read `"bin"`, which the primitive never sends, so the constraint was
+    // inert and any binary ran (audit finding C2 / PAT-KVD-CLI-1A99C5).
+    //
+    // Fail-closed on shape mismatch: when a `binaries:` constraint is declared
+    // but the payload carries no `binary` field the enforcer can inspect, we
+    // DENY rather than fall through (permissive-on-absence, PAT-KVD-CLI-003).
+    if let Some(allowed) = &c.binaries {
+        match inner
+            .get(crate::primitives::shell::BINARY_FIELD)
+            .and_then(Value::as_str)
+        {
+            Some(bin) => {
+                if !allowed.iter().any(|pat| pat == bin) {
+                    return Err(KvendraError::AllowlistViolation(format!(
+                        "{primitive}.{operation}: binary '{bin}' not allowed"
+                    )));
+                }
+            }
+            None => {
+                return Err(KvendraError::AllowlistViolation(format!(
+                    "{primitive}.{operation}: `binaries` constraint declared but no `{}` field \
+                     in the call payload — refusing (fail-closed on shape mismatch)",
+                    crate::primitives::shell::BINARY_FIELD
+                )));
+            }
+        }
     }
 
     // packages (npm/pypi package name).
@@ -458,10 +478,27 @@ fn glob_match(pattern: &str, candidate: &str) -> bool {
     Regex::new(&re).is_ok_and(|r| r.is_match(candidate))
 }
 
-/// Substring regex match (`Regex::is_match` semantics — anchor with `^`/`$`
-/// in the pattern if you need full-match).
-fn regex_match(pattern: &str, candidate: &str) -> bool {
-    Regex::new(pattern).is_ok_and(|re| re.is_match(candidate))
+/// Start-anchored regex match for URL allowlisting (`url_pattern_regex`).
+///
+/// Pre-0.6.4 `url_pattern_regex` used bare `Regex::is_match`, a SUBSTRING
+/// match: a pattern meant to pin the host, e.g. `https://api\.github\.com/`,
+/// also matched a hostile URL that merely *contained* it, e.g.
+/// `https://evil.example/?x=https://api.github.com/` — sending the profile's
+/// Bearer token to `evil.example` (audit finding: "regex de URL sin anclar").
+///
+/// We anchor every URL pattern at the START of the candidate. A pattern that
+/// already begins with `^` is used as-is; otherwise we prepend `^`. This does
+/// NOT anchor the end (URL paths legitimately vary), but binding the scheme +
+/// host prefix is what closes the exfiltration bypass. Every production
+/// profile already writes `^https://…`, so this is a no-op for well-formed
+/// allowlists and a hard deny for the bypass shape.
+fn regex_match_url(pattern: &str, candidate: &str) -> bool {
+    let anchored = if pattern.starts_with('^') {
+        pattern.to_string()
+    } else {
+        format!("^(?:{pattern})")
+    };
+    Regex::new(&anchored).is_ok_and(|re| re.is_match(candidate))
 }
 
 /// Full-string regex match (auto-wraps the pattern with `^...$` if the user
@@ -1061,6 +1098,12 @@ allowlist:
         assert!(check(&s, "kvendra.aws", "lambda_invoke", &args).is_err());
     }
 
+    // NOTE: these tests drive the enforcer with the EXACT wire field the
+    // shell primitive emits (`binary`), not the historical `bin` typo. Using
+    // `bin` here is what let audit finding C2 pass CI while production was
+    // unprotected — the fixtures were complicit in the bug
+    // (PAT-KVD-CLI-1A99C5). See `binaries_missing_field_fails_closed` for the
+    // fail-closed-on-shape-mismatch guard.
     #[test]
     fn binaries_happy() {
         let s = spec_with(
@@ -1076,7 +1119,7 @@ allowlist:
             binaries: ["npm"]
 "#,
         );
-        let args = env_args(serde_json::json!({ "bin": "npm" }));
+        let args = env_args(serde_json::json!({ "binary": "npm" }));
         assert!(check(&s, "kvendra.shell", "run", &args).is_ok());
     }
 
@@ -1095,8 +1138,42 @@ allowlist:
             binaries: ["npm"]
 "#,
         );
+        let args = env_args(serde_json::json!({ "binary": "rm" }));
+        let err = check(&s, "kvendra.shell", "run", &args)
+            .expect_err("binary outside allowlist must be denied");
+        assert!(
+            matches!(err, KvendraError::AllowlistViolation(ref m) if m.contains("'rm'")),
+            "got: {err:?}"
+        );
+    }
+
+    /// C2 regression — a `binaries:` constraint with NO `binary` field in the
+    /// payload must FAIL CLOSED, not fall through as allowed. Guards against
+    /// permissive-on-absence resurfacing via a field rename.
+    #[test]
+    fn binaries_missing_field_fails_closed() {
+        let s = spec_with(
+            r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.shell
+      operations:
+        - run:
+            binaries: ["npm"]
+"#,
+        );
+        // Historical wrong key — enforcer must NOT be fooled into allowing.
         let args = env_args(serde_json::json!({ "bin": "rm" }));
-        assert!(check(&s, "kvendra.shell", "run", &args).is_err());
+        assert!(
+            check(&s, "kvendra.shell", "run", &args).is_err(),
+            "a payload with no `binary` field but a `binaries` constraint must be denied"
+        );
+        // Empty payload — same fail-closed outcome.
+        let empty = env_args(serde_json::json!({}));
+        assert!(check(&s, "kvendra.shell", "run", &empty).is_err());
     }
 
     #[test]
