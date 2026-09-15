@@ -11,15 +11,33 @@ Developer CLI for Kvendra. Manage workspaces, knowledge bases, skills, and pipel
 
 Built in Rust. Open source under Apache-2.0. Repository: [`KvendraAI/kvendra-cli`](https://github.com/KvendraAI/kvendra-cli).
 
-## Status
+## Status: Alpha — try it and tell us what breaks
 
-Pre-1.0 (`0.6.x`). The `kvendra` binary is functional and published to
-crates.io; the CLI surface and on-disk formats may still change before 1.0.
-Security fixes ship promptly — see the [security policy](SECURITY.md), the
-[0.6.4 advisory](docs/security/advisory-cli-0.6.4.md), and
-[what protection you have and what does not](docs/security/protection-levels.md).
+The `kvendra` CLI is in **alpha**. It works and we use it daily, but it is
+early: expect rough edges, the CLI surface and on-disk formats may still change,
+and we are actively hardening it. **Please try it and report what you find** —
+open an [issue](https://github.com/KvendraAI/kvendra-cli/issues) for bugs and
+ideas, and email **security@kvendra.ai** for anything security-sensitive (see
+[SECURITY.md](SECURITY.md)). Your reports directly shape the roadmap.
 
-## What will live here
+We are candid about the security model rather than trusting a slogan. Before you
+rely on the vault, read **[what protection you have and what does
+not](docs/security/protection-levels.md)** and the
+[0.6.4 security advisory](docs/security/advisory-cli-0.6.4.md). Short version:
+your encrypted files are safe at rest and your AI agent never holds the
+plaintext, but a process that has fully taken over your user account while the
+vault is unlocked can read what you can. Raising protection past that (hardware
+keys, remote broker) is on the roadmap and will be opt-in.
+
+## Do I need the CLI? No — it is optional
+
+**Kvendra does not require the CLI.** Pro accounts and self-hosted / Enterprise
+deployments work fully without installing it — nothing blocks or degrades if you
+never run `kvendra`. The CLI is an optional power tool for people who want a
+local MCP capability broker and a client-side credential vault on their own
+machine. Install it if that helps your workflow; skip it if it doesn't.
+
+## What's in the box
 
 - `kvendra` command-line tool for workspace, KB, skills, and pipeline operations.
 - MCP capability broker (server stdio) for Claude Code, Cursor, Cline, Continue, and other MCP clients.
@@ -29,9 +47,11 @@ Security fixes ship promptly — see the [security policy](SECURITY.md), the
 
 ## Install
 
-### From source (`cargo install`) — recommended for v0.1.0
+### With `cargo install`
 
 ```bash
+cargo install kvendra          # from crates.io
+# or track the latest main:
 cargo install --git https://github.com/KvendraAI/kvendra-cli kvendra
 kvendra --version
 ```
