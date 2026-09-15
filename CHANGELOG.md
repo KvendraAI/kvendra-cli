@@ -294,6 +294,43 @@ against the running broker and re-verified fixed. Behaviour changes are flagged.
   above the entropy threshold, so redacting only it would leak the key body).
   `src/detection/patterns.rs`. Regression: `cargo test --lib detection`.
 
+### Fixed — code-review pass (adversarial self-audit of the 0.6.4 changes)
+
+A rigorous review of the fixes themselves (four parallel reviewers + a manual
+pass) found several issues the tests had masked — the fixes were built with the
+tests in mind, so a few left the exact hole they claimed to close. All fixed:
+
+- **git repo check re-openable with a decoy `repo`/`url` on push** — the N7
+  resolver preferred a caller `repo`/`url` field over the actual `remote`, which
+  the push/pull/tag/commit primitives never read. An agent could send a benign
+  allowlisted `repo` decoy alongside an attacker `remote` and pass the check
+  while pushing to the attacker. `git_target_repo` is now operation-aware (only
+  `clone` uses url/repo); the 12 tests that leaned on the decoy path were moved
+  to the real `{cwd, remote, ref}` shape. `src/allowlist/enforcer.rs`.
+- **`regex_match_url` left later alternation branches unanchored** — a
+  `^a/|b/` pattern anchored only branch 1; now `^(?:{pattern})` unconditionally.
+- **`extract_repo_canonical` didn't handle `ssh://`/userinfo/port** — legit ssh
+  pushes were denied; a userinfo host (`github.com@evil.com`) is now attributed
+  to the real host.
+- **N8 broad-scope canaries widened** to public TLDs + http + userinfo (a
+  `^https://[^/]+\.com/` pattern bypassed the opt-in guard).
+- **npm `--registry` pin was bypassable for SCOPED packages** — a scoped
+  package's `@scope:registry` overrode the default. The publish now pins the
+  package's own scope to npmjs and refuses a redirecting `publishConfig.registry`.
+- **CloudFront `--paths` elements weren't option-guarded** — an
+  `--endpoint-url=` path element was an SSRF; each path is now `reject_option_like`.
+- **`KVENDRA_REBIND_RECOVERY_CODE`** added to the child-process env scrub.
+- **Detection**: private keys redact `BEGIN…(END|EOF)` and bypass the entropy
+  gate; JWT/Google-OAuth are redact-only (no inbound block, to avoid DoSing legit
+  bearer args); the http response now redacts the exact secret value, not just
+  known patterns.
+- **Master password zeroized on the main `unlock` path** (was only on `--extend`).
+
+Deferred (larger change or same-uid-bounded), tracked in `ISSUE-KVD-CLI-3FD509`:
+A5 config not re-verified on `mcp serve` locked boot; `unsafe` quota burned on a
+transient failure; `packages:` unenforced on `npm publish`; git `insteadOf` via
+the hand-parsed `.git/config`; the userinfo-floating canary residual.
+
 ### Known design item — cycle 8 (tracked, owner decision)
 
 - **Approval cache is per-profile, not per-operation.** In the default
