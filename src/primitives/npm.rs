@@ -78,14 +78,66 @@ async fn publish(op_args: &Value, secret: Option<&SecretPlaintext>) -> KvendraRe
         .and_then(Value::as_str)
         .unwrap_or("restricted");
 
+    // N6 continued — `--registry` sets only the DEFAULT registry. For a SCOPED
+    // package npm's `pickRegistry` uses the scope-specific `@scope:registry`
+    // (from the cwd `.npmrc` or `package.json`), which overrides the default and
+    // would still send `NPM_TOKEN` to an attacker registry; and
+    // `publishConfig.registry` in package.json can redirect the publish outright.
+    // Read the caller-controlled package.json: pin the package's OWN scope to
+    // npmjs on the CLI (highest precedence), and refuse a publishConfig.registry
+    // that points off npmjs.
+    let mut scope_pin: Option<String> = None;
+    if let Ok(raw) = std::fs::read_to_string(std::path::Path::new(cwd).join("package.json"))
+        && let Ok(pkg) = serde_json::from_str::<Value>(&raw)
+    {
+        if let Some(scope) = pkg
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|n| n.strip_prefix('@'))
+            .and_then(|r| r.split_once('/'))
+            .map(|(s, _)| s)
+        {
+            scope_pin = Some(format!("--@{scope}:registry={NPMJS_REGISTRY}"));
+        }
+        if let Some(reg) = pkg
+            .get("publishConfig")
+            .and_then(|p| p.get("registry"))
+            .and_then(Value::as_str)
+            && !registry_is_npmjs(reg)
+        {
+            return Err(KvendraError::AllowlistViolation(format!(
+                "npm.publish: package.json publishConfig.registry '{reg}' is not the npmjs \
+                 registry — refusing (it would redirect the publish and the token)"
+            )));
+        }
+    }
+
     // Hardened spawn: scrub KVENDRA_* env (N1) + sanitised PATH (A2).
     let mut cmd = crate::primitives::spawn::hardened_command("npm");
     // N2 (--ignore-scripts) + N6 (--registry pinned) — see `publish_argv`.
-    cmd.args(publish_argv(access)).current_dir(cwd);
+    cmd.args(publish_argv(access));
+    if let Some(pin) = &scope_pin {
+        cmd.arg(pin);
+    }
+    cmd.current_dir(cwd);
     if let Some(s) = secret {
         cmd.env("NPM_TOKEN", s.as_str()?);
     }
     run_npm("publish", cmd).await
+}
+
+/// Is `registry` the public npmjs registry (host `registry.npmjs.org`)?
+fn registry_is_npmjs(registry: &str) -> bool {
+    registry
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("https://")
+        .or_else(|| registry.trim().trim_end_matches('/').strip_prefix("http://"))
+        .map(|host_path| {
+            let host = host_path.split('/').next().unwrap_or(host_path);
+            host.eq_ignore_ascii_case("registry.npmjs.org")
+        })
+        .unwrap_or(false)
 }
 
 async fn deprecate(op_args: &Value, secret: Option<&SecretPlaintext>) -> KvendraResult<Value> {
@@ -169,6 +221,18 @@ mod tests {
             argv.iter().any(|a| a == "--ignore-scripts"),
             "N2: --ignore-scripts must be present"
         );
+    }
+
+    #[test]
+    fn registry_is_npmjs_only_for_npmjs_host() {
+        assert!(registry_is_npmjs("https://registry.npmjs.org/"));
+        assert!(registry_is_npmjs("https://registry.npmjs.org"));
+        assert!(registry_is_npmjs("http://registry.npmjs.org/"));
+        // Attacker redirects must NOT be accepted.
+        assert!(!registry_is_npmjs("https://evil.example/"));
+        assert!(!registry_is_npmjs("https://registry.npmjs.org.evil.example/"));
+        assert!(!registry_is_npmjs("https://npm.pkg.github.com/"));
+        assert!(!registry_is_npmjs("registry.npmjs.org")); // no scheme
     }
 
     /// N6 — deprecate also authenticates, so it must pin the registry too, and

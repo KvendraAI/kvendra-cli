@@ -105,16 +105,37 @@ pub fn detect(haystack: &str) -> Vec<DetectionMatch> {
     let mut out = Vec::new();
     for idx in hits.iter() {
         let provider = cp.providers[idx];
+        // Redact-only providers (JWT, Google OAuth) are commonly legitimate
+        // inbound arguments; do not let them block/quarantine a call.
+        if crate::detection::patterns::REDACT_ONLY_PROVIDERS.contains(&provider) {
+            continue;
+        }
         if let Some(m) = cp.individual[idx].find(haystack) {
             let matched = m.as_str().to_string();
             let h = shannon_entropy(&matched);
-            if h >= ENTROPY_THRESHOLD {
+            let always = crate::detection::patterns::ALWAYS_REDACT_PROVIDERS.contains(&provider);
+            if always || h >= ENTROPY_THRESHOLD {
                 out.push(DetectionMatch {
                     provider: provider.to_string(),
                     matched_text: matched,
                     entropy_bits_per_char: h,
                 });
             }
+        }
+    }
+    out
+}
+
+/// Redact EXACT known secret values (and nothing else) from `text`. Pattern
+/// detection only catches recognized token *shapes*; the broker holds the exact
+/// plaintext it injected, so an opaque/unrecognized credential reflected back by
+/// an endpoint can be scrubbed by literal value here. Empty/very short values
+/// are ignored to avoid mangling unrelated output.
+pub fn redact_values(text: &str, values: &[String]) -> String {
+    let mut out = text.to_string();
+    for v in values {
+        if v.len() >= 8 {
+            out = out.replace(v.as_str(), "<redacted:secret-value>");
         }
     }
     out
@@ -133,10 +154,11 @@ pub fn sanitize_output(s: &str) -> String {
         let re = &cp.individual[idx];
         let provider = cp.providers[idx];
         // Replace each match if entropy passes the filter.
+        let always = crate::detection::patterns::ALWAYS_REDACT_PROVIDERS.contains(&provider);
         let replaced = re
             .replace_all(&out, |caps: &regex::Captures| {
                 let m = caps.get(0).unwrap().as_str();
-                if shannon_entropy(m) >= ENTROPY_THRESHOLD {
+                if always || shannon_entropy(m) >= ENTROPY_THRESHOLD {
                     format!("<redacted:{provider}>")
                 } else {
                     m.to_string()
@@ -198,17 +220,47 @@ mod tests {
     }
 
     #[test]
-    fn detects_jwt() {
+    fn jwt_is_redact_only_not_inbound_blocked() {
+        // A JWT is commonly a legitimate inbound argument (Authorization bearer),
+        // so detect() must NOT flag it (no block/quarantine in severity=block),
+        // but sanitize_output MUST still redact it so it is never echoed back.
         let s = "auth: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
                  eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ.\
                  dQw4w9WgXcQ_abc123XYZ_signature_bits";
-        assert!(detect(s).iter().any(|h| h.provider == "jwt"));
+        assert!(
+            !detect(s).iter().any(|h| h.provider == "jwt"),
+            "jwt must not block inbound"
+        );
+        assert!(sanitize_output(s).contains("<redacted:jwt>"), "jwt must be redacted in output");
     }
 
     #[test]
-    fn detects_google_oauth_token() {
+    fn google_oauth_is_redact_only_not_inbound_blocked() {
         let s = "token ya29.a0AfH6SMBx7yQk9vL2mNpQrStUvWxYz0123456789";
-        assert!(detect(s).iter().any(|h| h.provider == "google_oauth_token"));
+        assert!(!detect(s).iter().any(|h| h.provider == "google_oauth_token"));
+        assert!(sanitize_output(s).contains("<redacted:google_oauth_token>"));
+    }
+
+    #[test]
+    fn private_key_redacted_even_without_end_marker() {
+        // A truncated key (BEGIN + body, no END) must still be redacted to EOF.
+        let s = "log:\n-----BEGIN OPENSSH PRIVATE KEY-----\n\
+                 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAA\n\
+                 AAtzc2gtZWQyNTUxOQAAACD9aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJqWxY";
+        let out = sanitize_output(s);
+        assert!(out.contains("<redacted:private_key_pem>"), "got: {out}");
+        assert!(!out.contains("b3BlbnNzaC1rZXktdjEA"), "key body leaked: {out}");
+    }
+
+    #[test]
+    fn redact_values_scrubs_exact_opaque_secret() {
+        // An opaque credential (no recognized shape) reflected back is scrubbed
+        // by exact value.
+        let secret = "Zx9Qw-opaque-42kLmNoPqRs".to_string();
+        let reflected = format!("resp: {{\"echoed\":\"{secret}\"}}");
+        let out = redact_values(&reflected, std::slice::from_ref(&secret));
+        assert!(out.contains("<redacted:secret-value>"));
+        assert!(!out.contains(&secret));
     }
 
     #[test]

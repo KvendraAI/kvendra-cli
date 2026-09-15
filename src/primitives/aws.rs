@@ -184,6 +184,12 @@ async fn cloudfront_invalidate(op_args: &Value, creds: &AwsCreds) -> KvendraResu
         .arg("--paths");
     for p in paths {
         if let Some(s) = p.as_str() {
+            // Each path is agent-controlled and appended after `--paths` with no
+            // `--` terminator (the AWS CLI treats a later `--endpoint-url=…` /
+            // `--profile …` as a GLOBAL option → SSRF / redirect). Reject any
+            // path shaped like an option. (N5 was applied to distribution_id but
+            // not to these path elements.)
+            crate::primitives::spawn::reject_option_like("aws.cloudfront_invalidate.paths", s)?;
             cmd.arg(s);
         }
     }

@@ -532,11 +532,15 @@ fn glob_match(pattern: &str, candidate: &str) -> bool {
 /// profile already writes `^https://…`, so this is a no-op for well-formed
 /// allowlists and a hard deny for the bypass shape.
 pub(crate) fn regex_match_url(pattern: &str, candidate: &str) -> bool {
-    let anchored = if pattern.starts_with('^') {
-        pattern.to_string()
-    } else {
-        format!("^(?:{pattern})")
-    };
+    // ISSUE-KVD-CLI-B78ED5 — anchor the WHOLE pattern, UNCONDITIONALLY. Wrapping
+    // only when the pattern does not already start with `^` left a top-level
+    // alternation's later branches UNANCHORED: for `^https://a/|https://b/`,
+    // branch 1 is anchored but branch 2 matches as a substring, reopening the
+    // exact URL-anchoring bypass this function exists to close
+    // (`https://evil/?x=https://b/` → secret sent to evil). `^(?:{pattern})`
+    // binds every alternation branch to position 0; a redundant inner `^` in an
+    // already-anchored pattern is harmless.
+    let anchored = format!("^(?:{pattern})");
     Regex::new(&anchored).is_ok_and(|re| re.is_match(candidate))
 }
 
@@ -583,20 +587,35 @@ fn extract_owner_from_repo(repo: &str) -> Option<&str> {
 /// the `repos:` constraint (ISSUE-KVD-CLI-043).
 fn extract_repo_canonical(input: &str) -> String {
     let s = input.trim();
-    // Strip http(s):// scheme.
-    let s = s
-        .strip_prefix("https://")
-        .or_else(|| s.strip_prefix("http://"))
-        .unwrap_or(s);
-    // Convert SSH form `git@host:owner/name(.git)?` → `host/owner/name`.
-    if let Some(rest) = s.strip_prefix("git@")
-        && let Some((host, path)) = rest.split_once(':')
-    {
-        let path = path.strip_suffix(".git").unwrap_or(path);
-        return format!("{host}/{path}");
+    // No scheme: either scp-like `[user@]host:owner/repo` or an already-canonical
+    // `host/owner/repo` / `owner/repo`.
+    if !s.contains("://") {
+        if let Some((userhost, path)) = s.split_once(':') {
+            let host = userhost.rsplit_once('@').map(|(_, h)| h).unwrap_or(userhost);
+            // Treat as scp only when the left is host-ish and the right is a path,
+            // not a bare `:port`. Otherwise fall through to passthrough.
+            if host.contains('.') && !path.chars().all(|c| c.is_ascii_digit()) {
+                let path = path.strip_suffix(".git").unwrap_or(path);
+                return format!("{host}/{path}");
+            }
+        }
+        return s.strip_suffix(".git").unwrap_or(s).to_string();
     }
-    // Strip trailing `.git`.
-    s.strip_suffix(".git").unwrap_or(s).to_string()
+    // Has a scheme (https/http/ssh/git/ftp/…): strip it, then userinfo and port,
+    // so the HOST stays in the comparison. This canonicalizes `ssh://` and `git://`
+    // remotes (previously only http/https were handled → legitimate ssh pushes were
+    // wrongly denied) AND correctly attributes `https://github.com@evil.com/x` to
+    // `evil.com` (userinfo bypass) rather than github.com.
+    let after = s.split_once("://").map(|x| x.1).unwrap_or(s);
+    let (authority, path) = after.split_once('/').unwrap_or((after, ""));
+    let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    if path.is_empty() {
+        host.to_string()
+    } else {
+        format!("{host}/{path}")
+    }
 }
 
 /// Does `s` look like a git remote URL (scheme, `git@`, or `user@host:` scp
@@ -1707,6 +1726,62 @@ allowlist:
             extract_repo_canonical("git@github.com:Foo/Bar"),
             "github.com/Foo/Bar"
         );
+    }
+
+    #[test]
+    fn extract_repo_canonical_handles_ssh_and_userinfo() {
+        // ssh:// scheme (was previously not stripped → legit ssh pushes denied).
+        assert_eq!(
+            extract_repo_canonical("ssh://git@github.com/Org/Repo.git"),
+            "github.com/Org/Repo"
+        );
+        assert_eq!(
+            extract_repo_canonical("ssh://git@github.com:22/Org/Repo"),
+            "github.com/Org/Repo"
+        );
+        // Userinfo bypass: attributes to the REAL host, not the userinfo label.
+        assert_eq!(
+            extract_repo_canonical("https://github.com@evil.com/Org/Repo"),
+            "evil.com/Org/Repo"
+        );
+        // Port stripped.
+        assert_eq!(
+            extract_repo_canonical("https://github.com:443/Org/Repo"),
+            "github.com/Org/Repo"
+        );
+    }
+
+    #[test]
+    fn url_pattern_alternation_second_branch_is_anchored() {
+        // A top-level alternation must anchor EVERY branch; branch 2 must not
+        // match as a substring (ISSUE-KVD-CLI-B78ED5 regex-anchor fix).
+        let s = spec_with(
+            r#"
+profile_id: x
+secret:
+  type: t
+allowlist:
+  primitives:
+    - name: kvendra.http
+      operations:
+        - request:
+            methods: ["GET"]
+            url_pattern_regex: ['^https://api\.example\.com/|https://cdn\.example\.com/']
+"#,
+        );
+        // Attacker URL that merely CONTAINS the second branch as a substring.
+        let attack = env_args(
+            serde_json::json!({ "method": "GET", "url": "https://evil.example/?x=https://cdn.example.com/" }),
+        );
+        assert!(
+            check(&s, "kvendra.http", "request", &attack).is_err(),
+            "unanchored alternation branch must not allow a substring match"
+        );
+        // The legit second-branch host still matches at position 0.
+        let ok = env_args(
+            serde_json::json!({ "method": "GET", "url": "https://cdn.example.com/asset" }),
+        );
+        assert!(check(&s, "kvendra.http", "request", &ok).is_ok());
     }
 
     #[test]

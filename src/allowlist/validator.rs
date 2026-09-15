@@ -17,6 +17,22 @@ const BROAD_SCOPE_CANARIES: &[&str] = &[
     "http://c4n4ry.attacker.test/x?y=z",
     "https://192.0.2.77/latest/meta-data/",
     "ftp://nope.invalid/",
+    // Public-TLD canaries: a pattern that pins only a TLD (`^https://[^/]+\.com/`)
+    // or a bare scheme is effectively host-unrestricted — it matches any
+    // attacker-registered host on that TLD, yet matches none of the reserved-TLD
+    // canaries above. Cover the common public TLDs and a userinfo form.
+    "https://c4n4ry-9f2b7a.com/probe",
+    "https://c4n4ry-9f2b7a.net/probe",
+    "https://c4n4ry-9f2b7a.org/probe",
+    "https://c4n4ry-9f2b7a.io/probe",
+    "https://c4n4ry-9f2b7a.dev/probe",
+    "https://c4n4ry-9f2b7a.co/probe",
+    // http:// variants — an http-scheme broad pattern is just as unrestricted.
+    "http://c4n4ry-9f2b7a.com/probe",
+    "http://c4n4ry-9f2b7a.net/probe",
+    "http://c4n4ry-9f2b7a.org/probe",
+    "http://c4n4ry-9f2b7a.io/probe",
+    "http://attacker@c4n4ry-9f2b7a.com/probe",
 ];
 
 pub fn validate(spec: &ProfileSpec) -> KvendraResult<()> {
@@ -340,6 +356,29 @@ allowlist:
         ] {
             let p = ProfileSpec::from_yaml(&http_spec_with_pattern(pat, false)).unwrap();
             assert!(validate(&p).is_ok(), "host-pinned pattern '{pat}' must pass");
+        }
+    }
+
+    #[test]
+    fn n8_rejects_tld_only_and_userinfo_broad_patterns() {
+        // A pattern that pins only a TLD (or lets an @ userinfo float the host)
+        // is effectively host-unrestricted and must require accept_broad_scope.
+        // TLD-only patterns match any attacker-registered host on that TLD.
+        // (A userinfo-floating pattern with a literal `host@[^/]+` is an exotic
+        // residual the canary heuristic does not catch — structural host-label
+        // validation would, tracked as future hardening; a blanket `@` guard is
+        // rejected because npm scope paths legitimately contain `@`.)
+        for pat in [
+            r"^https://[^/]+\.com/",
+            r"^https://.*\.com/",
+            r"^https://[^/]+\.io/",
+            r"^http://[^/]+\.net/",
+        ] {
+            let p = ProfileSpec::from_yaml(&http_spec_with_pattern(pat, false)).unwrap();
+            assert!(
+                validate(&p).is_err(),
+                "TLD-only broad pattern '{pat}' must be rejected"
+            );
         }
     }
 

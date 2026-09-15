@@ -33,6 +33,9 @@ const SENSITIVE_ENV_VARS: &[&str] = &[
     "KVENDRA_NEW_PASSWORD",
     "KVENDRA_RECOVERY_MNEMONIC",
     "KVENDRA_INIT_CONFIRM_CODE",
+    // A recovery credential (read by `config rebind`); a brokered child must
+    // not inherit it if the owner exported it in the launching shell (N1 class).
+    "KVENDRA_REBIND_RECOVERY_CODE",
 ];
 
 /// Build a sanitised PATH from the inherited PATH: keep only non-empty,

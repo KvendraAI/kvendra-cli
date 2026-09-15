@@ -83,9 +83,15 @@ async fn request(op_args: &Value, secret: Option<&SecretPlaintext>) -> KvendraRe
         }
     }
 
-    // Auth (uses the secret plaintext, never echoed back).
+    // Auth (uses the secret plaintext, never echoed back). Capture the exact
+    // value(s) sent so they can be scrubbed from the response by literal value,
+    // not just by pattern — the caller controls `auth_scheme`/`headers`, so it
+    // can steer an OPAQUE (unrecognized-shape) credential into a spot a
+    // cooperating endpoint reflects back, which the pattern redactor would miss.
+    let mut secret_values: Vec<String> = Vec::new();
     if let Some(s) = secret {
         let plaintext = s.as_str()?;
+        secret_values.push(plaintext.to_string());
         match auth_scheme {
             "bearer" => {
                 builder = builder.bearer_auth(plaintext);
@@ -103,6 +109,7 @@ async fn request(op_args: &Value, secret: Option<&SecretPlaintext>) -> KvendraRe
                 let username = &scheme["basic_".len()..];
                 let combined = format!("{username}:{plaintext}");
                 let encoded = B64.encode(combined);
+                secret_values.push(encoded.clone());
                 builder = builder.header("Authorization", format!("Basic {encoded}"));
             }
             "none" => {}
@@ -129,20 +136,21 @@ async fn request(op_args: &Value, secret: Option<&SecretPlaintext>) -> KvendraRe
     // return a token in a response header (Set-Cookie, X-Api-Key, …). The body
     // was already passed through the detection redactor; headers were not, an
     // asymmetry an agent could use to read a secret back (ISSUE-KVD-CLI-B78ED5).
+    // Scrub the exact injected secret value(s) first, then the pattern redactor.
+    let scrub = |raw: &str| -> String {
+        crate::detection::sanitize_output(&crate::detection::redact_values(raw, &secret_values))
+    };
     let headers_map: serde_json::Map<String, Value> = resp
         .headers()
         .iter()
         .filter_map(|(k, v)| {
-            v.to_str().ok().map(|vs| {
-                (
-                    k.as_str().to_string(),
-                    Value::String(crate::detection::sanitize_output(vs)),
-                )
-            })
+            v.to_str()
+                .ok()
+                .map(|vs| (k.as_str().to_string(), Value::String(scrub(vs))))
         })
         .collect();
     let bytes = resp.bytes().await.unwrap_or_default();
-    let body_text = crate::detection::sanitize_output(&String::from_utf8_lossy(&bytes));
+    let body_text = scrub(&String::from_utf8_lossy(&bytes));
     Ok(json!({
         "operation": "request",
         "status_code": status.as_u16(),

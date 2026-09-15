@@ -51,8 +51,24 @@ pub const PROVIDER_PATTERNS: &[(&str, &str)] = &[
     // so redacting only it would leave the high-entropy key body visible. `(?s)`
     // lets `.` cross newlines; the match spans BEGIN…END so the entire key is
     // replaced.
+    // Match BEGIN … up to the END marker, OR to end-of-text if the END was
+    // truncated (a tool that cut its own output must not leak the key body
+    // just because the footer is missing). `\z` = end of text.
     (
         "private_key_pem",
-        r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)",
     ),
 ];
+
+/// Providers that are REDACTED in output but do NOT block/quarantine on inbound
+/// `tools/call` args. A JWT or Google OAuth token is commonly a LEGITIMATE
+/// argument (e.g. an `Authorization: Bearer` value the agent must send), so
+/// treating it as an inbound-smuggling signal in `severity = block` mode would
+/// deny legitimate calls. They still must never be echoed back, so output
+/// redaction keeps them.
+pub const REDACT_ONLY_PROVIDERS: &[&str] = &["jwt", "google_oauth_token"];
+
+/// Providers that must be redacted regardless of the entropy filter — their
+/// framing (a PEM `BEGIN … PRIVATE KEY` block) is a strong enough signal on its
+/// own, and a contrived low-entropy body must not slip a real key past.
+pub const ALWAYS_REDACT_PROVIDERS: &[&str] = &["private_key_pem"];

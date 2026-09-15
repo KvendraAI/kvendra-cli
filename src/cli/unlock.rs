@@ -109,7 +109,7 @@ pub async fn run(args: UnlockArgs) -> KvendraResult<()> {
         None
     };
 
-    let password = match args.password_env {
+    let mut password = match args.password_env {
         Some(s) => s,
         None => {
             let handle = tty_handle.as_ref().expect("set when password_env is None");
@@ -160,7 +160,12 @@ pub async fn run(args: UnlockArgs) -> KvendraResult<()> {
         return Ok(());
     }
 
-    vault.unlock(password.as_bytes(), cfg.vault.idle_timeout_minutes)?;
+    // Zeroize the plaintext master password after use, on both success and
+    // error paths (mirrors the `--extend` path hardened for A1; `String::drop`
+    // frees but does not wipe the heap buffer).
+    let unlock_res = vault.unlock(password.as_bytes(), cfg.vault.idle_timeout_minutes);
+    password.zeroize();
+    unlock_res?;
 
     // REQ-KVD-008 + finding A5: re-load the config with the vault attached so
     // the HMAC verification + home_canonical check run. A config that is not
