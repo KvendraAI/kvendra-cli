@@ -235,6 +235,15 @@ owner UX decision (not a fail-open bug).
   cloudfront (`distribution_id`), lambda (`function_name`), `read_metadata`
   (`package`/`project`) and `github.update_repo` all align.
 
+### Found in the detection-coverage review (cycle 10)
+
+- **N11 — the output redactor missed private keys, JWTs, and Google OAuth
+  tokens.** `sanitize_output` redacts brokered-command output (and, since N9,
+  HTTP headers/body), but its provider set did not include PEM private keys,
+  JSON Web Tokens, or `ya29.` tokens — so those could be returned to the agent
+  unredacted. All three were added; the private-key pattern redacts the whole
+  `BEGIN…END` block so the key body cannot leak.
+
 ## Design-level items — documented, not code-patched
 
 These are threat-model boundaries, not one-line bugs. They are stated honestly

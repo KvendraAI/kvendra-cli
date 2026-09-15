@@ -282,6 +282,18 @@ against the running broker and re-verified fixed. Behaviour changes are flagged.
   primitive does not inject caller-supplied env — so it over-restricts rather
   than under-restricts (safe), documented for a future cleanup.
 
+### Fixed — cycle 10 (secret-detection completeness for output redaction)
+
+- **N11 — the output redactor missed private keys, JWTs and Google OAuth
+  tokens.** `sanitize_output` (which redacts brokered-command output, and now
+  HTTP headers/body per N9) covered ~16 provider token formats but not PEM
+  private keys, JSON Web Tokens (the shape of the Cognito Pro session token), or
+  Google `ya29.` OAuth tokens — so a private key or JWT appearing in a command's
+  output was returned to the agent verbatim. Added all three. The private-key
+  pattern matches the WHOLE `BEGIN…END` block (the header line alone is barely
+  above the entropy threshold, so redacting only it would leak the key body).
+  `src/detection/patterns.rs`. Regression: `cargo test --lib detection`.
+
 ### Known design item — cycle 8 (tracked, owner decision)
 
 - **Approval cache is per-profile, not per-operation.** In the default

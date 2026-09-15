@@ -198,6 +198,37 @@ mod tests {
     }
 
     #[test]
+    fn detects_jwt() {
+        let s = "auth: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
+                 eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ.\
+                 dQw4w9WgXcQ_abc123XYZ_signature_bits";
+        assert!(detect(s).iter().any(|h| h.provider == "jwt"));
+    }
+
+    #[test]
+    fn detects_google_oauth_token() {
+        let s = "token ya29.a0AfH6SMBx7yQk9vL2mNpQrStUvWxYz0123456789";
+        assert!(detect(s).iter().any(|h| h.provider == "google_oauth_token"));
+    }
+
+    #[test]
+    fn sanitize_redacts_whole_private_key_block() {
+        // The WHOLE block must be redacted, not just the header — otherwise the
+        // high-entropy key body would leak (finding: detection completeness).
+        let key = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+                   b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAA\n\
+                   AAtzc2gtZWQyNTUxOQAAACD9aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJqWxY\n\
+                   -----END OPENSSH PRIVATE KEY-----";
+        let s = format!("here is a key:\n{key}\ndone");
+        let out = sanitize_output(&s);
+        assert!(out.contains("<redacted:private_key_pem>"), "got: {out}");
+        assert!(
+            !out.contains("b3BlbnNzaC1rZXktdjEA"),
+            "private key body leaked: {out}"
+        );
+    }
+
+    #[test]
     fn detects_npm_token() {
         let s = "npm_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaaaa";
         let hits = detect(s);

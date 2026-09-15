@@ -38,4 +38,21 @@ pub const PROVIDER_PATTERNS: &[(&str, &str)] = &[
     ("google_api_key", r"AIza[0-9A-Za-z_\-]{35}"),
     // GitLab personal access token.
     ("gitlab_pat", r"glpat-[0-9A-Za-z_\-]{20,}"),
+    // Google OAuth 2.0 access token (`ya29.`).
+    ("google_oauth_token", r"ya29\.[0-9A-Za-z_\-]{20,}"),
+    // JSON Web Token — three base64url segments, header begins `eyJ` (base64 of
+    // `{"`). Session/id tokens (e.g. the Cognito Pro token) take this shape.
+    (
+        "jwt",
+        r"eyJ[0-9A-Za-z_\-]{8,}\.[0-9A-Za-z_\-]{8,}\.[0-9A-Za-z_\-]{8,}",
+    ),
+    // PEM private key block (SSH / TLS / PGP). Match the WHOLE block, not just
+    // the header: the header line alone is barely above the entropy threshold,
+    // so redacting only it would leave the high-entropy key body visible. `(?s)`
+    // lets `.` cross newlines; the match spans BEGIN…END so the entire key is
+    // replaced.
+    (
+        "private_key_pem",
+        r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+    ),
 ];
