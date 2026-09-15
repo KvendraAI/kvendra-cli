@@ -55,7 +55,7 @@ pub enum MigrationOutcome {
 /// Server-side context shared across all dispatch calls.
 pub struct ServerContext {
     pub vault: Vault,
-    pub config: Config,
+    pub config: std::sync::RwLock<Config>,
     /// Audit writer slot. Wrapped in `RwLock<Option<_>>` (interior
     /// mutability) so the dispatcher can lazy-spawn the writer the first
     /// time the vault transitions from `LockedPendingUnlock` to `Unlocked`
@@ -148,16 +148,16 @@ impl ServerContext {
         Ok(true)
     }
 
-    /// Per-session quota for the `kvendra.unsafe.raw_token` escape hatch
-    /// (ISSUE-KVD-CLI-B78ED5 finding H4). Split into a non-mutating `check`
-    /// (called early, after the allowlist + approval gates) and a `consume`
-    /// (called only once the plaintext has actually been resolved and is about
-    /// to be exposed). Splitting it means a transient PRE-exposure failure —
-    /// `BrokerUnreachable`, `RateLimited`, a stale-cache refusal — no longer
-    /// burns the (default 1) budget on a call that exposed nothing
-    /// (ISSUE-KVD-CLI-3FD509 item 2). On stdio `mcp serve` requests are
-    /// processed serially, so no other request interleaves between check and
-    /// consume; a concurrent racer at worst spends one extra use (bounded).
+    // Per-session quota for the `kvendra.unsafe.raw_token` escape hatch
+    // (ISSUE-KVD-CLI-B78ED5 finding H4). Split into a non-mutating `check`
+    // (called early, after the allowlist + approval gates) and a `consume`
+    // (called only once the plaintext has actually been resolved and is about
+    // to be exposed). Splitting it means a transient PRE-exposure failure —
+    // `BrokerUnreachable`, `RateLimited`, a stale-cache refusal — no longer
+    // burns the (default 1) budget on a call that exposed nothing
+    // (ISSUE-KVD-CLI-3FD509 item 2). On stdio `mcp serve` requests are
+    // processed serially, so no other request interleaves between check and
+    // consume; a concurrent racer at worst spends one extra use (bounded).
 
     /// Peek: is a use still available for this profile? No mutation.
     fn check_unsafe_quota(&self, profile_id: &str) -> KvendraResult<()> {
@@ -324,7 +324,7 @@ pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
 
     let ctx = Arc::new(ServerContext {
         vault,
-        config,
+        config: std::sync::RwLock::new(config),
         writer: std::sync::RwLock::new(writer),
         approval_cache: Arc::new(ApprovalCache::new()),
         approval_prompt_lock: Arc::new(Mutex::new(())),
@@ -530,7 +530,7 @@ fn try_self_heal_vault(ctx: &ServerContext) {
     let home = ctx.vault.home();
     match crate::session::local::load(home) {
         Ok(state) => {
-            let idle_timeout = ctx.config.vault.idle_timeout_minutes;
+            let idle_timeout = ctx.config.read().unwrap_or_else(|e| e.into_inner()).vault.idle_timeout_minutes;
             match ctx
                 .vault
                 .unlock_from_derived_key(&state.derived_key, idle_timeout)
@@ -541,6 +541,33 @@ fn try_self_heal_vault(ctx: &ServerContext) {
                         flag = self_heal_flag,
                         "vault locked → re-unlocked from active session blob"
                     );
+                    // A5 (ISSUE-KVD-CLI-3FD509 item 1) — the config was loaded at
+                    // BOOT with the vault LOCKED, so its trailer HMAC could not be
+                    // verified and a tampered/unsigned `config.toml` may have been
+                    // cached (e.g. `approval.mode = silent`). Now that the vault is
+                    // unlocked, RELOAD and VERIFY it and replace the cached copy.
+                    // If the on-disk config does not verify, re-lock and refuse to
+                    // serve under an unverified config (fail closed). This closes
+                    // the boot-time / tamper→restore gap in the A5 fix for the
+                    // canonical tolerant-boot serve flow.
+                    match crate::config::Config::load(ctx.vault.home(), Some(&ctx.vault)) {
+                        Ok(verified) => {
+                            if let Ok(mut guard) = ctx.config.write() {
+                                *guard = verified;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                target: "kvendra::mcp",
+                                flag = "config_verify_failed_post_unlock",
+                                error = %e,
+                                "config.toml failed integrity verification after \
+                                 self-heal — re-locking the vault (fail closed)"
+                            );
+                            ctx.vault.lock();
+                            return;
+                        }
+                    }
                     // ISSUE-KVD-CLI-9764AC fix — if the server booted with
                     // the vault in `LockedPendingUnlock`, the audit writer
                     // was constructed `None` and `record_audit` is a silent
@@ -724,7 +751,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
     let detection_decision = if detection_hits.is_empty() {
         Decision::Allow
     } else {
-        Decision::from_severity(ctx.config.detection.severity)
+        Decision::from_severity(ctx.config.read().unwrap_or_else(|e| e.into_inner()).detection.severity)
     };
     if !detection_hits.is_empty() {
         match detection_decision {
@@ -885,7 +912,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         )
         .await;
         let error_type = approval_decision.error_type().unwrap_or("approval_failed");
-        let hint = approval::hint_for(approval_decision, ctx.config.approval.timeout_seconds);
+        let hint = approval::hint_for(approval_decision, ctx.config.read().unwrap_or_else(|e| e.into_inner()).approval.timeout_seconds);
         let data = serde_json::json!({
             "error_type": error_type,
             "hint": hint,
@@ -1383,7 +1410,7 @@ mod tests {
 
         let ctx = ServerContext {
             vault: v,
-            config: Config::default(),
+            config: std::sync::RwLock::new(Config::default()),
             writer: std::sync::RwLock::new(writer),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
@@ -1497,7 +1524,7 @@ mod tests {
         v.unlock(b"hunter2-noallowlist-test", 30).unwrap();
         let ctx = ServerContext {
             vault: v,
-            config: Config::default(),
+            config: std::sync::RwLock::new(Config::default()),
             writer: std::sync::RwLock::new(None),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
@@ -1601,7 +1628,7 @@ mod tests {
 
         let ctx = ServerContext {
             vault: v,
-            config: Config::default(),
+            config: std::sync::RwLock::new(Config::default()),
             writer: std::sync::RwLock::new(None),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
@@ -1617,6 +1644,81 @@ mod tests {
         assert!(
             ctx.vault.is_unlocked(),
             "self-healing should re-unlock the vault from the active blob"
+        );
+    }
+
+    // A5 (ISSUE-KVD-CLI-3FD509 item 1) — config is reloaded+verified at self-heal.
+
+    fn setup_selfheal_ctx_with_disk_config(
+        write_disk_config: impl FnOnce(&std::path::Path, &Vault),
+    ) -> ServerContext {
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-cfg", fast_params()).unwrap();
+        v.unlock(b"hunter2-cfg", 30).unwrap();
+        write_disk_config(home, &v);
+        let derived = v.peek_session_derived_key().unwrap();
+        let state = crate::session::local::build_state_for_current_machine(
+            derived,
+            std::time::Duration::from_secs(3600),
+            home,
+        )
+        .unwrap();
+        crate::session::local::persist_atomic(&state, home).unwrap();
+        v.lock();
+        ServerContext {
+            vault: v,
+            // Cached config with a DEFAULT value — as if a tampered config had
+            // been adopted at boot; the reload must overwrite it.
+            config: std::sync::RwLock::new(Config::default()),
+            writer: std::sync::RwLock::new(None),
+            approval_cache: Arc::new(ApprovalCache::new()),
+            approval_prompt_lock: Arc::new(Mutex::new(())),
+            transport: Transport::Mcp,
+            resolver: None,
+            session: None,
+            workspace_id: None,
+            unsafe_usage: Default::default(),
+        }
+    }
+
+    #[test]
+    fn self_heal_reloads_verified_config_over_cached() {
+        let distinctive = Config::default().approval.timeout_seconds.wrapping_add(123);
+        let ctx = setup_selfheal_ctx_with_disk_config(|home, v| {
+            let mut c = Config::default();
+            c.approval.timeout_seconds = distinctive;
+            c.save(home, v).unwrap(); // SIGNED
+        });
+        super::try_self_heal_vault(&ctx);
+        assert!(ctx.vault.is_unlocked(), "valid config → stay unlocked");
+        assert_eq!(
+            ctx.config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .approval
+                .timeout_seconds,
+            distinctive,
+            "the verified on-disk config must replace the boot-time cache"
+        );
+    }
+
+    #[test]
+    fn self_heal_relocks_on_unsigned_config() {
+        let ctx = setup_selfheal_ctx_with_disk_config(|home, _v| {
+            // Write an UNSIGNED config (no HMAC trailer) — the A5 tamper case.
+            std::fs::write(
+                home.join("config.toml"),
+                "[approval]\nmode = \"silent\"\n",
+            )
+            .unwrap();
+        });
+        super::try_self_heal_vault(&ctx);
+        assert!(
+            !ctx.vault.is_unlocked(),
+            "an unsigned/tampered config must re-lock the vault (fail closed)"
         );
     }
 
@@ -1665,7 +1767,7 @@ mod tests {
 
         let ctx = ServerContext {
             vault: v,
-            config: Config::default(),
+            config: std::sync::RwLock::new(Config::default()),
             writer: std::sync::RwLock::new(None),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
@@ -1773,7 +1875,7 @@ mod tests {
 
         let ctx = ServerContext {
             vault: v,
-            config: Config::default(),
+            config: std::sync::RwLock::new(Config::default()),
             writer: std::sync::RwLock::new(None),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
@@ -1853,7 +1955,7 @@ mod tests {
 
         let ctx = Arc::new(ServerContext {
             vault: v,
-            config: Config::default(),
+            config: std::sync::RwLock::new(Config::default()),
             writer: std::sync::RwLock::new(None),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
@@ -1921,7 +2023,7 @@ mod tests {
 
         let ctx = Arc::new(ServerContext {
             vault: v,
-            config: Config::default(),
+            config: std::sync::RwLock::new(Config::default()),
             writer: std::sync::RwLock::new(None),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
@@ -1989,7 +2091,7 @@ mod tests {
 
         let ctx = Arc::new(ServerContext {
             vault: v,
-            config: Config::default(),
+            config: std::sync::RwLock::new(Config::default()),
             writer: std::sync::RwLock::new(Some(writer)),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
@@ -2055,7 +2157,7 @@ mod tests {
 
         let ctx = ServerContext {
             vault: v,
-            config: Config::default(),
+            config: std::sync::RwLock::new(Config::default()),
             writer: std::sync::RwLock::new(None),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
@@ -2109,7 +2211,7 @@ mod tests {
         // production boot path when `audit_hmac_key()` errored).
         let ctx = ServerContext {
             vault: v,
-            config: Config::default(),
+            config: std::sync::RwLock::new(Config::default()),
             writer: std::sync::RwLock::new(None),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),
@@ -2165,7 +2267,7 @@ mod tests {
 
         let ctx = ServerContext {
             vault: v,
-            config: Config::default(),
+            config: std::sync::RwLock::new(Config::default()),
             writer: std::sync::RwLock::new(None),
             approval_cache: Arc::new(ApprovalCache::new()),
             approval_prompt_lock: Arc::new(Mutex::new(())),

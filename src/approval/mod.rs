@@ -212,7 +212,7 @@ pub async fn check(
         }
     };
 
-    let global = ctx.config.approval.mode;
+    let global = ctx.config.read().unwrap_or_else(|e| e.into_inner()).approval.mode;
     let mode = policy::resolve_mode(env_mode, profile_override_mode, global);
 
     if !policy::should_prompt(mode, destructive) {
@@ -249,8 +249,8 @@ pub async fn check(
         return ApprovalDecision::CacheHit;
     }
 
-    let timeout_seconds = ctx.config.approval.timeout_seconds;
-    let cache_ttl = Duration::from_secs(u64::from(ctx.config.approval.cache_ttl_seconds));
+    let timeout_seconds = ctx.config.read().unwrap_or_else(|e| e.into_inner()).approval.timeout_seconds;
+    let cache_ttl = Duration::from_secs(u64::from(ctx.config.read().unwrap_or_else(|e| e.into_inner()).approval.cache_ttl_seconds));
 
     let prompt_ctx = ApprovalContext {
         profile_id: profile_id.to_string(),

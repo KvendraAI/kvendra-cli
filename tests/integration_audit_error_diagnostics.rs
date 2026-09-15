@@ -64,7 +64,7 @@ async fn bootstrap_ctx(yaml: &str, profile_id: &str) -> (TempDir, Arc<ServerCont
 
     let ctx = Arc::new(ServerContext {
         vault: v,
-        config,
+        config: std::sync::RwLock::new(config),
         writer: std::sync::RwLock::new(Some(writer)),
         approval_cache: Arc::new(ApprovalCache::new()),
         approval_prompt_lock: Arc::new(Mutex::new(())),
