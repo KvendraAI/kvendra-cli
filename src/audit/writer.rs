@@ -131,7 +131,11 @@ impl AuditWriter {
     }
 }
 
-fn record_event(conn: &Connection, hmac_key: &[u8], event: &AuditEvent) -> KvendraResult<i64> {
+pub(crate) fn record_event(
+    conn: &Connection,
+    hmac_key: &[u8],
+    event: &AuditEvent,
+) -> KvendraResult<i64> {
     // Fetch previous hmac (or empty for first row).
     let prev: String = conn
         .query_row(

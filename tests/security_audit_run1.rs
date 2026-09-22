@@ -1806,6 +1806,226 @@ async fn sa4_green_cli_audit_verify_exits_nonzero_on_layout_violation() {
     assert!(stdout.contains("BROKEN"), "stdout: {stdout}");
 }
 
+// ─── SA4-F3 — `kvendra audit commit-layout` pins legacy rows ──────────────
+//
+// v1/v2 rows keep columns OUTSIDE their frozen MAC (v1: remote_audit_id +
+// error_code/error_message; v2: the diagnostics) and every legacy layout
+// canonicalizes NULL to ''. The commitment row (v4, appended — nothing is
+// rewritten) binds a digest over every column of every legacy row.
+
+fn commit_layout(
+    ctx: &Arc<ServerContext>,
+) -> kvendra::error::KvendraResult<kvendra::audit::layout_commit::CommitOutcome> {
+    let key = ctx.vault.audit_hmac_key().unwrap();
+    let conn = kvendra::audit::reader::open_readonly(&ctx.vault.audit_db_path()).unwrap();
+    kvendra::audit::layout_commit::commit_legacy_layout(&conn, &key, 1_800_000_000_000)
+}
+
+fn chain_report(
+    ctx: &Arc<ServerContext>,
+) -> kvendra::error::KvendraResult<kvendra::audit::reader::ChainReport> {
+    let key = ctx.vault.audit_hmac_key().unwrap();
+    let conn = kvendra::audit::reader::open_readonly(&ctx.vault.audit_db_path()).unwrap();
+    kvendra::audit::reader::verify_chain_report(&conn, &key)
+}
+
+fn tamper(ctx: &Arc<ServerContext>, sql: &str) {
+    let conn = rusqlite::Connection::open(ctx.vault.audit_db_path()).unwrap();
+    conn.execute(sql, []).unwrap();
+}
+
+/// The unbound-column forgeries of the validator finding (SA4-F3).
+const SA4_LEGACY_UNBOUND_EDITS: &[&str] = &[
+    // v1 row #1: diagnostics + remote id are outside the v1 MAC.
+    "UPDATE audit_events SET error_code = 'ALLOWLIST_VIOLATION' WHERE id = 1",
+    "UPDATE audit_events SET error_message = 'forged reason' WHERE id = 1",
+    "UPDATE audit_events SET remote_audit_id = '01HFORGED' WHERE id = 1",
+    // v2 row #2: diagnostics are outside the v2 MAC.
+    "UPDATE audit_events SET error_code = 'ALLOWLIST_VIOLATION' WHERE id = 2",
+    // v3 row #4: NULL↔'' is canonicalized away by every legacy MAC.
+    "UPDATE audit_events SET remote_audit_id = '' WHERE id = 4",
+    "UPDATE audit_events SET error_code = '' WHERE id = 4",
+];
+
+/// GREEN-only — once committed, forging diagnostics into a v1/v2 row (or a
+/// NULL↔'' edit on any legacy row) is a layout violation at the commitment.
+#[tokio::test]
+async fn sa4_green_commit_layout_detects_forged_legacy_diagnostics() {
+    for sql in SA4_LEGACY_UNBOUND_EDITS {
+        let (_dir, ctx) =
+            bootstrap("shell.profile", SHELL_ECHO_ONLY, DetectionSeverity::Warn).await;
+        drain(&ctx).await;
+        write_0_6_4_chain(&ctx);
+        assert!(matches!(
+            commit_layout(&ctx).unwrap(),
+            kvendra::audit::layout_commit::CommitOutcome::Committed {
+                row: 5,
+                legacy_rows: 4,
+                ..
+            }
+        ));
+        assert!(verify(&ctx).is_ok(), "the fresh commitment must verify");
+        tamper(&ctx, sql);
+        let r = verify(&ctx);
+        assert!(
+            matches!(
+                r,
+                Err(kvendra::error::KvendraError::AuditLayoutViolation { row: 5, .. })
+            ),
+            "{sql}: a committed legacy row must not be forgeable, got {r:?}"
+        );
+    }
+}
+
+/// GREEN-only — without a commitment, legacy rows verify exactly as before
+/// (the documented residual gap) and are reported as uncommitted.
+#[tokio::test]
+async fn sa4_green_uncommitted_legacy_rows_verify_as_before() {
+    for sql in SA4_LEGACY_UNBOUND_EDITS {
+        let (_dir, ctx) =
+            bootstrap("shell.profile", SHELL_ECHO_ONLY, DetectionSeverity::Warn).await;
+        drain(&ctx).await;
+        write_0_6_4_chain(&ctx);
+        tamper(&ctx, sql);
+        let rep = chain_report(&ctx).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert_eq!(
+            (
+                rep.legacy_rows,
+                rep.committed_legacy_rows(),
+                rep.uncommitted_legacy_rows()
+            ),
+            (4, 0, 4)
+        );
+    }
+}
+
+/// GREEN-only — commit-layout is idempotent, a no-op on an empty or v4-only
+/// log, and new v4 rows keep appending and verifying after the commitment.
+#[tokio::test]
+async fn sa4_green_commit_layout_is_idempotent() {
+    use kvendra::audit::layout_commit::CommitOutcome;
+    let (_dir, ctx) = bootstrap("shell.profile", SHELL_ECHO_ONLY, DetectionSeverity::Warn).await;
+    drain(&ctx).await;
+    assert_eq!(commit_layout(&ctx).unwrap(), CommitOutcome::NothingToCommit);
+
+    let (_dir2, ctx2) = bootstrap("shell.profile", SHELL_ECHO_ONLY, DetectionSeverity::Warn).await;
+    deny_one_shell_call(&ctx2).await;
+    drain(&ctx2).await;
+    assert_eq!(
+        commit_layout(&ctx2).unwrap(),
+        CommitOutcome::NothingToCommit
+    );
+    assert!(verify(&ctx2).is_ok());
+
+    let (_dir3, ctx3) = bootstrap("shell.profile", SHELL_ECHO_ONLY, DetectionSeverity::Warn).await;
+    drain(&ctx3).await;
+    write_0_6_4_chain(&ctx3);
+    assert!(matches!(
+        commit_layout(&ctx3).unwrap(),
+        CommitOutcome::Committed { row: 5, .. }
+    ));
+    assert_eq!(
+        commit_layout(&ctx3).unwrap(),
+        CommitOutcome::AlreadyCommitted {
+            row: 5,
+            legacy_rows: 4
+        }
+    );
+    let rep = chain_report(&ctx3).unwrap();
+    assert_eq!(
+        (rep.rows, rep.commitment_rows, rep.committed_legacy_rows()),
+        (5, 1, 4)
+    );
+}
+
+fn run_cli(home: &std::path::Path, args: &[&str], password: &str) -> std::process::Output {
+    use std::io::Write;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kvendra"))
+        .args(args)
+        .env("KVENDRA_HOME", home)
+        .env_remove("KVENDRA_PASSWORD")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{password}\n").as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// GREEN-only — CLI exit codes of `kvendra audit commit-layout` (temp
+/// `KVENDRA_HOME` only).
+#[tokio::test]
+async fn sa4_green_cli_commit_layout_exit_codes() {
+    const PW: &str = "hunter2-run1-audit";
+    let (dir, ctx) = bootstrap("shell.profile", SHELL_ECHO_ONLY, DetectionSeverity::Warn).await;
+    drain(&ctx).await;
+    write_0_6_4_chain(&ctx);
+    let home = dir.path();
+    let commit = ["audit", "commit-layout", "--password-stdin"];
+    let verify_args = ["audit", "--verify", "--password-stdin"];
+
+    let out = run_cli(home, &verify_args, PW);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout: {stdout}");
+    assert!(stdout.contains("0 committed, 4 uncommitted"), "{stdout}");
+
+    let out = run_cli(home, &commit, "wrong-password");
+    assert!(!out.status.success(), "a wrong password must fail");
+    assert_eq!(chain_report(&ctx).unwrap().commitment_rows, 0);
+
+    let out = run_cli(home, &commit, PW);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Committed 4 legacy-layout rows"),
+        "{stdout}"
+    );
+
+    let out = run_cli(home, &commit, PW);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout: {stdout}");
+    assert!(stdout.contains("Already committed"), "{stdout}");
+
+    let out = run_cli(home, &verify_args, PW);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout: {stdout}");
+    assert!(stdout.contains("4 committed, 0 uncommitted"), "{stdout}");
+
+    tamper(
+        &ctx,
+        "UPDATE audit_events SET error_code = 'ALLOWLIST_VIOLATION' WHERE id = 1",
+    );
+    let out = run_cli(home, &verify_args, PW);
+    assert!(
+        !out.status.success(),
+        "verify must exit non-zero on a forged committed row"
+    );
+    let out = run_cli(home, &commit, PW);
+    assert!(
+        !out.status.success(),
+        "commit-layout must refuse (not re-commit) over a forged committed row"
+    );
+    assert_eq!(
+        rusqlite::Connection::open(ctx.vault.audit_db_path())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM audit_events", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        5,
+        "a refused commit appends nothing"
+    );
+
+    let empty = tempfile::tempdir().unwrap();
+    let out = run_cli(empty.path(), &commit, PW);
+    assert!(out.status.success(), "no audit log is a no-op");
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // SA5 — ISSUE-KVD-CLI-3319F0 (MED)
 // Broker-supplied `template_id` is joined into a filesystem path unvalidated.

@@ -6,6 +6,7 @@ pub mod bootstrap;
 pub mod error_code;
 pub mod export;
 pub mod hmac;
+pub mod layout_commit;
 pub mod migrations;
 pub mod reader;
 pub mod schema;

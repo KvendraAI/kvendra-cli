@@ -1,6 +1,7 @@
 //! Audit reader — query / export / verify HMAC chain.
 
 use crate::audit::hmac::{CURRENT_HMAC_LAYOUT, RowFields, compute_for_layout};
+use crate::audit::layout_commit::{CommittedRow, is_legacy_layout, legacy_layout_digest};
 use crate::audit::schema::init;
 use crate::error::{KvendraError, KvendraResult};
 use rusqlite::Connection;
@@ -101,6 +102,36 @@ impl StoredEvent {
     }
 }
 
+/// Outcome of a successful [`verify_chain_report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainReport {
+    /// Rows verified.
+    pub rows: usize,
+    /// Rows under a legacy layout (v1/v2/v3).
+    pub legacy_rows: usize,
+    /// Layout commitment rows (`kvendra audit commit-layout`), each checked
+    /// against the digest of every legacy row.
+    pub commitment_rows: usize,
+}
+
+impl ChainReport {
+    /// Legacy rows pinned by a verified layout commitment (all or none: a
+    /// commitment always covers every legacy row).
+    pub fn committed_legacy_rows(&self) -> usize {
+        if self.commitment_rows > 0 {
+            self.legacy_rows
+        } else {
+            0
+        }
+    }
+
+    /// Legacy rows whose unbound columns (v1 `remote_audit_id`, v1/v2 error
+    /// diagnostics, NULL-vs-empty) are not yet pinned by a commitment.
+    pub fn uncommitted_legacy_rows(&self) -> usize {
+        self.legacy_rows - self.committed_legacy_rows()
+    }
+}
+
 /// Walk the chain from id ASC, recompute each row's HMAC under the layout
 /// version recorded in that row, and fail at the first mismatch
 /// (REQ-KVD-002 AC-AUDIT-2 extended for REQ-KVD-CLI-010 hmac_version).
@@ -111,10 +142,20 @@ impl StoredEvent {
 /// a row of the current layout appears, no legacy-layout row may follow it:
 /// the post-fix writer only ever emits the current layout.
 pub fn verify_chain(conn: &Connection, hmac_key: &[u8]) -> KvendraResult<()> {
+    verify_chain_report(conn, hmac_key).map(|_| ())
+}
+
+/// [`verify_chain`], plus: every layout commitment row must carry the digest
+/// of all legacy rows before it (which, since legacy-after-v4 is refused, is
+/// every legacy row in the log) — else [`KvendraError::AuditLayoutViolation`]
+/// at the commitment row.
+pub fn verify_chain_report(conn: &Connection, hmac_key: &[u8]) -> KvendraResult<ChainReport> {
     let events = list_all(conn)?;
     let mut prev = String::new();
     let mut seen_current_layout = false;
-    for ev in events {
+    let mut legacy: Vec<CommittedRow<'_>> = Vec::new();
+    let mut commitment_rows = 0usize;
+    for ev in &events {
         if ev.prev_hmac_hex != prev {
             return Err(KvendraError::AuditChainBroken(ev.id));
         }
@@ -137,12 +178,32 @@ pub fn verify_chain(conn: &Connection, hmac_key: &[u8]) -> KvendraResult<()> {
         if recomputed != ev.hmac_hex {
             return Err(KvendraError::AuditChainBroken(ev.id));
         }
+        if ev.is_layout_commitment() {
+            if legacy_layout_digest(&legacy) != ev.args_hash_hex {
+                return Err(KvendraError::AuditLayoutViolation {
+                    row: ev.id,
+                    reason: format!(
+                        "legacy layout commitment mismatch: the {} legacy row(s) it pins were \
+                         altered (incl. columns outside their legacy MAC)",
+                        legacy.len()
+                    ),
+                });
+            }
+            commitment_rows += 1;
+        }
+        if is_legacy_layout(ev.hmac_version) {
+            legacy.push(ev.committed_row());
+        }
         if ev.hmac_version == CURRENT_HMAC_LAYOUT {
             seen_current_layout = true;
         }
-        prev = ev.hmac_hex;
+        prev.clone_from(&ev.hmac_hex);
     }
-    Ok(())
+    Ok(ChainReport {
+        rows: events.len(),
+        legacy_rows: legacy.len(),
+        commitment_rows,
+    })
 }
 
 /// Compute SHA-256 of a JSON value, hex-encoded — used as `args_hash`.

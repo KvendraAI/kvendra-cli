@@ -3,6 +3,9 @@
 use crate::audit::export::bundle::ExportBundle;
 use crate::audit::export::json_canonical::read_json_canonical;
 use crate::audit::hmac::{CURRENT_HMAC_LAYOUT, RowFields, compute_for_layout};
+use crate::audit::layout_commit::{
+    CommittedRow, is_commitment_row, is_legacy_layout, legacy_layout_digest,
+};
 use crate::error::{KvendraError, KvendraResult};
 use std::path::Path;
 
@@ -38,6 +41,12 @@ pub fn verify_bundle(bundle: &ExportBundle) -> KvendraResult<VerifyOutcome> {
     let key = derive_chain_key_from_seed(&bundle.chain_key_seed_hex)?;
     let mut prev = bundle.chain_root_hmac_hex.clone();
     let mut seen_current_layout = false;
+    // Layout commitments (`kvendra audit commit-layout`) pin every legacy row
+    // of the log. Only a genesis-rooted export holds that complete set; a
+    // window starting mid-chain cannot recompute the digest, so its
+    // commitment rows are checked by their own MAC only.
+    let genesis_rooted = bundle.chain_root_hmac_hex.is_empty();
+    let mut legacy: Vec<CommittedRow<'_>> = Vec::new();
 
     for (i, ev) in bundle.events.iter().enumerate() {
         if ev.previous_hmac_hex != prev {
@@ -93,6 +102,34 @@ pub fn verify_bundle(bundle: &ExportBundle) -> KvendraResult<VerifyOutcome> {
                     "current_hmac mismatch at row {} (audit_id={})",
                     i, ev.audit_id
                 ),
+            });
+        }
+        if genesis_rooted
+            && is_commitment_row(
+                ev.hmac_version,
+                &ev.profile_id,
+                &ev.primitive,
+                &ev.action,
+                &ev.flags,
+            )
+            && legacy_layout_digest(&legacy) != ev.args_hash_hex
+        {
+            return Ok(VerifyOutcome::Fail {
+                first_deviation_at: i,
+                reason: format!(
+                    "legacy layout commitment mismatch at row {} (audit_id={}): the {} legacy \
+                     row(s) it pins were altered",
+                    i,
+                    ev.audit_id,
+                    legacy.len()
+                ),
+            });
+        }
+        if is_legacy_layout(ev.hmac_version) {
+            legacy.push(CommittedRow {
+                fields,
+                hmac_version: ev.hmac_version,
+                hmac_hex: &ev.current_hmac_hex,
             });
         }
         prev = ev.current_hmac_hex.clone();

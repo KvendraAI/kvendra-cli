@@ -1,11 +1,13 @@
-//! `kvendra audit [--json] [--verify] [--watch]` + `audit export` + `audit verify-export`.
+//! `kvendra audit [--json] [--verify] [--watch]` + `audit export` + `audit verify-export`
+//! + `audit commit-layout`.
 
 use crate::audit::export::bundle::ExportFilters;
 use crate::audit::export::filter::ExportFilter;
 use crate::audit::export::pdf_format::BrandConfig;
 use crate::audit::export::verify::VerifyOutcome;
 use crate::audit::export::{bundle, csv_format, json_canonical, pdf_format, verify};
-use crate::audit::reader::{list_all, open_readonly, verify_chain};
+use crate::audit::layout_commit::{CommitOutcome, commit_legacy_layout};
+use crate::audit::reader::{ChainReport, list_all, open_readonly, verify_chain_report};
 use crate::config::kvendra_home;
 use crate::error::{KvendraError, KvendraResult};
 use clap::{Args, Subcommand};
@@ -47,6 +49,17 @@ pub enum AuditSub {
     Export(ExportArgs),
     /// Verify integrity of a previously generated JSON canonical export.
     VerifyExport(VerifyExportArgs),
+    /// Pin every legacy-layout (v1/v2/v3) row — including the columns their
+    /// legacy MAC never covered — by appending one v4 commitment row
+    /// (ISSUE-KVD-CLI-F4ED93). Idempotent; never rewrites existing rows.
+    CommitLayout(CommitLayoutArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CommitLayoutArgs {
+    /// Read the master password from stdin (recommended for scripts).
+    #[arg(long)]
+    pub password_stdin: bool,
 }
 
 #[derive(Debug, Args)]
@@ -85,6 +98,7 @@ pub async fn run(args: AuditArgs) -> KvendraResult<()> {
         return match sub {
             AuditSub::Export(a) => run_export(a).await,
             AuditSub::VerifyExport(a) => run_verify_export(a),
+            AuditSub::CommitLayout(a) => run_commit_layout(a),
         };
     }
     run_legacy(args).await
@@ -103,22 +117,13 @@ async fn run_legacy(args: AuditArgs) -> KvendraResult<()> {
 
     if args.verify {
         let vault = crate::vault::Vault::new(home);
-        let mut key = match vault.audit_hmac_key() {
-            Ok(k) => k,
-            Err(_) => {
-                let password = read_password_for_verify(args.password_stdin)?;
-                let derived = vault.audit_hmac_key_from_password(password.as_bytes());
-                let mut pw = password;
-                pw.zeroize();
-                derived?
-            }
-        };
-        let result = verify_chain(&conn, &key);
+        let mut key = audit_key(&vault, args.password_stdin)?;
+        let result = verify_chain_report(&conn, &key);
         key.zeroize();
         match result {
-            Ok(()) => {
-                let n = list_all(&conn)?.len();
-                println!("Audit chain valid ({n} rows verified)");
+            Ok(report) => {
+                println!("Audit chain valid ({} rows verified)", report.rows);
+                print_legacy_commitment_status(&report);
             }
             Err(KvendraError::AuditChainBroken(row)) => {
                 println!("CORRUPTION DETECTED at row #{row} (HMAC mismatch)");
@@ -167,6 +172,80 @@ async fn run_legacy(args: AuditArgs) -> KvendraResult<()> {
             ev.status,
             ev.severity,
             err_tail
+        );
+    }
+    Ok(())
+}
+
+/// The audit HMAC sub-key: from an unlocked in-process vault, else derived
+/// from the master password.
+fn audit_key(vault: &crate::vault::Vault, password_stdin: bool) -> KvendraResult<Vec<u8>> {
+    match vault.audit_hmac_key() {
+        Ok(k) => Ok(k),
+        Err(_) => {
+            let password = read_password_for_verify(password_stdin)?;
+            let derived = vault.audit_hmac_key_from_password(password.as_bytes());
+            let mut pw = password;
+            pw.zeroize();
+            derived
+        }
+    }
+}
+
+fn print_legacy_commitment_status(report: &ChainReport) {
+    if report.legacy_rows == 0 {
+        return;
+    }
+    println!(
+        "Legacy-layout rows: {} committed, {} uncommitted",
+        report.committed_legacy_rows(),
+        report.uncommitted_legacy_rows()
+    );
+    if report.uncommitted_legacy_rows() > 0 {
+        println!(
+            "  (uncommitted v1/v2 rows do not bind every column; run \
+             `kvendra audit commit-layout` to pin them)"
+        );
+    }
+}
+
+fn run_commit_layout(args: CommitLayoutArgs) -> KvendraResult<()> {
+    let home = kvendra_home()?;
+    let db = home.join("audit.db");
+    if !db.exists() {
+        println!("(no audit log yet — nothing to commit)");
+        return Ok(());
+    }
+    let conn = open_readonly(&db)?;
+    let vault = crate::vault::Vault::new(home);
+    let mut key = audit_key(&vault, args.password_stdin)?;
+    let outcome = commit_legacy_layout(&conn, &key, now_unix_ms());
+    let chain = verify_chain_report(&conn, &key);
+    key.zeroize();
+    match outcome? {
+        CommitOutcome::NothingToCommit => {
+            println!("No legacy-layout rows — nothing to commit.");
+        }
+        CommitOutcome::AlreadyCommitted { row, legacy_rows } => {
+            println!(
+                "Already committed: {legacy_rows} legacy-layout rows pinned by row #{row} \
+                 (nothing appended)."
+            );
+        }
+        CommitOutcome::Committed {
+            row,
+            legacy_rows,
+            digest_hex,
+        } => {
+            println!(
+                "Committed {legacy_rows} legacy-layout rows in row #{row} (digest {digest_hex})."
+            );
+        }
+    }
+    if let Err(e) = chain {
+        eprintln!(
+            "warning: the audit chain currently fails verification ({e}). The commitment \
+             pins the legacy rows as they are now; it neither hides nor repairs that failure."
         );
     }
     Ok(())
