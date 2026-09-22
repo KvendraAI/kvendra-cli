@@ -809,22 +809,22 @@ allowlist:
       operations:
         - s3_sync:
             buckets: ["kvendra-com-prod"]
-            local_roots: ["{root}"]
+            local_roots: ['{root}']
             accept_destructive: true
         - s3_cp:
             buckets: ["kvendra-com-prod"]
-            local_roots: ["{root}"]
+            local_roots: ['{root}']
             accept_destructive: true
     - name: kvendra.git
       operations:
         - clone:
             repos: ["github.com/KvendraAI/*"]
-            local_roots: ["{root}"]
+            local_roots: ['{root}']
             accept_destructive: true
     - name: kvendra.pypi
       operations:
         - upload:
-            local_roots: ["{root}"]
+            local_roots: ['{root}']
             accept_destructive: true
 "#
     ))

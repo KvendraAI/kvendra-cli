@@ -798,7 +798,7 @@ allowlist:
       operations:
         - s3_sync:
             buckets: ["b"]
-            local_roots: ["{root}"]
+            local_roots: ['{root}']
             accept_destructive: true{broad}
 "#
         ))

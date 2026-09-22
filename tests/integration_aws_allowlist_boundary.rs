@@ -39,7 +39,7 @@ allowlist:
       operations:
         - s3_sync:
             buckets: ["kvendra-com-prod"]
-            local_roots: ["@CRATE_ROOT@"]
+            local_roots: ['@CRATE_ROOT@']
             accept_destructive: true
         - cloudfront_invalidate:
             distributions: ["E2MSK8NR0QTV9W"]
