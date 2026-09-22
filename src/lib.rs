@@ -7,6 +7,8 @@
 //! - [`mcp`] — thin JSON-RPC 2.0 MCP server transport (per ADR-KVD-006).
 //! - [`primitives`] — capability primitives (git, github, shell, ...).
 //! - [`detection`] — regex pattern detection layer (placeholder Pase B).
+//! - [`path_id`] — the shared rule for untrusted identifiers used as one
+//!   filesystem path component (`profile_id`, `template_id`).
 //! - [`config`] — `~/.kvendra/config.toml` loader.
 //! - [`error`] — unified `KvendraError` type.
 
@@ -23,6 +25,7 @@ pub mod error;
 pub mod grant;
 pub mod keychain_acl;
 pub mod mcp;
+pub mod path_id;
 pub mod primitives;
 pub mod protocol;
 pub mod secret_resolver;

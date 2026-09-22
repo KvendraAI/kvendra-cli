@@ -44,31 +44,93 @@ pub fn stale_blocked_path(home: &Path, workspace_id: &str) -> PathBuf {
     cache_root(home, workspace_id).join(".stale_blocked")
 }
 
+/// Build `<cache_root>/<template_id>.<suffix>`, refusing anything that is not
+/// exactly one safe component directly under the root.
+///
+/// ISSUE-KVD-CLI-3319F0: `template_id` is chosen by the BROKER
+/// ([`crate::protocol::v1::Template`] decodes it as a free `String`), and
+/// `Path::join` discards the base on an absolute operand while a `..` segment
+/// survives the join, so the previous lexical join let a hostile broker pick
+/// any path the user can write — including the vault's own signed
+/// `allowlists/*.yaml`.
+///
+/// Two independent gates, both required:
+/// 1. the shared charset/length rule
+///    ([`crate::path_id::is_safe_path_component`]) on the template id AND on
+///    the workspace slug that forms the parent directory — the slug is
+///    `workspace_id_safe`, which only maps `/` to `__` and is broker-supplied
+///    the moment `/v1/me` is wired in;
+/// 2. containment by PARENT EQUALITY. `Path::starts_with` is not containment:
+///    `<root>/../../x` still starts with `<root>`.
+fn cache_child(
+    home: &Path,
+    workspace_id: &str,
+    template_id: &str,
+    suffix: &str,
+) -> KvendraResult<PathBuf> {
+    if !crate::path_id::is_safe_path_component(template_id) {
+        return Err(KvendraError::Config(format!(
+            "broker returned an unusable template id: {template_id:?}"
+        )));
+    }
+    let slug = crate::session::SessionState::workspace_id_safe(workspace_id);
+    if !crate::path_id::is_safe_path_component(&slug) {
+        return Err(KvendraError::Config(format!(
+            "broker returned an unusable workspace id: {workspace_id:?}"
+        )));
+    }
+    let root = cache_root(home, workspace_id);
+    let path = root.join(format!("{template_id}.{suffix}"));
+    if path.parent() != Some(root.as_path()) {
+        return Err(KvendraError::Config(
+            "template path escaped the sync cache root".to_string(),
+        ));
+    }
+    Ok(path)
+}
+
 /// Path of the cached YAML for a single template.
-pub fn template_cache_path(home: &Path, workspace_id: &str, template_id: &str) -> PathBuf {
-    cache_root(home, workspace_id).join(format!("{template_id}.yaml"))
+///
+/// Fallible since ISSUE-KVD-CLI-3319F0 — see [`cache_child`].
+pub fn template_cache_path(
+    home: &Path,
+    workspace_id: &str,
+    template_id: &str,
+) -> KvendraResult<PathBuf> {
+    cache_child(home, workspace_id, template_id, "yaml")
 }
 
 /// Sidecar file holding the ETag for `template_id`.
-pub fn template_etag_path(home: &Path, workspace_id: &str, template_id: &str) -> PathBuf {
-    cache_root(home, workspace_id).join(format!("{template_id}.yaml.etag"))
+///
+/// Fallible since ISSUE-KVD-CLI-3319F0 — see [`cache_child`].
+pub fn template_etag_path(
+    home: &Path,
+    workspace_id: &str,
+    template_id: &str,
+) -> KvendraResult<PathBuf> {
+    cache_child(home, workspace_id, template_id, "yaml.etag")
 }
 
 #[allow(dead_code)]
 fn read_etag(home: &Path, workspace_id: &str, template_id: &str) -> Option<String> {
-    let path = template_etag_path(home, workspace_id, template_id);
+    let path = template_etag_path(home, workspace_id, template_id).ok()?;
     std::fs::read_to_string(&path)
         .ok()
         .map(|s| s.trim().to_string())
 }
 
 fn write_etag(home: &Path, workspace_id: &str, template_id: &str, etag: &str) -> KvendraResult<()> {
-    let path = template_etag_path(home, workspace_id, template_id);
+    let path = template_etag_path(home, workspace_id, template_id)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| KvendraError::Config(format!("mkdir etag: {e}")))?;
     }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    // `with_file_name` (not `with_extension`): the stem is attacker-chosen, and
+    // `with_extension` on an id like `.` resolves to the PARENT directory.
+    let tmp = path.with_file_name(format!(
+        "{template_id}.yaml.etag.tmp.{}",
+        std::process::id()
+    ));
     {
         let mut f = OpenOptions::new()
             .create(true)
@@ -90,12 +152,14 @@ fn write_template_atomic(
     template_id: &str,
     yaml: &str,
 ) -> KvendraResult<()> {
-    let path = template_cache_path(home, workspace_id, template_id);
+    let path = template_cache_path(home, workspace_id, template_id)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| KvendraError::Config(format!("mkdir cache: {e}")))?;
     }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    // `with_file_name` (not `with_extension`): the stem is attacker-chosen, and
+    // `with_extension` on an id like `.` resolves to the PARENT directory.
+    let tmp = path.with_file_name(format!("{template_id}.yaml.tmp.{}", std::process::id()));
     {
         let mut f = OpenOptions::new()
             .create(true)
@@ -155,6 +219,21 @@ pub async fn sync_once(
                 // payload itself is the source of truth, so we write whatever
                 // the broker said. The optional `If-None-Match` on the list
                 // GET above already handles the "nothing changed" path.
+                // ISSUE-KVD-CLI-3319F0: an id that is not a safe path
+                // component is refused by the builder BEFORE any mkdir/open,
+                // so a hostile template is skipped and counted — never fatal
+                // for the templates that are well-formed.
+                if !crate::path_id::is_safe_path_component(&tmpl.template_id) {
+                    tracing::warn!(
+                        target: "kvendra::workspace",
+                        flag = "workspace_template_id_rejected",
+                        template = %tmpl.template_id,
+                        workspace = %workspace_id,
+                        "broker returned a template id that is not a safe path component — template skipped, nothing written"
+                    );
+                    report.failed += 1;
+                    continue;
+                }
                 if let Err(e) =
                     write_template_atomic(home, workspace_id, &tmpl.template_id, &tmpl.yaml_blob)
                 {
@@ -177,7 +256,15 @@ pub async fn sync_once(
                 );
                 report.fetched += 1;
             }
-            clear_stale_blocked(home, workspace_id);
+            // AC-ALLOWSYNC-3 + ISSUE-KVD-CLI-3319F0: the sentinel means "the
+            // cache is fresh". Clearing it after a pass in which templates
+            // were REJECTED or failed to write would declare a cache fresh
+            // that the broker never managed to refresh — a hostile broker
+            // could hold the workspace open indefinitely by returning ids the
+            // CLI must refuse. Only a fully successful pass recovers.
+            if report.failed == 0 {
+                clear_stale_blocked(home, workspace_id);
+            }
         }
     }
     Ok(report)
@@ -240,5 +327,189 @@ mod tests {
         assert!(is_stale_blocked(dir.path(), "ws/a"));
         clear_stale_blocked(dir.path(), "ws/a");
         assert!(!is_stale_blocked(dir.path(), "ws/a"));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SA5 — ISSUE-KVD-CLI-3319F0 (RUN-KVD-CLI-190069).
+    //
+    // The BROKER chooses `template_id` (`protocol::v1::Template`, a free
+    // `String` with no bound and no charset) and `template_cache_path` /
+    // `template_etag_path` join it LEXICALLY onto the per-workspace cache
+    // root. `Path::join` discards the base on an absolute operand and a `..`
+    // segment survives the join, so a hostile (or compromised) broker picks
+    // ANY path the user can write — including the vault's own signed
+    // allowlists at `~/.kvendra/allowlists/*.yaml`.
+    //
+    // These tests are the WRITE boundary (the path-building half is pinned in
+    // tests/security_audit_run1.rs). They live in-crate because
+    // `write_template_atomic` / `write_etag` are private. RED at e41b652: the
+    // writes return Ok and the bytes land outside the cache root.
+    // ───────────────────────────────────────────────────────────────────
+
+    const WS: &str = "ws-test";
+
+    /// Hostile ids that must never reach the filesystem. Each one is the exact
+    /// shape a broker could return today.
+    fn hostile_relative_ids() -> Vec<&'static str> {
+        vec![
+            // Escapes the cache root and lands on a REAL vault allowlist.
+            "../../../allowlists/profile-alpha",
+            // Materialises a whole directory chain outside the cache root.
+            "../../../deep/a/b/c/d/mark",
+        ]
+    }
+
+    /// Create the 0400 victim a hostile template id can overwrite:
+    /// `<home>/allowlists/profile-alpha.yaml`, i.e. exactly where the vault
+    /// keeps the signed per-profile allowlists.
+    fn plant_victim(home: &Path) -> PathBuf {
+        let victim_dir = home.join("allowlists");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        let victim = victim_dir.join("profile-alpha.yaml");
+        std::fs::write(
+            &victim,
+            "profile_id: profile-alpha\n# SIGNED — do not touch\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        victim
+    }
+
+    #[test]
+    fn sa5_traversal_template_id_must_not_overwrite_a_vault_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let victim = plant_victim(home);
+        let before = std::fs::read(&victim).unwrap();
+        #[cfg(unix)]
+        let ino_before = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&victim).unwrap().ino()
+        };
+
+        let r = write_template_atomic(
+            home,
+            WS,
+            "../../../allowlists/profile-alpha",
+            "profile_id: pwned\nallowlist:\n  primitives: []\n",
+        );
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            before,
+            "the 0400 vault allowlist at {} was OVERWRITTEN through the \
+             template cache path",
+            victim.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&victim).unwrap().ino(),
+                ino_before,
+                "the victim file was REPLACED (rename onto the target changes \
+                 the inode even when the old file was mode 0400)"
+            );
+        }
+        assert!(
+            r.is_err(),
+            "a template id containing `..` must be REFUSED before any write; \
+             write_template_atomic returned {r:?}"
+        );
+    }
+
+    #[test]
+    fn sa5_traversal_template_id_must_not_materialise_directories_outside_the_cache_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+
+        let r = write_template_atomic(home, WS, "../../../deep/a/b/c/d/mark", "x: 1\n");
+
+        assert!(
+            !home.join("deep").exists(),
+            "`create_dir_all` MATERIALISED a directory chain outside the cache \
+             root at {}",
+            home.join("deep").display()
+        );
+        assert!(
+            r.is_err(),
+            "a deep `..` chain must be REFUSED; write_template_atomic returned {r:?}"
+        );
+    }
+
+    #[test]
+    fn sa5_absolute_template_id_must_not_create_a_file_outside_the_cache_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        // A second tempdir keeps the escape bounded: an absolute operand makes
+        // `Path::join` DISCARD the cache root entirely.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let stem = elsewhere.path().join("escapee");
+        let escapee = elsewhere.path().join("escapee.yaml");
+
+        let r = write_template_atomic(home, WS, &stem.to_string_lossy(), "x: 1\n");
+
+        assert!(
+            !escapee.exists(),
+            "an absolute template id WROTE {} — entirely outside {}",
+            escapee.display(),
+            cache_root(home, WS).display()
+        );
+        assert!(
+            r.is_err(),
+            "an ABSOLUTE template id must be REFUSED; write_template_atomic \
+             returned {r:?}"
+        );
+    }
+
+    #[test]
+    fn sa5_hostile_template_ids_must_be_refused_by_the_etag_writer_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let abs_stem = elsewhere.path().join("escapee");
+
+        let mut ids: Vec<String> = hostile_relative_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        ids.push(abs_stem.to_string_lossy().into_owned());
+
+        for id in &ids {
+            let r = write_etag(home, WS, id, "\"etag-value\"");
+            assert!(
+                r.is_err(),
+                "write_etag accepted the hostile template id {id:?} (the ETag \
+                 sidecar shares the builder, so it shares the hole); returned {r:?}"
+            );
+        }
+        assert!(
+            !home.join("deep").exists(),
+            "the etag writer materialised directories outside the cache root"
+        );
+        assert!(
+            !elsewhere.path().join("escapee.yaml.etag").exists(),
+            "the etag writer wrote outside the cache root"
+        );
+    }
+
+    /// GUARD (green before AND after) — a legitimate broker id must still
+    /// round-trip to exactly one file directly under the cache root, mode 0400.
+    #[test]
+    fn sa5_guard_legit_template_id_still_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let path = template_cache_path(home, WS, "github-deploy-tmpl-v1").unwrap();
+        write_template_atomic(home, WS, "github-deploy-tmpl-v1", "x: 1\n").unwrap();
+        assert!(path.exists(), "the legit template must be cached");
+        assert_eq!(
+            path.parent(),
+            Some(cache_root(home, WS).as_path()),
+            "the cached template must sit DIRECTLY under the cache root"
+        );
     }
 }

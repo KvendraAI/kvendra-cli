@@ -11,6 +11,7 @@ pub mod patterns;
 
 use crate::config::DetectionSeverity;
 use regex::{Regex, RegexSet};
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 /// Severity decision for a detected token.
@@ -97,30 +98,67 @@ pub fn shannon_entropy(s: &str) -> f64 {
 /// like `"ghp_lorem_ipsum_dolor_sit_amet_..."`.
 pub const ENTROPY_THRESHOLD: f64 = 3.5;
 
+/// One regex hit that passed the entropy gate, with its span in the haystack.
+/// Private: the plaintext never leaves this module.
+struct RawMatch {
+    start: usize,
+    end: usize,
+    text: String,
+    entropy: f64,
+}
+
+/// THE shared selector behind the decider ([`detect`]) and the executor
+/// ([`sanitize_output`]) — one canonicaliser per operand, per
+/// PAT-KVD-CLI-C18A74.
+///
+/// Returns EVERY match of provider `idx` in `haystack` that passes the entropy
+/// gate, in order. The gate is applied per match: a low-entropy decoy of the
+/// right shape must never disqualify the provider for the whole payload
+/// (ISSUE-KVD-CLI-8F501A).
+fn matches_above_threshold(idx: usize, haystack: &str) -> Vec<RawMatch> {
+    let cp = compiled();
+    let provider = cp.providers[idx];
+    let always = patterns::ALWAYS_REDACT_PROVIDERS.contains(&provider);
+    cp.individual[idx]
+        .find_iter(haystack)
+        .filter_map(|m| {
+            let text = m.as_str().to_string();
+            let entropy = shannon_entropy(&text);
+            (always || entropy >= ENTROPY_THRESHOLD).then(|| RawMatch {
+                start: m.start(),
+                end: m.end(),
+                text,
+                entropy,
+            })
+        })
+        .collect()
+}
+
 /// Run the regex set against `haystack`. Returns matches that pass the
 /// entropy filter.
 pub fn detect(haystack: &str) -> Vec<DetectionMatch> {
     let cp = compiled();
     let hits = cp.set.matches(haystack);
     let mut out = Vec::new();
+    let mut seen: HashSet<(usize, String)> = HashSet::new();
     for idx in hits.iter() {
         let provider = cp.providers[idx];
         // Redact-only providers (JWT, Google OAuth) are commonly legitimate
         // inbound arguments; do not let them block/quarantine a call.
-        if crate::detection::patterns::REDACT_ONLY_PROVIDERS.contains(&provider) {
+        if patterns::REDACT_ONLY_PROVIDERS.contains(&provider) {
             continue;
         }
-        if let Some(m) = cp.individual[idx].find(haystack) {
-            let matched = m.as_str().to_string();
-            let h = shannon_entropy(&matched);
-            let always = crate::detection::patterns::ALWAYS_REDACT_PROVIDERS.contains(&provider);
-            if always || h >= ENTROPY_THRESHOLD {
-                out.push(DetectionMatch {
-                    provider: provider.to_string(),
-                    matched_text: matched,
-                    entropy_bits_per_char: h,
-                });
+        for m in matches_above_threshold(idx, haystack) {
+            // Identical repeats of the same secret are ONE finding; distinct
+            // secrets of the same provider are each reported.
+            if !seen.insert((idx, m.text.clone())) {
+                continue;
             }
+            out.push(DetectionMatch {
+                provider: provider.to_string(),
+                matched_text: m.text,
+                entropy_bits_per_char: m.entropy,
+            });
         }
     }
     out
@@ -150,22 +188,25 @@ pub fn sanitize_output(s: &str) -> String {
     if !hits.matched_any() {
         return out;
     }
+    // Same selector as `detect`, applied sequentially per provider on the
+    // CURRENT `out` — byte-identical to the previous per-provider
+    // `replace_all` chain, including how a later provider sees the text an
+    // earlier one already rewrote.
     for idx in hits.iter() {
-        let re = &cp.individual[idx];
         let provider = cp.providers[idx];
-        // Replace each match if entropy passes the filter.
-        let always = crate::detection::patterns::ALWAYS_REDACT_PROVIDERS.contains(&provider);
-        let replaced = re
-            .replace_all(&out, |caps: &regex::Captures| {
-                let m = caps.get(0).unwrap().as_str();
-                if always || shannon_entropy(m) >= ENTROPY_THRESHOLD {
-                    format!("<redacted:{provider}>")
-                } else {
-                    m.to_string()
-                }
-            })
-            .into_owned();
-        out = replaced;
+        let marks = matches_above_threshold(idx, &out);
+        if marks.is_empty() {
+            continue;
+        }
+        let mut next = String::with_capacity(out.len());
+        let mut cursor = 0usize;
+        for m in &marks {
+            next.push_str(&out[cursor..m.start]);
+            next.push_str(&format!("<redacted:{provider}>"));
+            cursor = m.end;
+        }
+        next.push_str(&out[cursor..]);
+        out = next;
     }
     out
 }
@@ -417,5 +458,211 @@ mod tests {
             "leaked npm token deep nested: {s}"
         );
         assert!(s.contains("no secret here"), "lost safe data: {s}");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SA8 — ISSUE-KVD-CLI-8F501A: the entropy gate belongs PER MATCH, not
+    // on the leftmost sample of a provider.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// `ghp_` + 36 identical chars — matches the pattern exactly, 0.669 b/char.
+    const DECOY_GHP: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    /// A real-shaped GitHub PAT, 5.03 b/char.
+    const REAL_GHP: &str = "ghp_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaaaa";
+    /// A *different* real-shaped GitHub PAT, 5.17 b/char.
+    const REAL_GHP_2: &str = "ghp_Zq7Wm2Xv8Nb4Kc6Rt9Yh3Jd5Fg1Ls0PuAe0x";
+    /// `npm_` + 36 identical chars, 0.669 b/char.
+    const DECOY_NPM: &str = "npm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    /// A real-shaped npm token, 4.98 b/char.
+    const REAL_NPM: &str = "npm_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaaaa";
+
+    #[test]
+    fn decoy_does_not_mask_real_token_of_same_provider() {
+        // Before the fix `detect` took the LEFTMOST match only, so the decoy
+        // decided the whole provider and this returned [].
+        let s = format!("{DECOY_GHP} {REAL_GHP}");
+        let hits = detect(&s);
+        assert_eq!(
+            hits.len(),
+            1,
+            "exactly the real token must be reported; got {hits:?}"
+        );
+        assert_eq!(hits[0].provider, "github_pat_classic");
+        assert_eq!(hits[0].matched_text, REAL_GHP);
+    }
+
+    #[test]
+    fn decoy_alone_is_still_not_detected() {
+        // Guard: the fix must not degenerate into "drop the entropy filter".
+        assert!(
+            detect(DECOY_GHP).is_empty(),
+            "a low-entropy string alone must not be reported"
+        );
+        assert_eq!(
+            sanitize_output(DECOY_GHP),
+            DECOY_GHP,
+            "and it must survive the redactor verbatim"
+        );
+    }
+
+    #[test]
+    fn two_real_tokens_of_same_provider_are_both_reported() {
+        let s = format!("primary={REAL_GHP} backup={REAL_GHP_2}");
+        let hits = detect(&s);
+        assert_eq!(
+            hits.len(),
+            2,
+            "both distinct secrets must surface: {hits:?}"
+        );
+        let texts: Vec<&str> = hits.iter().map(|h| h.matched_text.as_str()).collect();
+        assert!(
+            texts.contains(&REAL_GHP) && texts.contains(&REAL_GHP_2),
+            "got {texts:?}"
+        );
+    }
+
+    #[test]
+    fn identical_repeats_are_deduplicated_but_still_detected() {
+        let s = format!("{REAL_GHP} {REAL_GHP} {REAL_GHP}");
+        let hits = detect(&s);
+        assert_eq!(
+            hits.len(),
+            1,
+            "the same secret repeated is ONE finding (and never zero): {hits:?}"
+        );
+        assert_eq!(hits[0].matched_text, REAL_GHP);
+    }
+
+    #[test]
+    fn multi_provider_mix_decoy_and_real_tokens() {
+        let s = format!("{DECOY_GHP} {DECOY_NPM} {REAL_GHP} {REAL_NPM}");
+        let hits = detect(&s);
+        assert_eq!(hits.len(), 2, "one real token per provider: {hits:?}");
+        let gh = hits
+            .iter()
+            .find(|h| h.provider == "github_pat_classic")
+            .unwrap_or_else(|| panic!("github token masked by its decoy: {hits:?}"));
+        assert_eq!(gh.matched_text, REAL_GHP);
+        let npm = hits
+            .iter()
+            .find(|h| h.provider == "npm_token")
+            .unwrap_or_else(|| panic!("npm token masked by its decoy: {hits:?}"));
+        assert_eq!(npm.matched_text, REAL_NPM);
+    }
+
+    #[test]
+    fn inbound_and_outbound_agree_on_same_input() {
+        // The decider and the executor are driven by the SAME selector, so no
+        // value may be reported inbound and yet echoed back outbound.
+        let s = format!("{DECOY_GHP} {REAL_GHP} {REAL_NPM}");
+        let out = sanitize_output(&s);
+        for h in detect(&s) {
+            assert!(
+                !out.contains(&h.matched_text),
+                "detected {} survived the redactor: {out}",
+                h.provider
+            );
+        }
+        assert!(
+            out.contains(DECOY_GHP),
+            "the low-entropy decoy must survive verbatim: {out}"
+        );
+        assert!(out.contains("<redacted:github_pat_classic>"), "got: {out}");
+        assert!(out.contains("<redacted:npm_token>"), "got: {out}");
+    }
+
+    #[test]
+    fn exemptions_survive_the_per_match_gate() {
+        // REDACT_ONLY providers stay non-blocking inbound, and ALWAYS_REDACT
+        // providers still ignore the entropy threshold (a low-entropy PEM
+        // block is reported, twice-distinct blocks are both reported).
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQ_abc123XYZ";
+        let s = format!("{jwt} ya29.a0AfH6SMBx7yQk9vL2mNpQrStUvWxYz0123456789");
+        assert!(
+            detect(&s).is_empty(),
+            "redact-only providers must not block inbound"
+        );
+        let body = "a".repeat(64);
+        let pem_a =
+            format!("-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----");
+        let pem_b = format!("-----BEGIN EC PRIVATE KEY-----\n{body}\n-----END EC PRIVATE KEY-----");
+        assert!(shannon_entropy(&pem_a) < ENTROPY_THRESHOLD);
+        let hits = detect(&format!("{pem_a}\n{pem_b}"));
+        assert_eq!(hits.len(), 2, "every PEM block is reported: {hits:?}");
+        assert!(hits.iter().all(|h| h.provider == "private_key_pem"));
+    }
+
+    /// Verbatim copy of the pre-SA8 `sanitize_output` (per-provider
+    /// `replace_all` with the entropy test inside the closure). Kept in the
+    /// test module only, as the reference for the differential test below.
+    fn legacy_sanitize_output(s: &str) -> String {
+        let cp = compiled();
+        let mut out = s.to_string();
+        let hits = cp.set.matches(&out);
+        if !hits.matched_any() {
+            return out;
+        }
+        for idx in hits.iter() {
+            let re = &cp.individual[idx];
+            let provider = cp.providers[idx];
+            let always = patterns::ALWAYS_REDACT_PROVIDERS.contains(&provider);
+            out = re
+                .replace_all(&out, |caps: &regex::Captures| {
+                    let m = caps.get(0).unwrap().as_str();
+                    if always || shannon_entropy(m) >= ENTROPY_THRESHOLD {
+                        format!("<redacted:{provider}>")
+                    } else {
+                        m.to_string()
+                    }
+                })
+                .into_owned();
+        }
+        out
+    }
+
+    #[test]
+    fn sanitize_output_is_byte_identical_to_the_previous_replace_all() {
+        // SA8 changes the DECIDER, never the outbound bytes: the new splice
+        // must reproduce `replace_all` exactly, including cross-provider order.
+        const POOL: &[&str] = &[
+            DECOY_GHP,
+            REAL_GHP,
+            REAL_GHP_2,
+            DECOY_NPM,
+            REAL_NPM,
+            "AKIAIOSFODNN7EXAMPLE",
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQ_abc123XYZ",
+            "sk-aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJ",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----",
+            "just a plain log line",
+            "",
+        ];
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..4000 {
+            let mut hay = String::new();
+            let parts = next() % 6 + 1;
+            for _ in 0..parts {
+                let r = next();
+                hay.push_str(POOL[(r % POOL.len() as u64) as usize]);
+                // `.is_multiple_of` (not `% 2 == 0`) — clippy::manual_is_multiple_of.
+                if r.is_multiple_of(2) {
+                    hay.push(' ');
+                } else {
+                    hay.push_str("\n| ");
+                }
+            }
+            assert_eq!(
+                sanitize_output(&hay),
+                legacy_sanitize_output(&hay),
+                "outbound bytes diverged on: {hay:?}"
+            );
+        }
     }
 }

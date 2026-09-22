@@ -182,13 +182,17 @@ const CATALOG: [PrimitiveInfo; 8] = [
 /// Found during the v0.6.4 adversarial pass (cycle 2, beyond the external
 /// audit): the MCP dispatcher previously passed `profile_id` straight to the
 /// vault path builders with no character validation.
+///
+/// Thin delegator to [`crate::path_id::is_safe_path_component`], which is THE
+/// rule for every untrusted identifier that becomes one path component
+/// (ISSUE-KVD-CLI-3319F0 found the same defect on the broker-supplied
+/// `template_id`; PAT-KVD-CLI-C18A74 says one canonicalizer per operand).
+/// Edit the rule THERE, never here. Two deltas versus the inlined v0.6.4
+/// version, both strictly stricter: the maximum length dropped from 256 to
+/// [`crate::path_id::MAX_PATH_COMPONENT_ID_LEN`] (128), and a leading `.` is
+/// now rejected.
 pub fn is_valid_profile_id(profile_id: &str) -> bool {
-    !profile_id.is_empty()
-        && profile_id.len() <= 256
-        && !profile_id.contains("..")
-        && profile_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    crate::path_id::is_safe_path_component(profile_id)
 }
 
 /// REQ-KVD-CLI-42CB74 — look up `requires_vault` for a tool by name. Used

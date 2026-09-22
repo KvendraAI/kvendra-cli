@@ -120,6 +120,18 @@ pub struct MemberListResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Template {
+    /// Broker-chosen identifier. Decoded as a free `String` ON PURPOSE: a
+    /// custom `Deserialize` would make ONE hostile item reject the whole
+    /// list, and a workspace would lose every legitimate template because of
+    /// somebody else's bad id.
+    ///
+    /// It is therefore UNTRUSTED here and validated at the sink. It becomes
+    /// one filesystem path component
+    /// (`cache/allowlists/<ws>/<template_id>.yaml`), so the rule is
+    /// [`crate::path_id::is_safe_path_component`] — enforced by
+    /// `workspace::allowlist_sync::{template_cache_path, template_etag_path}`,
+    /// which additionally assert parent-equality containment.
+    /// ISSUE-KVD-CLI-3319F0.
     pub template_id: String,
     pub yaml_blob: String,
     pub version: u32,
