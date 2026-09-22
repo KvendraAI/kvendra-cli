@@ -132,7 +132,12 @@ fn registry_is_npmjs(registry: &str) -> bool {
         .trim()
         .trim_end_matches('/')
         .strip_prefix("https://")
-        .or_else(|| registry.trim().trim_end_matches('/').strip_prefix("http://"))
+        .or_else(|| {
+            registry
+                .trim()
+                .trim_end_matches('/')
+                .strip_prefix("http://")
+        })
         .map(|host_path| {
             let host = host_path.split('/').next().unwrap_or(host_path);
             host.eq_ignore_ascii_case("registry.npmjs.org")
@@ -230,7 +235,9 @@ mod tests {
         assert!(registry_is_npmjs("http://registry.npmjs.org/"));
         // Attacker redirects must NOT be accepted.
         assert!(!registry_is_npmjs("https://evil.example/"));
-        assert!(!registry_is_npmjs("https://registry.npmjs.org.evil.example/"));
+        assert!(!registry_is_npmjs(
+            "https://registry.npmjs.org.evil.example/"
+        ));
         assert!(!registry_is_npmjs("https://npm.pkg.github.com/"));
         assert!(!registry_is_npmjs("registry.npmjs.org")); // no scheme
     }

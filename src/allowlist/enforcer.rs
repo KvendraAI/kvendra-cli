@@ -453,7 +453,11 @@ fn check_args(
         let matches_pat = |pats: &Option<Vec<String>>| {
             pats.as_ref().is_some_and(|ps| {
                 ps.iter().any(|p| {
-                    let pat = if is_git { normalize_repo_host(p) } else { p.clone() };
+                    let pat = if is_git {
+                        normalize_repo_host(p)
+                    } else {
+                        p.clone()
+                    };
                     glob_match(&pat, &cand)
                 })
             })
@@ -619,7 +623,10 @@ fn extract_repo_canonical(input: &str) -> String {
     // `host/owner/repo` / `owner/repo`.
     if !s.contains("://") {
         if let Some((userhost, path)) = s.split_once(':') {
-            let host = userhost.rsplit_once('@').map(|(_, h)| h).unwrap_or(userhost);
+            let host = userhost
+                .rsplit_once('@')
+                .map(|(_, h)| h)
+                .unwrap_or(userhost);
             // Treat as scp only when the left is host-ish and the right is a path,
             // not a bare `:port`. Otherwise fall through to passthrough.
             if host.contains('.') && !path.chars().all(|c| c.is_ascii_digit()) {
@@ -636,7 +643,10 @@ fn extract_repo_canonical(input: &str) -> String {
     // `evil.com` (userinfo bypass) rather than github.com.
     let after = s.split_once("://").map(|x| x.1).unwrap_or(s);
     let (authority, path) = after.split_once('/').unwrap_or((after, ""));
-    let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
     let host = host_port.split(':').next().unwrap_or(host_port);
     let path = path.strip_suffix(".git").unwrap_or(path);
     if path.is_empty() {
@@ -741,9 +751,7 @@ fn git_target_repo(inner: &Value, operation: &str) -> Option<String> {
 fn npm_package_name_from_cwd(cwd: &str) -> Option<String> {
     let raw = std::fs::read_to_string(std::path::Path::new(cwd).join("package.json")).ok()?;
     let pkg: Value = serde_json::from_str(&raw).ok()?;
-    pkg.get("name")
-        .and_then(Value::as_str)
-        .map(str::to_string)
+    pkg.get("name").and_then(Value::as_str).map(str::to_string)
 }
 
 /// Normalize a canonical repo (`host/owner/name` or `owner/name`) so a
@@ -2229,7 +2237,10 @@ allowlist:
         }));
         let res = check(&s, "kvendra.git", "push", &args);
         let _ = std::fs::remove_dir_all(&main);
-        assert!(add.status.success(), "worktree add should succeed in test env");
+        assert!(
+            add.status.success(),
+            "worktree add should succeed in test env"
+        );
         assert!(
             res.is_ok(),
             "push from a worktree must resolve origin (hand-parser denied it): {res:?}"

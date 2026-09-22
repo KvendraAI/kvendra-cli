@@ -190,9 +190,7 @@ fn check_constraints(primitive: &str, op: &str, c: &OperationConstraints) -> Kve
                     // canaries can't catch generically. Reject an `@` that appears
                     // before the first path `/` (the authority); a `@` in the PATH
                     // (npm scope `/@org/…`) is fine.
-                    if !accept_broad
-                        && let Some((_, after_scheme)) = pat.split_once("://")
-                    {
+                    if !accept_broad && let Some((_, after_scheme)) = pat.split_once("://") {
                         let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
                         if authority.contains('@') {
                             return Err(KvendraError::AllowlistParse(format!(
@@ -370,7 +368,14 @@ allowlist:
     #[test]
     fn n8_rejects_effectively_broad_regexes() {
         // None of these is literally `.*`, yet each matches arbitrary hosts.
-        for pat in ["^https?://", "^http", "^https://", ".", "^.", "^https?://.*"] {
+        for pat in [
+            "^https?://",
+            "^http",
+            "^https://",
+            ".",
+            "^.",
+            "^https?://.*",
+        ] {
             let p = ProfileSpec::from_yaml(&http_spec_with_pattern(pat, false)).unwrap();
             assert!(
                 validate(&p).is_err(),
@@ -387,7 +392,10 @@ allowlist:
             r"^https://(api|cdn)\.example\.com/.*",
         ] {
             let p = ProfileSpec::from_yaml(&http_spec_with_pattern(pat, false)).unwrap();
-            assert!(validate(&p).is_ok(), "host-pinned pattern '{pat}' must pass");
+            assert!(
+                validate(&p).is_ok(),
+                "host-pinned pattern '{pat}' must pass"
+            );
         }
     }
 

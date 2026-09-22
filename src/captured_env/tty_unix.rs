@@ -121,7 +121,10 @@ mod tests {
     /// must be accepted.
     #[test]
     fn real_terminal_is_accepted() {
-        assert_eq!(classify_terminal(true, true, true, 100, 100), TerminalClass::Ok);
+        assert_eq!(
+            classify_terminal(true, true, true, 100, 100),
+            TerminalClass::Ok
+        );
     }
 
     /// AC-CAPTURED-ENV-1/-2 (PAT-KVD-CLI-008): classification is deterministic
@@ -132,6 +135,10 @@ mod tests {
         let a = classify_terminal(inputs.0, inputs.1, inputs.2, inputs.3, inputs.4);
         let b = classify_terminal(inputs.0, inputs.1, inputs.2, inputs.3, inputs.4);
         assert_eq!(a, b, "same inputs must yield the same classification");
-        assert_ne!(a, TerminalClass::Ok, "a captured env must not classify as Ok");
+        assert_ne!(
+            a,
+            TerminalClass::Ok,
+            "a captured env must not classify as Ok"
+        );
     }
 }

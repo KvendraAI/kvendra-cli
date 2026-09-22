@@ -231,7 +231,10 @@ mod tests {
             !detect(s).iter().any(|h| h.provider == "jwt"),
             "jwt must not block inbound"
         );
-        assert!(sanitize_output(s).contains("<redacted:jwt>"), "jwt must be redacted in output");
+        assert!(
+            sanitize_output(s).contains("<redacted:jwt>"),
+            "jwt must be redacted in output"
+        );
     }
 
     #[test]
@@ -249,7 +252,10 @@ mod tests {
                  AAtzc2gtZWQyNTUxOQAAACD9aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJqWxY";
         let out = sanitize_output(s);
         assert!(out.contains("<redacted:private_key_pem>"), "got: {out}");
-        assert!(!out.contains("b3BlbnNzaC1rZXktdjEA"), "key body leaked: {out}");
+        assert!(
+            !out.contains("b3BlbnNzaC1rZXktdjEA"),
+            "key body leaked: {out}"
+        );
     }
 
     #[test]

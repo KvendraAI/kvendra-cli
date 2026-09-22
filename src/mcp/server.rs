@@ -530,7 +530,12 @@ fn try_self_heal_vault(ctx: &ServerContext) {
     let home = ctx.vault.home();
     match crate::session::local::load(home) {
         Ok(state) => {
-            let idle_timeout = ctx.config.read().unwrap_or_else(|e| e.into_inner()).vault.idle_timeout_minutes;
+            let idle_timeout = ctx
+                .config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .vault
+                .idle_timeout_minutes;
             match ctx
                 .vault
                 .unlock_from_derived_key(&state.derived_key, idle_timeout)
@@ -751,7 +756,13 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
     let detection_decision = if detection_hits.is_empty() {
         Decision::Allow
     } else {
-        Decision::from_severity(ctx.config.read().unwrap_or_else(|e| e.into_inner()).detection.severity)
+        Decision::from_severity(
+            ctx.config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .detection
+                .severity,
+        )
     };
     if !detection_hits.is_empty() {
         match detection_decision {
@@ -912,7 +923,14 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         )
         .await;
         let error_type = approval_decision.error_type().unwrap_or("approval_failed");
-        let hint = approval::hint_for(approval_decision, ctx.config.read().unwrap_or_else(|e| e.into_inner()).approval.timeout_seconds);
+        let hint = approval::hint_for(
+            approval_decision,
+            ctx.config
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .approval
+                .timeout_seconds,
+        );
         let data = serde_json::json!({
             "error_type": error_type,
             "hint": hint,
@@ -1038,7 +1056,15 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
     {
         flags.push(crate::audit::FLAG_UNSAFE_QUOTA_EXCEEDED.to_string());
         let _ = record_audit(
-            &ctx, &arguments, name, &profile_id, &action, &flags, true, None, Some(&quota_err),
+            &ctx,
+            &arguments,
+            name,
+            &profile_id,
+            &action,
+            &flags,
+            true,
+            None,
+            Some(&quota_err),
         )
         .await;
         return JsonRpcResponse::error(
@@ -1709,11 +1735,7 @@ mod tests {
     fn self_heal_relocks_on_unsigned_config() {
         let ctx = setup_selfheal_ctx_with_disk_config(|home, _v| {
             // Write an UNSIGNED config (no HMAC trailer) — the A5 tamper case.
-            std::fs::write(
-                home.join("config.toml"),
-                "[approval]\nmode = \"silent\"\n",
-            )
-            .unwrap();
+            std::fs::write(home.join("config.toml"), "[approval]\nmode = \"silent\"\n").unwrap();
         });
         super::try_self_heal_vault(&ctx);
         assert!(

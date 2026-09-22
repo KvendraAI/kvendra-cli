@@ -605,15 +605,22 @@ mod tests {
         let canonical = "abandon abandon abandon abandon abandon abandon \
                          abandon abandon abandon abandon abandon about";
         assert!(
-            v.reset_password_with_mnemonic(canonical, b"attacker-pass").is_err(),
+            v.reset_password_with_mnemonic(canonical, b"attacker-pass")
+                .is_err(),
             "an unverifiable mnemonic must be refused, not accepted"
         );
         // The vault is unchanged: the ORIGINAL password still unlocks; the
         // attacker's chosen password does not.
-        assert!(v.unlock(b"orig-pass", 30).is_ok(), "original password must still work");
+        assert!(
+            v.unlock(b"orig-pass", 30).is_ok(),
+            "original password must still work"
+        );
         v.lock();
         assert!(
-            matches!(v.unlock(b"attacker-pass", 30), Err(KvendraError::InvalidMasterPassword)),
+            matches!(
+                v.unlock(b"attacker-pass", 30),
+                Err(KvendraError::InvalidMasterPassword)
+            ),
             "the attacker's password must NOT have been set"
         );
     }
