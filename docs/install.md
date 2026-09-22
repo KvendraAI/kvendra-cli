@@ -8,7 +8,7 @@ see the [README install section](../README.md#install).
 ### Option 1: cargo install (recommended)
 
 ```bash
-cargo install --git https://github.com/KvendraAI/kvendra-cli kvendra
+cargo install --locked --git https://github.com/KvendraAI/kvendra-cli kvendra
 ```
 
 Requires Rust 1.75+. The build downloads ~50 dependencies and takes
@@ -42,7 +42,7 @@ and is planned for v0.2.0 (`ROAD-KVD-CLI-002`, requires Apple Developer ID).
 ### Option 1: cargo install (recommended)
 
 ```bash
-cargo install --git https://github.com/KvendraAI/kvendra-cli kvendra
+cargo install --locked --git https://github.com/KvendraAI/kvendra-cli kvendra
 ```
 
 ### Option 2: pre-built binary
@@ -68,7 +68,7 @@ Install Rust via [rustup](https://rustup.rs/) with the `msvc` toolchain
 (default on Windows). Then:
 
 ```powershell
-cargo install --git https://github.com/KvendraAI/kvendra-cli kvendra
+cargo install --locked --git https://github.com/KvendraAI/kvendra-cli kvendra
 ```
 
 ### Option 2: pre-built binary

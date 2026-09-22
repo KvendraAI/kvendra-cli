@@ -168,7 +168,7 @@ No en `0.1.0`. Track:
 >
 > AUR / Snap / Flatpak / Nix: post-Beta, mantenido por community.
 
-Por ahora: `cargo install kvendra` o GitHub Releases.
+Por ahora: `cargo install --locked kvendra` o GitHub Releases.
 
 ## Cómo reportar un bug
 

@@ -9,7 +9,7 @@ Existe una guía corta complementaria en `docs/install.md` del repo. Este capít
 ## Canales disponibles en `0.1.0`
 
 > **crates.io**
-> - Comando: `cargo install kvendra`
+> - Comando: `cargo install --locked kvendra`
 > - Requiere: toolchain Rust estable, MSRV 1.85.
 > - Plataformas: cualquiera donde haya `cargo` y compile el árbol de deps (macOS arm64+x86_64, Linux x86_64, Windows x86_64).
 > - Tamaño: la build local del binario release dura entre 2 y 6 minutos según hardware.
@@ -52,7 +52,7 @@ Existe una guía corta complementaria en `docs/install.md` del repo. Este capít
 
 | Caso | Canal recomendado |
 |------|-------------------|
-| Tienes toolchain Rust instalado y aceptas un build local | `cargo install kvendra` |
+| Tienes toolchain Rust instalado y aceptas un build local | `cargo install --locked kvendra` |
 | No tienes Rust o quieres instalación inmediata | GitHub Releases |
 | Vas a usar el binario en CI matrix | GitHub Releases (artefacto reproducible) |
 
@@ -61,7 +61,7 @@ Existe una guía corta complementaria en `docs/install.md` del repo. Este capít
 **Vía crates.io:**
 
 ```bash
-cargo install kvendra --locked
+cargo install --locked kvendra
 ```
 
 El flag `--locked` instala respetando `Cargo.lock`. Recomendado para reproducibilidad.

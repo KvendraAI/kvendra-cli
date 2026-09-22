@@ -50,9 +50,9 @@ machine. Install it if that helps your workflow; skip it if it doesn't.
 ### With `cargo install`
 
 ```bash
-cargo install kvendra          # from crates.io
+cargo install --locked kvendra          # from crates.io
 # or track the latest main:
-cargo install --git https://github.com/KvendraAI/kvendra-cli kvendra
+cargo install --locked --git https://github.com/KvendraAI/kvendra-cli kvendra
 kvendra --version
 ```
 
