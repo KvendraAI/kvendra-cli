@@ -2,7 +2,7 @@
 
 use crate::audit::export::bundle::ExportBundle;
 use crate::audit::export::json_canonical::read_json_canonical;
-use crate::audit::hmac::{compute_hmac_v1, compute_hmac_v2, compute_hmac_v3};
+use crate::audit::hmac::{CURRENT_HMAC_LAYOUT, RowFields, compute_for_layout};
 use crate::error::{KvendraError, KvendraResult};
 use std::path::Path;
 
@@ -37,6 +37,7 @@ pub fn verify_bundle(bundle: &ExportBundle) -> KvendraResult<VerifyOutcome> {
     }
     let key = derive_chain_key_from_seed(&bundle.chain_key_seed_hex)?;
     let mut prev = bundle.chain_root_hmac_hex.clone();
+    let mut seen_current_layout = false;
 
     for (i, ev) in bundle.events.iter().enumerate() {
         if ev.previous_hmac_hex != prev {
@@ -48,53 +49,43 @@ pub fn verify_bundle(bundle: &ExportBundle) -> KvendraResult<VerifyOutcome> {
                 ),
             });
         }
-        let recomputed = if ev.hmac_version >= 3 {
-            compute_hmac_v3(
-                &key,
-                ev.audit_id,
-                ev.ts_unix_ms,
-                &ev.profile_id,
-                &ev.primitive,
-                &ev.action,
-                &ev.args_hash_hex,
-                &ev.result_status,
-                &ev.severity,
-                &ev.flags,
-                &ev.previous_hmac_hex,
-                ev.remote_audit_id.as_deref(),
-                ev.error_code.as_deref(),
-                ev.error_message.as_deref(),
-            )
-        } else if ev.hmac_version == 2 {
-            compute_hmac_v2(
-                &key,
-                ev.audit_id,
-                ev.ts_unix_ms,
-                &ev.profile_id,
-                &ev.primitive,
-                &ev.action,
-                &ev.args_hash_hex,
-                &ev.result_status,
-                &ev.severity,
-                &ev.flags,
-                &ev.previous_hmac_hex,
-                ev.remote_audit_id.as_deref(),
-            )
-        } else {
-            compute_hmac_v1(
-                &key,
-                ev.audit_id,
-                ev.ts_unix_ms,
-                &ev.profile_id,
-                &ev.primitive,
-                &ev.action,
-                &ev.args_hash_hex,
-                &ev.result_status,
-                &ev.severity,
-                &ev.flags,
-                &ev.previous_hmac_hex,
-            )
+        if seen_current_layout && ev.hmac_version < CURRENT_HMAC_LAYOUT {
+            return Ok(VerifyOutcome::Fail {
+                first_deviation_at: i,
+                reason: format!(
+                    "legacy hmac layout v{} after a layout v{CURRENT_HMAC_LAYOUT} row at row {} \
+                     (audit_id={})",
+                    ev.hmac_version, i, ev.audit_id
+                ),
+            });
+        }
+        let fields = RowFields {
+            id: ev.audit_id,
+            ts_unix_ms: ev.ts_unix_ms,
+            profile_id: &ev.profile_id,
+            primitive: &ev.primitive,
+            action: &ev.action,
+            args_hash_hex: &ev.args_hash_hex,
+            status: &ev.result_status,
+            severity: &ev.severity,
+            flags: &ev.flags,
+            prev_hmac_hex: &ev.previous_hmac_hex,
+            remote_audit_id: ev.remote_audit_id.as_deref(),
+            error_code: ev.error_code.as_deref(),
+            error_message: ev.error_message.as_deref(),
         };
+        let recomputed = match compute_for_layout(&key, ev.hmac_version, &fields) {
+            Ok(tag) => tag,
+            Err(e) => {
+                return Ok(VerifyOutcome::Fail {
+                    first_deviation_at: i,
+                    reason: format!("{e} at row {} (audit_id={})", i, ev.audit_id),
+                });
+            }
+        };
+        if ev.hmac_version == CURRENT_HMAC_LAYOUT {
+            seen_current_layout = true;
+        }
         if recomputed != ev.current_hmac_hex {
             return Ok(VerifyOutcome::Fail {
                 first_deviation_at: i,

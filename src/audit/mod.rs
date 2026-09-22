@@ -127,6 +127,14 @@ pub const FLAG_GIT_URL_REJECTED: &str = "git_url_rejected";
 /// inert (audit finding C2); it now fails closed on shape mismatch.
 pub const FLAG_SHELL_BINARY_SHAPE_MISMATCH: &str = "shell_binary_shape_mismatch";
 
+/// A `tools/call` arrived with a tool `name` (or a non-empty `operation`)
+/// outside the audit-field charset (`path_id::is_safe_audit_field`). Both
+/// values become MAC-bound audit columns; ISSUE-KVD-CLI-F4ED93 showed that a
+/// `|` in them could re-split the legacy pipe-joined MAC input. The
+/// dispatcher refuses the call before any dispatch (defence in depth next to
+/// the injective v4 layout).
+pub const FLAG_INVALID_TOOL_FIELD_DENIED: &str = "invalid_tool_field_denied";
+
 /// Status field of an audit row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

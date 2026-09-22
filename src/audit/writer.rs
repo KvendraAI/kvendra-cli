@@ -5,13 +5,14 @@
 //! contention, and lets async callers `await` enqueue without blocking the
 //! reactor.
 //!
-//! Post-v3 migration every new row writes with `hmac_version = 3` and the
-//! HMAC includes `remote_audit_id` plus `error_code` / `error_message` (each
-//! NULL canonicalized to the empty string). The `update_event_status` path
-//! re-hashes under v3 as well to keep the row's HMAC in sync with the
-//! post-update status/severity and the error diagnostics it stamps.
+//! Every new row writes with `hmac_version = CURRENT_HMAC_LAYOUT` (4, the
+//! injective encoding of ISSUE-KVD-CLI-F4ED93) over the same columns as v3:
+//! `remote_audit_id` plus `error_code` / `error_message`. The
+//! `update_event_status` path re-hashes under the row's own layout to keep
+//! the row's HMAC in sync with the post-update status/severity and the error
+//! diagnostics it stamps.
 
-use crate::audit::hmac::compute_hmac_v3;
+use crate::audit::hmac::{CURRENT_HMAC_LAYOUT, RowFields, compute_for_layout, compute_hmac_v4};
 use crate::audit::schema::init;
 use crate::audit::{AuditEvent, Severity, Status};
 use crate::error::{KvendraError, KvendraResult};
@@ -100,7 +101,7 @@ impl AuditWriter {
     ///
     /// On the error path the caller passes the classified `error_code` and the
     /// already-sanitized `error_message`; both are persisted and bound to the
-    /// v3 HMAC. `ok` updates pass `None`/`None`.
+    /// row HMAC. `ok` updates pass `None`/`None`.
     pub async fn update_status(
         &self,
         id: i64,
@@ -158,14 +159,14 @@ fn record_event(conn: &Connection, hmac_key: &[u8], event: &AuditEvent) -> Kvend
             prev,
             "",
             event.remote_audit_id,
-            3_i64,
+            CURRENT_HMAC_LAYOUT,
             event.error_code,
             event.error_message,
         ],
     )?;
     let id = conn.last_insert_rowid();
 
-    let mac = compute_hmac_v3(
+    let mac = compute_hmac_v4(
         hmac_key,
         id,
         event.ts_unix_ms,
@@ -257,53 +258,23 @@ fn update_event_status(
         },
     )?;
 
-    let mac = if row.hmac_version >= 3 {
-        compute_hmac_v3(
-            hmac_key,
-            id,
-            row.ts_unix_ms,
-            &row.profile_id,
-            &row.primitive,
-            &row.action,
-            &row.args_hash_hex,
-            status.as_str(),
-            severity.as_str(),
-            &row.flags,
-            &row.prev_hmac,
-            row.remote_audit_id.as_deref(),
-            row.error_code.as_deref(),
-            row.error_message.as_deref(),
-        )
-    } else if row.hmac_version == 2 {
-        crate::audit::hmac::compute_hmac_v2(
-            hmac_key,
-            id,
-            row.ts_unix_ms,
-            &row.profile_id,
-            &row.primitive,
-            &row.action,
-            &row.args_hash_hex,
-            status.as_str(),
-            severity.as_str(),
-            &row.flags,
-            &row.prev_hmac,
-            row.remote_audit_id.as_deref(),
-        )
-    } else {
-        crate::audit::hmac::compute_hmac_v1(
-            hmac_key,
-            id,
-            row.ts_unix_ms,
-            &row.profile_id,
-            &row.primitive,
-            &row.action,
-            &row.args_hash_hex,
-            status.as_str(),
-            severity.as_str(),
-            &row.flags,
-            &row.prev_hmac,
-        )
+    let fields = RowFields {
+        id,
+        ts_unix_ms: row.ts_unix_ms,
+        profile_id: &row.profile_id,
+        primitive: &row.primitive,
+        action: &row.action,
+        args_hash_hex: &row.args_hash_hex,
+        status: status.as_str(),
+        severity: severity.as_str(),
+        flags: &row.flags,
+        prev_hmac_hex: &row.prev_hmac,
+        remote_audit_id: row.remote_audit_id.as_deref(),
+        error_code: row.error_code.as_deref(),
+        error_message: row.error_message.as_deref(),
     };
+    let mac = compute_for_layout(hmac_key, row.hmac_version, &fields)
+        .map_err(|e| KvendraError::Audit(format!("re-hash of row {id}: {e}")))?;
 
     conn.execute(
         "UPDATE audit_events SET hmac_hex = ?1 WHERE id = ?2",

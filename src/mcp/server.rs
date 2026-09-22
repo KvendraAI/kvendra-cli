@@ -649,6 +649,36 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         vec![]
     };
 
+    // ISSUE-KVD-CLI-F4ED93 — the tool name and the operation are recorded as
+    // MAC-bound audit columns. Refuse any value outside the audit-field
+    // charset (no `|`, no control bytes) before anything else touches it.
+    if !crate::path_id::is_safe_audit_field(name)
+        || (!action.is_empty() && !crate::path_id::is_safe_audit_field(&action))
+    {
+        flags.push(crate::audit::FLAG_INVALID_TOOL_FIELD_DENIED.to_string());
+        let err = KvendraError::InvalidArgs(
+            "tool name or operation contains characters outside [A-Za-z0-9._-] — refused"
+                .to_string(),
+        );
+        let _ = record_audit(
+            &ctx,
+            &arguments,
+            name,
+            &profile_id,
+            &action,
+            &flags,
+            true,
+            None,
+            Some(&err),
+        )
+        .await;
+        return JsonRpcResponse::error(
+            id,
+            codes::APPLICATION_ERROR,
+            crate::detection::sanitize_output(&err.to_string()),
+        );
+    }
+
     // REQ-KVD-CLI-42CB74 — tolerant-boot gate. If the vault is still in
     // `LockedPendingUnlock` after self-heal (no session blob on disk yet,
     // so the user has not run `kvendra unlock` from their own terminal)

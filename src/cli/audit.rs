@@ -124,7 +124,10 @@ async fn run_legacy(args: AuditArgs) -> KvendraResult<()> {
                 println!("CORRUPTION DETECTED at row #{row} (HMAC mismatch)");
                 return Err(KvendraError::AuditChainBroken(row));
             }
-            Err(e) => println!("audit chain BROKEN: {e}"),
+            Err(e) => {
+                println!("audit chain BROKEN: {e}");
+                return Err(e);
+            }
         }
         return Ok(());
     }

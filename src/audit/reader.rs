@@ -1,6 +1,6 @@
 //! Audit reader — query / export / verify HMAC chain.
 
-use crate::audit::hmac::{compute_hmac_v1, compute_hmac_v2, compute_hmac_v3};
+use crate::audit::hmac::{CURRENT_HMAC_LAYOUT, RowFields, compute_for_layout};
 use crate::audit::schema::init;
 use crate::error::{KvendraError, KvendraResult};
 use rusqlite::Connection;
@@ -24,8 +24,9 @@ pub struct StoredEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_audit_id: Option<String>,
     /// HMAC layout version (1 = legacy, 2 = remote_audit_id, 3 = error
-    /// diagnostics). Defaults to 1 for rows that pre-date the schema
-    /// migration; selects which `compute_hmac_vN` `verify_chain` recomputes.
+    /// diagnostics, 4 = injective encoding). Defaults to 1 for rows that
+    /// pre-date the schema migration; selects which layout `verify_chain`
+    /// recomputes.
     pub hmac_version: i64,
     /// Closed-vocabulary diagnostic code for `status:error` rows
     /// (ISSUE-KVD-CLI-6C43AA). `None` for ok/started rows and pre-v3 rows.
@@ -79,65 +80,65 @@ pub fn list_all(conn: &Connection) -> KvendraResult<Vec<StoredEvent>> {
     Ok(out)
 }
 
+impl StoredEvent {
+    /// The MAC-bound columns of this row.
+    pub fn hmac_fields(&self) -> RowFields<'_> {
+        RowFields {
+            id: self.id,
+            ts_unix_ms: self.ts_unix_ms,
+            profile_id: &self.profile_id,
+            primitive: &self.primitive,
+            action: &self.action,
+            args_hash_hex: &self.args_hash_hex,
+            status: &self.status,
+            severity: &self.severity,
+            flags: &self.flags,
+            prev_hmac_hex: &self.prev_hmac_hex,
+            remote_audit_id: self.remote_audit_id.as_deref(),
+            error_code: self.error_code.as_deref(),
+            error_message: self.error_message.as_deref(),
+        }
+    }
+}
+
 /// Walk the chain from id ASC, recompute each row's HMAC under the layout
 /// version recorded in that row, and fail at the first mismatch
 /// (REQ-KVD-002 AC-AUDIT-2 extended for REQ-KVD-CLI-010 hmac_version).
+///
+/// ISSUE-KVD-CLI-F4ED93: the layout is dispatched exhaustively
+/// ([`compute_for_layout`]) — an unknown layout or a non-canonical legacy row
+/// is an [`KvendraError::AuditLayoutViolation`], never silently absorbed. Once
+/// a row of the current layout appears, no legacy-layout row may follow it:
+/// the post-fix writer only ever emits the current layout.
 pub fn verify_chain(conn: &Connection, hmac_key: &[u8]) -> KvendraResult<()> {
     let events = list_all(conn)?;
     let mut prev = String::new();
+    let mut seen_current_layout = false;
     for ev in events {
         if ev.prev_hmac_hex != prev {
             return Err(KvendraError::AuditChainBroken(ev.id));
         }
-        let recomputed = if ev.hmac_version >= 3 {
-            compute_hmac_v3(
-                hmac_key,
-                ev.id,
-                ev.ts_unix_ms,
-                &ev.profile_id,
-                &ev.primitive,
-                &ev.action,
-                &ev.args_hash_hex,
-                &ev.status,
-                &ev.severity,
-                &ev.flags,
-                &ev.prev_hmac_hex,
-                ev.remote_audit_id.as_deref(),
-                ev.error_code.as_deref(),
-                ev.error_message.as_deref(),
-            )
-        } else if ev.hmac_version == 2 {
-            compute_hmac_v2(
-                hmac_key,
-                ev.id,
-                ev.ts_unix_ms,
-                &ev.profile_id,
-                &ev.primitive,
-                &ev.action,
-                &ev.args_hash_hex,
-                &ev.status,
-                &ev.severity,
-                &ev.flags,
-                &ev.prev_hmac_hex,
-                ev.remote_audit_id.as_deref(),
-            )
-        } else {
-            compute_hmac_v1(
-                hmac_key,
-                ev.id,
-                ev.ts_unix_ms,
-                &ev.profile_id,
-                &ev.primitive,
-                &ev.action,
-                &ev.args_hash_hex,
-                &ev.status,
-                &ev.severity,
-                &ev.flags,
-                &ev.prev_hmac_hex,
-            )
-        };
+        if seen_current_layout && ev.hmac_version < CURRENT_HMAC_LAYOUT {
+            return Err(KvendraError::AuditLayoutViolation {
+                row: ev.id,
+                reason: format!(
+                    "legacy layout v{} after a layout v{CURRENT_HMAC_LAYOUT} row",
+                    ev.hmac_version
+                ),
+            });
+        }
+        let recomputed =
+            compute_for_layout(hmac_key, ev.hmac_version, &ev.hmac_fields()).map_err(|e| {
+                KvendraError::AuditLayoutViolation {
+                    row: ev.id,
+                    reason: e.to_string(),
+                }
+            })?;
         if recomputed != ev.hmac_hex {
             return Err(KvendraError::AuditChainBroken(ev.id));
+        }
+        if ev.hmac_version == CURRENT_HMAC_LAYOUT {
+            seen_current_layout = true;
         }
         prev = ev.hmac_hex;
     }

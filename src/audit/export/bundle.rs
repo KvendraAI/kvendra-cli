@@ -27,7 +27,7 @@ pub struct ExportFilters {
 }
 
 /// Una fila del export. Mantiene los campos necesarios para re-verificar
-/// la cadena HMAC (mismo input que el `compute_hmac_v{1,2}`).
+/// la cadena HMAC (mismo input que `hmac::compute_for_layout`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportedEvent {
     pub audit_id: i64,

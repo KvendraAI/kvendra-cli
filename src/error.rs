@@ -51,6 +51,9 @@ pub enum KvendraError {
     #[error("audit hmac chain broken at row {0}")]
     AuditChainBroken(i64),
 
+    #[error("audit hmac layout violation at row {row}: {reason}")]
+    AuditLayoutViolation { row: i64, reason: String },
+
     #[error("allowlist parse error: {0}")]
     AllowlistParse(String),
 
