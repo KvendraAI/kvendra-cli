@@ -2,11 +2,21 @@
 
 use crate::error::KvendraResult;
 use rusqlite::Connection;
+use std::time::Duration;
+
+/// How long a connection waits on a contended audit-DB lock before SQLite
+/// reports SQLITE_BUSY.
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Apply PRAGMAs, create base tables, and run any pending migrations.
 ///
 /// Idempotent — safe to call on every process startup.
 pub fn init(conn: &Connection) -> KvendraResult<()> {
+    // Several processes share one audit DB (every `kvendra mcp` server, the
+    // CLI's `commit-layout` / `unlock` / `config` writers). Writers serialise
+    // on `BEGIN IMMEDIATE` (see `writer::with_immediate_txn`); this makes a
+    // contended lock wait instead of failing with SQLITE_BUSY at once.
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;

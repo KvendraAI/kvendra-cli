@@ -24,14 +24,18 @@
 //!    a no-op when there are no legacy rows (empty log or v4-only log), and a
 //!    refusal (never a re-commit) when an existing commitment no longer
 //!    matches — re-committing would launder the tamper.
-//!  - **Independent of prev-link state.** The digest is over column contents;
-//!    it does not care whether the chain links verify. Pre-existing link
-//!    breaks are still reported by `verify_chain` (which stops at the first
-//!    one, before reaching the commitment row) — committing neither hides nor
-//!    repairs them.
+//!  - **Only over a verifying chain (SA4-F5).** The whole chain is verified
+//!    inside the commit transaction first; on ANY verification failure
+//!    (prev-link break, bad MAC, layout violation, commitment mismatch) the
+//!    commit is refused and nothing is appended. A commitment therefore never
+//!    vouches for a log that was already broken or forged, and an
+//!    unauthenticated row that merely looks like a commitment (bogus MAC,
+//!    stripped flags) can neither short-circuit to "already committed" nor
+//!    hide behind a fresh commitment.
 
 use crate::audit::hmac::RowFields;
-use crate::audit::reader::{StoredEvent, list_all};
+use crate::audit::reader::{StoredEvent, list_all, verify_chain_report};
+use crate::audit::writer::with_immediate_txn;
 use crate::audit::{AuditEvent, PRIMITIVE_SYSTEM, Severity, Status};
 use crate::error::{KvendraError, KvendraResult};
 use rusqlite::Connection;
@@ -167,27 +171,28 @@ pub enum CommitOutcome {
 
 /// Append a commitment over every legacy row, unless one already matches.
 ///
-/// Runs under `BEGIN IMMEDIATE` so the read of the legacy set, the read of the
-/// chain tip and the append are one atomic step against other writers. Fails
-/// with [`KvendraError::AuditLayoutViolation`] when an existing commitment no
-/// longer matches the legacy rows.
+/// Runs under `BEGIN IMMEDIATE` so the chain verification, the read of the
+/// legacy set, the read of the chain tip and the append are one atomic step
+/// against other writers (every audit writer takes the same lock, SA4-F4).
+///
+/// Fail-closed (SA4-F5): the WHOLE chain must verify
+/// ([`verify_chain_report`]) inside that transaction before anything is
+/// decided. Any failure — a broken prev-link, a bad row MAC (e.g. a forged or
+/// flag-stripped commitment row), a layout violation, a commitment that no
+/// longer matches the legacy rows — is returned unchanged and nothing is
+/// appended. Consequently only a MAC-valid commitment whose digest matches
+/// counts as [`CommitOutcome::AlreadyCommitted`].
 pub fn commit_legacy_layout(
     conn: &Connection,
     hmac_key: &[u8],
     ts_unix_ms: i64,
 ) -> KvendraResult<CommitOutcome> {
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let r = commit_in_txn(conn, hmac_key, ts_unix_ms);
-    match r {
-        Ok(outcome) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(outcome)
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(e)
-        }
+    if !conn.is_autocommit() {
+        return Err(KvendraError::Audit(
+            "commit-layout must own its transaction (connection already in one)".into(),
+        ));
     }
+    with_immediate_txn(conn, |conn| commit_in_txn(conn, hmac_key, ts_unix_ms))
 }
 
 fn commit_in_txn(
@@ -195,6 +200,9 @@ fn commit_in_txn(
     hmac_key: &[u8],
     ts_unix_ms: i64,
 ) -> KvendraResult<CommitOutcome> {
+    // Every commitment row that survives this check has a valid v4 MAC and
+    // carries the digest of the current legacy rows.
+    verify_chain_report(conn, hmac_key)?;
     let events = list_all(conn)?;
     let (digest_hex, legacy_rows) = digest_of_legacy_rows(&events);
     if legacy_rows == 0 {
@@ -501,8 +509,15 @@ mod tests {
         );
     }
 
+    fn row_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// SA4-F5: committing over an already-broken chain is refused (was:
+    /// appended + exit 0) and appends nothing.
     #[test]
-    fn commitment_ignores_prev_link_state() {
+    fn commit_refuses_on_a_broken_chain() {
         let (_d, conn) = db();
         legacy_chain(&conn);
         // A pre-existing link break inside the legacy prefix.
@@ -511,20 +526,124 @@ mod tests {
             [],
         )
         .unwrap();
-        let before = verify_chain(&conn, K);
-        assert!(matches!(before, Err(KvendraError::AuditChainBroken(3))));
-        assert!(matches!(
-            commit(&conn).unwrap(),
-            CommitOutcome::Committed { legacy_rows: 3, .. }
-        ));
-        // Same first failure — the commitment neither hides nor adds to it.
         assert!(matches!(
             verify_chain(&conn, K),
             Err(KvendraError::AuditChainBroken(3))
         ));
         assert!(matches!(
-            commit(&conn).unwrap(),
-            CommitOutcome::AlreadyCommitted { .. }
+            commit(&conn),
+            Err(KvendraError::AuditChainBroken(3))
         ));
+        assert_eq!(row_count(&conn), 3, "a refused commit appends nothing");
+        assert!(conn.is_autocommit());
+    }
+
+    /// SA4-F5: a fake tail row that merely LOOKS like a matching commitment
+    /// (right columns + digest, bogus MAC) is not "already committed".
+    #[test]
+    fn fake_commitment_row_is_not_already_committed() {
+        let (_d, conn) = db();
+        legacy_chain(&conn);
+        let events = list_all(&conn).unwrap();
+        let (digest, _) = digest_of_legacy_rows(&events);
+        conn.execute(
+            "INSERT INTO audit_events (ts_unix_ms, profile_id, primitive, action, args_hash_hex,
+             status, severity, flags, prev_hmac_hex, hmac_hex, remote_audit_id, hmac_version)
+             VALUES (1, ?1, ?1, ?2, ?3, 'ok', 'info', ?4, ?5, 'deadbeef', NULL, 4)",
+            rusqlite::params![
+                PRIMITIVE_SYSTEM,
+                ACTION_AUDIT_LAYOUT_COMMITTED,
+                digest,
+                FLAG_AUDIT_LAYOUT_COMMITTED,
+                events[2].hmac_hex
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            commit(&conn),
+            Err(KvendraError::AuditChainBroken(4))
+        ));
+        assert_eq!(row_count(&conn), 4);
+    }
+
+    /// SA4-F5: stripping the flag off the real commitment (so it no longer
+    /// looks like one) must not lead to a second commitment over the now
+    /// broken chain.
+    #[test]
+    fn stripped_commitment_flags_refuse_instead_of_recommitting() {
+        let (_d, conn) = db();
+        legacy_chain(&conn);
+        commit(&conn).unwrap();
+        conn.execute("UPDATE audit_events SET flags = '' WHERE id = 4", [])
+            .unwrap();
+        assert!(matches!(
+            commit(&conn),
+            Err(KvendraError::AuditChainBroken(4))
+        ));
+        assert_eq!(row_count(&conn), 4);
+    }
+
+    /// SA4-F4: `commit-layout` racing a live writer (separate connections ≈
+    /// separate processes) never forks the chain and commits exactly once.
+    /// Pre-fix: CHAIN_BROKEN 9/10.
+    #[test]
+    fn commit_racing_a_writer_keeps_one_chain() {
+        use std::sync::{Arc, Barrier};
+        for run in 0..10 {
+            let (dir, conn) = db();
+            legacy_chain(&conn);
+            let path = dir.path().join("audit.db");
+            let barrier = Arc::new(Barrier::new(3));
+            let writer = {
+                let (path, barrier) = (path.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let conn = Connection::open(&path).unwrap();
+                    init(&conn).unwrap();
+                    barrier.wait();
+                    for i in 0..30 {
+                        let ev = AuditEvent {
+                            ts_unix_ms: 1_900_000_000_000 + i,
+                            profile_id: "p".into(),
+                            primitive: "kvendra.shell".into(),
+                            action: "exec".into(),
+                            args_hash_hex: format!("{i:064x}"),
+                            status: Status::Started,
+                            severity: Severity::Info,
+                            flags: String::new(),
+                            remote_audit_id: None,
+                            error_code: None,
+                            error_message: None,
+                        };
+                        crate::audit::writer::record_event(&conn, K, &ev).unwrap();
+                    }
+                })
+            };
+            let committers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (path, barrier) = (path.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        let conn = Connection::open(&path).unwrap();
+                        init(&conn).unwrap();
+                        barrier.wait();
+                        commit(&conn).unwrap()
+                    })
+                })
+                .collect();
+            writer.join().unwrap();
+            let outcomes: Vec<_> = committers.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|o| matches!(o, CommitOutcome::Committed { .. }))
+                    .count(),
+                1,
+                "run {run}: {outcomes:?}"
+            );
+            let rep = verify_chain_report(&conn, K);
+            assert!(
+                matches!(rep, Ok(r) if r.rows == 34 && r.commitment_rows == 1),
+                "run {run}: {rep:?}"
+            );
+        }
     }
 }

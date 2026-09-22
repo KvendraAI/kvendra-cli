@@ -45,6 +45,12 @@ pub fn open_readonly(db_path: &Path) -> KvendraResult<Connection> {
 }
 
 pub fn list_all(conn: &Connection) -> KvendraResult<Vec<StoredEvent>> {
+    list_from(conn, i64::MIN)
+}
+
+/// Every row with `id >= from_id`, id ASC (the tail of the chain starting at
+/// `from_id`).
+pub fn list_from(conn: &Connection, from_id: i64) -> KvendraResult<Vec<StoredEvent>> {
     // We `SELECT` the v2 columns explicitly because they may have been added
     // by the migration step earlier in the process — older binaries opening
     // the same file would have already had `apply_pending` upgrade the
@@ -53,9 +59,9 @@ pub fn list_all(conn: &Connection) -> KvendraResult<Vec<StoredEvent>> {
         "SELECT id, ts_unix_ms, profile_id, primitive, action, args_hash_hex,
          status, severity, flags, prev_hmac_hex, hmac_hex,
          remote_audit_id, hmac_version, error_code, error_message
-         FROM audit_events ORDER BY id ASC",
+         FROM audit_events WHERE id >= ?1 ORDER BY id ASC",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([from_id], |row| {
         Ok(StoredEvent {
             id: row.get(0)?,
             ts_unix_ms: row.get(1)?,
@@ -99,6 +105,19 @@ impl StoredEvent {
             error_code: self.error_code.as_deref(),
             error_message: self.error_message.as_deref(),
         }
+    }
+}
+
+impl StoredEvent {
+    /// Whether this row's stored tag matches its columns under its own layout
+    /// (the per-row half of [`verify_chain_report`]; prev-links not checked).
+    pub fn mac_verifies(&self, hmac_key: &[u8]) -> KvendraResult<bool> {
+        let recomputed = compute_for_layout(hmac_key, self.hmac_version, &self.hmac_fields())
+            .map_err(|e| KvendraError::AuditLayoutViolation {
+                row: self.id,
+                reason: e.to_string(),
+            })?;
+        Ok(recomputed == self.hmac_hex)
     }
 }
 
@@ -168,14 +187,7 @@ pub fn verify_chain_report(conn: &Connection, hmac_key: &[u8]) -> KvendraResult<
                 ),
             });
         }
-        let recomputed =
-            compute_for_layout(hmac_key, ev.hmac_version, &ev.hmac_fields()).map_err(|e| {
-                KvendraError::AuditLayoutViolation {
-                    row: ev.id,
-                    reason: e.to_string(),
-                }
-            })?;
-        if recomputed != ev.hmac_hex {
+        if !ev.mac_verifies(hmac_key)? {
             return Err(KvendraError::AuditChainBroken(ev.id));
         }
         if ev.is_layout_commitment() {

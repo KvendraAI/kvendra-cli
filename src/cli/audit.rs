@@ -157,19 +157,22 @@ async fn run_legacy(args: AuditArgs) -> KvendraResult<()> {
         // Append the v3 diagnostic on error rows so the plain-text listing is
         // self-diagnosing (ISSUE-KVD-CLI-6C43AA). --json carries the structured
         // fields; here we render a compact `[CODE] message` tail.
+        // Agent-supplied fields are rendered through `display_safe` so rows
+        // written by older binaries cannot inject terminal escapes.
+        use crate::tui::display_safe as safe;
         let err_tail = match (ev.status.as_str(), &ev.error_code, &ev.error_message) {
-            ("error", Some(code), Some(msg)) => format!("  [{code}] {msg}"),
-            ("error", Some(code), None) => format!("  [{code}]"),
+            ("error", Some(code), Some(msg)) => format!("  [{}] {}", safe(code), safe(msg)),
+            ("error", Some(code), None) => format!("  [{}]", safe(code)),
             _ => String::new(),
         };
         println!(
             "{:>5} {} {:>15} {:<26} {:<10} {} {}{}",
             ev.id,
             ev.ts_unix_ms,
-            ev.profile_id,
-            ev.primitive,
-            ev.action,
-            ev.status,
+            safe(&ev.profile_id),
+            safe(&ev.primitive),
+            safe(&ev.action),
+            safe(&ev.status),
             ev.severity,
             err_tail
         );
@@ -220,9 +223,29 @@ fn run_commit_layout(args: CommitLayoutArgs) -> KvendraResult<()> {
     let vault = crate::vault::Vault::new(home);
     let mut key = audit_key(&vault, args.password_stdin)?;
     let outcome = commit_legacy_layout(&conn, &key, now_unix_ms());
-    let chain = verify_chain_report(&conn, &key);
     key.zeroize();
-    match outcome? {
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(
+            e @ (KvendraError::AuditChainBroken(_) | KvendraError::AuditLayoutViolation { .. }),
+        ) => {
+            eprintln!(
+                "error: refusing to commit the legacy layout — the audit chain does not verify \
+                 ({e}); nothing was appended.\n\
+                 A commitment is only appended to (or recognised on) a chain that verifies end \
+                 to end, so it can never vouch for a log that is already broken or forged.\n\
+                 Run `kvendra audit --verify` to see the first failing row. Prev-link breaks \
+                 (CHAIN_BROKEN) in rows written by kvendra 0.6.4 and earlier are a known \
+                 artefact of concurrent audit writers re-hashing a row after its successor had \
+                 chained to it (the audit-writer concurrency issue, follow-up of \
+                 ISSUE-KVD-CLI-F4ED93); they cannot be repaired in place without giving up the \
+                 tamper evidence the chain exists to provide."
+            );
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
+    match outcome {
         CommitOutcome::NothingToCommit => {
             println!("No legacy-layout rows — nothing to commit.");
         }
@@ -241,12 +264,6 @@ fn run_commit_layout(args: CommitLayoutArgs) -> KvendraResult<()> {
                 "Committed {legacy_rows} legacy-layout rows in row #{row} (digest {digest_hex})."
             );
         }
-    }
-    if let Err(e) = chain {
-        eprintln!(
-            "warning: the audit chain currently fails verification ({e}). The commitment \
-             pins the legacy rows as they are now; it neither hides nor repairs that failure."
-        );
     }
     Ok(())
 }

@@ -2157,6 +2157,71 @@ async fn sa4_green_cli_commit_layout_exit_codes() {
     assert!(out.status.success(), "no audit log is a no-op");
 }
 
+/// GREEN-only (SA4-F5) — `commit-layout` is fail-closed: a pre-existing
+/// prev-link break, a fake tail commitment (bogus MAC) or a flag-stripped
+/// real commitment all exit NON-ZERO, append nothing, and point the owner at
+/// `kvendra audit --verify`.
+#[tokio::test]
+async fn sa4_green_cli_commit_layout_refuses_unverifiable_chains() {
+    const PW: &str = "hunter2-run1-audit";
+    let commit = ["audit", "commit-layout", "--password-stdin"];
+    let rows = |ctx: &Arc<ServerContext>| {
+        rusqlite::Connection::open(ctx.vault.audit_db_path())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM audit_events", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    for case in ["broken-link", "fake-commitment", "stripped-flags"] {
+        let (dir, ctx) = bootstrap("shell.profile", SHELL_ECHO_ONLY, DetectionSeverity::Warn).await;
+        drain(&ctx).await;
+        write_0_6_4_chain(&ctx);
+        match case {
+            "broken-link" => tamper(
+                &ctx,
+                "UPDATE audit_events SET prev_hmac_hex = 'stale' WHERE id = 3",
+            ),
+            "fake-commitment" => tamper(
+                &ctx,
+                "INSERT INTO audit_events (ts_unix_ms, profile_id, primitive, action,
+                 args_hash_hex, status, severity, flags, prev_hmac_hex, hmac_hex, hmac_version)
+                 SELECT 1, 'kvendra.system', 'kvendra.system', 'audit_layout_committed',
+                        'ab', 'ok', 'info', 'audit_layout_committed', hmac_hex, 'deadbeef', 4
+                 FROM audit_events ORDER BY id DESC LIMIT 1",
+            ),
+            _ => {
+                assert!(matches!(
+                    commit_layout(&ctx).unwrap(),
+                    kvendra::audit::layout_commit::CommitOutcome::Committed { row: 5, .. }
+                ));
+                tamper(&ctx, "UPDATE audit_events SET flags = '' WHERE id = 5");
+            }
+        }
+        let before = rows(&ctx);
+        let out = run_cli(dir.path(), &commit, PW);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "{case}: must exit non-zero; stdout: {stdout}"
+        );
+        assert!(
+            !stdout.contains("Already committed") && !stdout.contains("Committed"),
+            "{case}: {stdout}"
+        );
+        assert!(
+            stderr.contains("kvendra audit --verify"),
+            "{case}: {stderr}"
+        );
+        assert_eq!(
+            rows(&ctx),
+            before,
+            "{case}: a refused commit appends nothing"
+        );
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // SA5 — ISSUE-KVD-CLI-3319F0 (MED)
 // Broker-supplied `template_id` is joined into a filesystem path unvalidated.
