@@ -51,7 +51,7 @@ use kvendra::approval::{ApprovalCache, ApprovalMode, Transport};
 use kvendra::audit::AuditWriter;
 use kvendra::audit::hmac::{compute_hmac_v2, compute_hmac_v3};
 use kvendra::config::{Config, DetectionSeverity};
-use kvendra::detection::detect;
+use kvendra::detection::{detect, sanitize_output};
 use kvendra::mcp::protocol::JsonRpcRequest;
 use kvendra::mcp::server::{ServerContext, dispatch};
 use kvendra::vault::kdf::KdfParams;
@@ -2522,6 +2522,215 @@ async fn sa8_decoy_must_not_defeat_the_inbound_block_gate() {
 //     `<redacted:github_pat_classic>` is present;
 //   * `REDACT_ONLY_PROVIDERS` (jwt, google_oauth_token) still exempt inbound and
 //     `ALWAYS_REDACT_PROVIDERS` (private_key_pem) still ignores the threshold.
+
+// ─────────────────────────────────────────────────────────────────────────
+// SA8-F1 (validation-loop iteration 2, Medium) — the per-match gate was still
+// bypassable at 23347f5:
+//   * OVERLAP: a rejected decoy's tail swallows the real token's prefix and
+//     `find_iter` resumes at the decoy's END, inside the real token
+//     (`AKIA`+12×`A`+AKID, `sk-`+48×`a`+openai, `ghp_`+33×`a`+PAT, …);
+//   * DILUTION: in-charset low-entropy padding glued to a real key under an
+//     unbounded quantifier drags the WHOLE-match entropy below 3.5 (anthropic,
+//     pypi, slack, gitlab, stripe, openai) — inbound blind AND the key echoed
+//     back verbatim by `sanitize_output`.
+// Each probe below is asserted inbound (`detect`) and outbound
+// (`sanitize_output`) for every provider shape.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// (provider, real-shaped token, decoy prefix, overlap pad length, pad char)
+const SA8_F1_CASES: &[(&str, &str, &str, usize, char)] = &[
+    (
+        "anthropic_key",
+        "sk-ant-api03-Zq7Wm2Xv8Nb4Kc6Rt9Yh3Jd5Fg1Ls0PuAeB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJ_x-QwErTyUiOp",
+        "sk-ant-",
+        60,
+        'a',
+    ),
+    (
+        "pypi_token",
+        "pypi-AgEIcHlwaS5vcmcCJDgyZWUxMTk5LTRkMzAtNGE5MS04YzVjLTk2ZjQ4YzI3ZDViYwACKlszLCJlMmU3MWMxMy01YjQ2LTRkOTMtYjMyOC1lY2EyZWVjZDQ3M2YiXQAABiBp",
+        "pypi-AgEI",
+        30,
+        'a',
+    ),
+    (
+        "slack_token",
+        "xoxb-1234567890-9876543210123-aB3kP9zX1mQ7rL5tY2vN4wE6",
+        "xoxb-",
+        10,
+        'a',
+    ),
+    (
+        "gitlab_pat",
+        "glpat-aB3kP9zX1mQ7rL5tY2vN",
+        "glpat-",
+        20,
+        'a',
+    ),
+    (
+        "stripe_secret_key",
+        "sk_live_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0",
+        "sk_live_",
+        24,
+        'a',
+    ),
+    (
+        "openai_key",
+        "sk-aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJ",
+        "sk-",
+        48,
+        'a',
+    ),
+    ("aws_akid", "AKIAIOSFODNN7EXAMPLE", "AKIA", 12, 'A'),
+    ("github_pat_classic", REAL_GHP, "ghp_", 33, 'a'),
+];
+
+fn sa8_f1_case(provider: &str) -> (&'static str, &'static str, usize, char) {
+    let (_, real, prefix, k, pad) = SA8_F1_CASES
+        .iter()
+        .find(|(p, ..)| *p == provider)
+        .unwrap_or_else(|| panic!("no SA8-F1 case for {provider}"));
+    (real, prefix, *k, *pad)
+}
+
+fn sa8_f1_assert_caught(provider: &str, shape: &str, real: &str, haystack: &str) {
+    let hits = detect(haystack);
+    assert!(
+        hits.iter()
+            .any(|h| h.provider == provider && h.matched_text.contains(real)),
+        "{provider}/{shape}: inbound detect() missed the real token; providers \
+         reported: {:?}",
+        hits.iter().map(|h| h.provider.as_str()).collect::<Vec<_>>()
+    );
+    let out = sanitize_output(haystack);
+    assert!(
+        !out.contains(real),
+        "{provider}/{shape}: the real token survived outbound redaction"
+    );
+    assert!(
+        out.contains(&format!("<redacted:{provider}>")),
+        "{provider}/{shape}: no `<redacted:{provider}>` marker in the output"
+    );
+}
+
+/// OVERLAP: decoy prefix + pad sized so the decoy match swallows the real
+/// token's prefix.
+fn sa8_f1_overlap(provider: &str) {
+    let (real, prefix, k, pad) = sa8_f1_case(provider);
+    let hay = format!("{prefix}{}{real}", pad.to_string().repeat(k));
+    sa8_f1_assert_caught(provider, "overlap", real, &hay);
+}
+
+/// DILUTION: real key followed (and, separately, preceded under the same
+/// prefix) by 2000 in-charset pad characters — no decoy needed.
+fn sa8_f1_dilution(provider: &str) {
+    let (real, prefix, _, pad) = sa8_f1_case(provider);
+    let padding = pad.to_string().repeat(2000);
+    sa8_f1_assert_caught(provider, "dilution", real, &format!("{real}{padding}"));
+    sa8_f1_assert_caught(
+        provider,
+        "pre-dilution",
+        real,
+        &format!("{prefix}{padding}{real}"),
+    );
+}
+
+#[test]
+fn sa8_f1_anthropic_overlap_and_dilution_are_caught() {
+    sa8_f1_overlap("anthropic_key");
+    sa8_f1_dilution("anthropic_key");
+}
+
+#[test]
+fn sa8_f1_pypi_overlap_and_dilution_are_caught() {
+    sa8_f1_overlap("pypi_token");
+    sa8_f1_dilution("pypi_token");
+}
+
+#[test]
+fn sa8_f1_slack_overlap_and_dilution_are_caught() {
+    sa8_f1_overlap("slack_token");
+    sa8_f1_dilution("slack_token");
+}
+
+#[test]
+fn sa8_f1_gitlab_overlap_and_dilution_are_caught() {
+    sa8_f1_overlap("gitlab_pat");
+    sa8_f1_dilution("gitlab_pat");
+}
+
+#[test]
+fn sa8_f1_stripe_overlap_and_dilution_are_caught() {
+    sa8_f1_overlap("stripe_secret_key");
+    sa8_f1_dilution("stripe_secret_key");
+}
+
+#[test]
+fn sa8_f1_openai_overlap_and_dilution_are_caught() {
+    sa8_f1_overlap("openai_key");
+    sa8_f1_dilution("openai_key");
+}
+
+#[test]
+fn sa8_f1_aws_akid_overlap_and_padding_are_caught() {
+    sa8_f1_overlap("aws_akid");
+    sa8_f1_dilution("aws_akid");
+}
+
+#[test]
+fn sa8_f1_github_overlap_and_padding_are_caught() {
+    sa8_f1_overlap("github_pat_classic");
+    sa8_f1_dilution("github_pat_classic");
+}
+
+/// GUARD — the window gate must not turn a decoy that is low-entropy
+/// EVERYWHERE into a finding, however long it is, for any provider.
+#[test]
+fn sa8_f1_guard_lone_low_entropy_decoys_stay_unreported() {
+    for (provider, _, prefix, _, pad) in SA8_F1_CASES {
+        for n in [16usize, 60, 500, 5000] {
+            let decoy = format!("{prefix}{}", pad.to_string().repeat(n));
+            assert!(
+                detect(&decoy).is_empty(),
+                "{provider}: a lone decoy with {n} pad chars was reported"
+            );
+            assert_eq!(
+                sanitize_output(&decoy),
+                decoy,
+                "{provider}: a lone decoy was mangled by the redactor"
+            );
+        }
+    }
+}
+
+/// End-to-end: the openai overlap probe must trip the severity=block gate.
+#[tokio::test]
+async fn sa8_f1_overlap_must_not_defeat_the_inbound_block_gate() {
+    let (_dir, ctx) = bootstrap("shell.profile", SHELL_ECHO_ONLY, DetectionSeverity::Block).await;
+    let (real, prefix, k, pad) = sa8_f1_case("openai_key");
+    let payload = format!("{prefix}{}{real}", pad.to_string().repeat(k));
+    let resp = dispatch(
+        call(
+            "kvendra.shell",
+            json!({
+                "profile_id": "shell.profile",
+                "operation": "exec",
+                "args": { "binary": "id", "argv": [payload] }
+            }),
+        ),
+        ctx.clone(),
+    )
+    .await;
+    let err = resp
+        .error
+        .as_ref()
+        .expect("a key smuggled behind an overlapping decoy must be refused");
+    assert!(
+        err.message.contains("severity=block"),
+        "the inbound detection gate must refuse at severity=block; got: {}",
+        err.message
+    );
+}
 
 // ═════════════════════════════════════════════════════════════════════════
 // SA10 — ISSUE-KVD-CLI-0F929A (MED) — supply chain.

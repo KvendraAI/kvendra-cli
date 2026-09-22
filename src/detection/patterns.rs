@@ -72,3 +72,22 @@ pub const REDACT_ONLY_PROVIDERS: &[&str] = &["jwt", "google_oauth_token"];
 /// framing (a PEM `BEGIN … PRIVATE KEY` block) is a strong enough signal on its
 /// own, and a contrived low-entropy body must not slip a real key past.
 pub const ALWAYS_REDACT_PROVIDERS: &[&str] = &["private_key_pem"];
+
+/// Entropy window, in bytes, for every provider whose pattern has an UNBOUNDED
+/// quantifier (`{n,}`, `\s*`): the pattern's MINIMUM match length. The entropy
+/// gate also scores the maximum-entropy window of this length inside a match,
+/// so padding a real key with low-entropy characters of the pattern's own
+/// charset cannot dilute the whole-match average below the threshold
+/// (ISSUE-KVD-CLI-8F501A, SA8-F1). Fixed-length patterns need no entry — their
+/// only window is the match itself. `private_key_pem` is ALWAYS_REDACT.
+pub const ENTROPY_WINDOWS: &[(&str, usize)] = &[
+    ("pypi_token", 39),
+    ("aws_secret_env", 62),
+    ("anthropic_key", 67),
+    ("openai_key", 51),
+    ("slack_token", 15),
+    ("stripe_secret_key", 32),
+    ("gitlab_pat", 26),
+    ("google_oauth_token", 25),
+    ("jwt", 29),
+];

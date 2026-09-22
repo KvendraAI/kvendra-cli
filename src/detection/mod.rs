@@ -46,6 +46,7 @@ struct CompiledPatterns {
     set: RegexSet,
     individual: Vec<Regex>,
     providers: Vec<&'static str>,
+    windows: Vec<Option<usize>>,
 }
 
 static PATTERNS: OnceLock<CompiledPatterns> = OnceLock::new();
@@ -65,24 +66,38 @@ fn compiled() -> &'static CompiledPatterns {
             .iter()
             .map(|r| Regex::new(r).expect("compile detection regex"))
             .collect();
+        let windows: Vec<Option<usize>> = providers
+            .iter()
+            .map(|p| {
+                patterns::ENTROPY_WINDOWS
+                    .iter()
+                    .find(|(q, _)| q == p)
+                    .map(|(_, w)| *w)
+            })
+            .collect();
         CompiledPatterns {
             set,
             individual,
             providers,
+            windows,
         }
     })
 }
 
 /// Shannon entropy in bits/char of a byte slice (printable ASCII assumed).
 pub fn shannon_entropy(s: &str) -> f64 {
-    if s.is_empty() {
+    bytes_entropy(s.as_bytes())
+}
+
+fn bytes_entropy(bytes: &[u8]) -> f64 {
+    if bytes.is_empty() {
         return 0.0;
     }
     let mut counts = [0u32; 256];
-    for b in s.bytes() {
-        counts[b as usize] += 1;
+    for b in bytes {
+        counts[*b as usize] += 1;
     }
-    let total = s.len() as f64;
+    let total = bytes.len() as f64;
     let mut h = 0.0_f64;
     for c in counts.iter() {
         if *c == 0 {
@@ -98,6 +113,77 @@ pub fn shannon_entropy(s: &str) -> f64 {
 /// like `"ghp_lorem_ipsum_dolor_sit_amet_..."`.
 pub const ENTROPY_THRESHOLD: f64 = 3.5;
 
+/// Scan budget of one selector run, as a multiple of the haystack length (plus
+/// [`SCAN_BUDGET_FLOOR`]). Retrying at the next character after a rejected
+/// match re-runs the regex over overlapping spans; on an adversarial input
+/// (thousands of prefixes inside one long low-entropy run) that is quadratic.
+/// Once the budget is spent the selector FAILS CLOSED: every remaining match
+/// of that provider is accepted without the entropy gate and scanning goes
+/// back to non-overlapping — linear, and never a bypass.
+const SCAN_BUDGET_FACTOR: usize = 8;
+const SCAN_BUDGET_FLOOR: usize = 64 * 1024;
+
+/// Entropy the gate compares against [`ENTROPY_THRESHOLD`]: the whole-match
+/// entropy (the historical measure, reported unchanged whenever it passes)
+/// or, for a provider with an [`patterns::ENTROPY_WINDOWS`] entry, the best
+/// window of the pattern's minimum length — so low-entropy padding in the
+/// pattern's own charset cannot dilute a real key below the threshold.
+fn gate_entropy(text: &str, window: Option<usize>) -> f64 {
+    let whole = shannon_entropy(text);
+    match window {
+        Some(w) if whole < ENTROPY_THRESHOLD && w > 0 && text.len() > w => {
+            max_window_entropy(text.as_bytes(), w).max(whole)
+        }
+        _ => whole,
+    }
+}
+
+/// Maximum Shannon entropy over every `w`-byte window of `bytes`, in one
+/// sliding pass (O(len)). Stops at the first window that reaches the
+/// threshold, confirmed by an exact recomputation of that window.
+fn max_window_entropy(bytes: &[u8], w: usize) -> f64 {
+    // H(window) = log2(w) − Σ c·log2(c) / w, maintained incrementally.
+    let f: Vec<f64> = (0..=w)
+        .map(|c| {
+            if c == 0 {
+                0.0
+            } else {
+                c as f64 * (c as f64).log2()
+            }
+        })
+        .collect();
+    let log_w = (w as f64).log2();
+    let mut counts = [0usize; 256];
+    let mut sum = 0.0_f64;
+    for b in &bytes[..w] {
+        let c = &mut counts[*b as usize];
+        sum += f[*c + 1] - f[*c];
+        *c += 1;
+    }
+    let mut best = 0.0_f64;
+    let mut start = 0usize;
+    loop {
+        let approx = log_w - sum / w as f64;
+        if approx >= ENTROPY_THRESHOLD - 1e-6 {
+            let exact = bytes_entropy(&bytes[start..start + w]);
+            if exact >= ENTROPY_THRESHOLD {
+                return exact;
+            }
+        }
+        best = best.max(approx);
+        if start + w >= bytes.len() {
+            return best.min(ENTROPY_THRESHOLD - f64::EPSILON);
+        }
+        let out = &mut counts[bytes[start] as usize];
+        sum += f[*out - 1] - f[*out];
+        *out -= 1;
+        let inc = &mut counts[bytes[start + w] as usize];
+        sum += f[*inc + 1] - f[*inc];
+        *inc += 1;
+        start += 1;
+    }
+}
+
 /// One regex hit that passed the entropy gate, with its span in the haystack.
 /// Private: the plaintext never leaves this module.
 struct RawMatch {
@@ -112,26 +198,60 @@ struct RawMatch {
 /// PAT-KVD-CLI-C18A74.
 ///
 /// Returns EVERY match of provider `idx` in `haystack` that passes the entropy
-/// gate, in order. The gate is applied per match: a low-entropy decoy of the
-/// right shape must never disqualify the provider for the whole payload
-/// (ISSUE-KVD-CLI-8F501A).
+/// gate, in order, non-overlapping. The gate is applied per match: a
+/// low-entropy decoy of the right shape must never disqualify the provider for
+/// the whole payload (ISSUE-KVD-CLI-8F501A). Two further rules close SA8-F1:
+///
+/// - the gate scores a bounded window as well as the whole match
+///   ([`gate_entropy`]), so in-charset padding cannot dilute a real key;
+/// - a REJECTED match is not consumed: scanning resumes at its next character,
+///   so a decoy whose tail swallows a real token's prefix cannot hide it.
+///
+/// Work is capped by [`SCAN_BUDGET_FACTOR`]; past the cap the selector fails
+/// closed (see there).
 fn matches_above_threshold(idx: usize, haystack: &str) -> Vec<RawMatch> {
     let cp = compiled();
     let provider = cp.providers[idx];
     let always = patterns::ALWAYS_REDACT_PROVIDERS.contains(&provider);
-    cp.individual[idx]
-        .find_iter(haystack)
-        .filter_map(|m| {
-            let text = m.as_str().to_string();
-            let entropy = shannon_entropy(&text);
-            (always || entropy >= ENTROPY_THRESHOLD).then(|| RawMatch {
+    let window = cp.windows[idx];
+    let re = &cp.individual[idx];
+    let mut budget = haystack
+        .len()
+        .saturating_mul(SCAN_BUDGET_FACTOR)
+        .saturating_add(SCAN_BUDGET_FLOOR);
+    let mut fail_closed = false;
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos <= haystack.len() {
+        let Some(m) = re.find_at(haystack, pos) else {
+            break;
+        };
+        if !fail_closed {
+            let cost = (m.end() - pos) + m.len();
+            match budget.checked_sub(cost) {
+                Some(left) => budget = left,
+                None => fail_closed = true,
+            }
+        }
+        let text = m.as_str();
+        let entropy = if always || fail_closed {
+            shannon_entropy(text)
+        } else {
+            gate_entropy(text, window)
+        };
+        if always || fail_closed || entropy >= ENTROPY_THRESHOLD {
+            out.push(RawMatch {
                 start: m.start(),
                 end: m.end(),
-                text,
+                text: text.to_string(),
                 entropy,
-            })
-        })
-        .collect()
+            });
+            pos = m.end();
+        } else {
+            pos = m.start() + text.chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    out
 }
 
 /// Run the regex set against `haystack`. Returns matches that pass the
@@ -622,8 +742,11 @@ mod tests {
 
     #[test]
     fn sanitize_output_is_byte_identical_to_the_previous_replace_all() {
-        // SA8 changes the DECIDER, never the outbound bytes: the new splice
-        // must reproduce `replace_all` exactly, including cross-provider order.
+        // On inputs WITHOUT prefix-swallowing overlap or in-charset dilution
+        // (every POOL entry is a standalone token followed by a separator),
+        // the new splice must reproduce `replace_all` exactly, including
+        // cross-provider order. The overlap/dilution shapes are where SA8-F1
+        // DELIBERATELY diverges — see `sa8_f1_*` below.
         const POOL: &[&str] = &[
             DECOY_GHP,
             REAL_GHP,
@@ -664,5 +787,253 @@ mod tests {
                 "outbound bytes diverged on: {hay:?}"
             );
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SA8-F1 — the per-match gate was still bypassable by OVERLAP (a decoy
+    // whose tail swallows the real token's prefix) and by DILUTION (in-charset
+    // low-entropy padding glued to a real key under an unbounded quantifier).
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// (provider, real-shaped token, decoy prefix, overlap pad length, pad char)
+    const F1_CASES: &[(&str, &str, &str, usize, char)] = &[
+        (
+            "anthropic_key",
+            "sk-ant-api03-Zq7Wm2Xv8Nb4Kc6Rt9Yh3Jd5Fg1Ls0PuAeB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJ_x-QwErTyUiOp",
+            "sk-ant-",
+            60,
+            'a',
+        ),
+        (
+            "pypi_token",
+            "pypi-AgEIcHlwaS5vcmcCJDgyZWUxMTk5LTRkMzAtNGE5MS04YzVjLTk2ZjQ4YzI3ZDViYwACKlszLCJlMmU3MWMxMy01YjQ2LTRkOTMtYjMyOC1lY2EyZWVjZDQ3M2YiXQAABiBp",
+            "pypi-AgEI",
+            30,
+            'a',
+        ),
+        (
+            "slack_token",
+            "xoxb-1234567890-9876543210123-aB3kP9zX1mQ7rL5tY2vN4wE6",
+            "xoxb-",
+            10,
+            'a',
+        ),
+        (
+            "gitlab_pat",
+            "glpat-aB3kP9zX1mQ7rL5tY2vN",
+            "glpat-",
+            20,
+            'a',
+        ),
+        (
+            "stripe_secret_key",
+            "sk_live_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0",
+            "sk_live_",
+            24,
+            'a',
+        ),
+        (
+            "openai_key",
+            "sk-aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJ",
+            "sk-",
+            48,
+            'a',
+        ),
+        ("aws_akid", "AKIAIOSFODNN7EXAMPLE", "AKIA", 12, 'A'),
+        ("github_pat_classic", REAL_GHP, "ghp_", 33, 'a'),
+    ];
+
+    /// Every probe shape the validator used, per provider.
+    fn f1_probes(prefix: &str, real: &str, k: usize, pad: char) -> Vec<(&'static str, String)> {
+        let p = |n: usize| pad.to_string().repeat(n);
+        vec![
+            ("overlap", format!("{prefix}{}{real}", p(k))),
+            ("dilution", format!("{real}{}", p(2000))),
+            ("pre-dilution", format!("{prefix}{}{real}", p(2000))),
+            ("sandwich", format!("x {prefix}{}{real}{} y", p(k), p(2000))),
+        ]
+    }
+
+    #[test]
+    fn sa8_f1_every_overlap_and_dilution_probe_is_caught_both_ways() {
+        for (provider, real, prefix, k, pad) in F1_CASES {
+            for (shape, hay) in f1_probes(prefix, real, *k, *pad) {
+                let hits = detect(&hay);
+                assert!(
+                    hits.iter()
+                        .any(|h| h.provider == *provider && h.matched_text.contains(real)),
+                    "{provider}/{shape}: inbound missed the real token; got {:?}",
+                    hits.iter().map(|h| &h.provider).collect::<Vec<_>>()
+                );
+                let out = sanitize_output(&hay);
+                assert!(
+                    !out.contains(real),
+                    "{provider}/{shape}: real token survived outbound redaction"
+                );
+                assert!(
+                    out.contains(&format!("<redacted:{provider}>")),
+                    "{provider}/{shape}: no redaction marker"
+                );
+                for h in &hits {
+                    assert!(
+                        !out.contains(&h.matched_text),
+                        "{provider}/{shape}: detected text echoed back"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sa8_f1_the_legacy_redactor_leaked_these_and_the_selector_does_not() {
+        // The honest counterpart of the byte-identity test: on these shapes
+        // the outbound bytes CHANGE, and they change from leaking to redacted.
+        let mut diverged = 0;
+        for (provider, real, prefix, k, pad) in F1_CASES {
+            for (shape, hay) in f1_probes(prefix, real, *k, *pad) {
+                let new = sanitize_output(&hay);
+                assert!(!new.contains(real), "{provider}/{shape} leaks: {new}");
+                if legacy_sanitize_output(&hay).contains(real) {
+                    diverged += 1;
+                }
+            }
+        }
+        // Validator shapes: 6 dilution + 5 overlap leaks at 23347f5, plus the
+        // pre-dilution and sandwich variants of the unbounded providers.
+        assert!(
+            diverged >= 11,
+            "expected the legacy redactor to leak on >= 11 probes, got {diverged}"
+        );
+    }
+
+    #[test]
+    fn sa8_f1_lone_low_entropy_decoys_of_unbounded_patterns_stay_undetected() {
+        // Guard: the window gate must not flag a decoy that is low-entropy
+        // EVERYWHERE, however long.
+        for (provider, _real, prefix, _k, pad) in F1_CASES {
+            for n in [16usize, 60, 500, 5000] {
+                let decoy = format!("{prefix}{}", pad.to_string().repeat(n));
+                assert!(
+                    detect(&decoy).is_empty(),
+                    "{provider}: lone decoy of {n} pad chars reported"
+                );
+                assert_eq!(sanitize_output(&decoy), decoy, "{provider}: decoy mangled");
+            }
+        }
+    }
+
+    #[test]
+    fn entropy_windows_are_the_patterns_minimum_length() {
+        // A minimal accepted string per windowed provider: it must match the
+        // pattern exactly, have the declared length, and stop matching once
+        // its last character is dropped.
+        let minimal: &[(&str, String)] = &[
+            ("pypi_token", format!("pypi-AgEI{}", "x".repeat(30))),
+            (
+                "aws_secret_env",
+                format!("aws_secret_access_key={}", "x".repeat(40)),
+            ),
+            ("anthropic_key", format!("sk-ant-{}", "x".repeat(60))),
+            ("openai_key", format!("sk-{}", "x".repeat(48))),
+            ("slack_token", format!("xoxb-{}", "x".repeat(10))),
+            ("stripe_secret_key", format!("sk_live_{}", "x".repeat(24))),
+            ("gitlab_pat", format!("glpat-{}", "x".repeat(20))),
+            ("google_oauth_token", format!("ya29.{}", "x".repeat(20))),
+            ("jwt", format!("eyJ{0}.{0}.{0}", "x".repeat(8))),
+        ];
+        assert_eq!(minimal.len(), patterns::ENTROPY_WINDOWS.len());
+        for (provider, w) in patterns::ENTROPY_WINDOWS {
+            let (_, src) = patterns::PROVIDER_PATTERNS
+                .iter()
+                .find(|(p, _)| p == provider)
+                .unwrap_or_else(|| panic!("window for unknown provider {provider}"));
+            let full = Regex::new(&format!("^(?:{src})$")).unwrap();
+            let (_, example) = minimal.iter().find(|(p, _)| p == provider).unwrap();
+            assert_eq!(example.len(), *w, "{provider}: window != minimum length");
+            assert!(
+                full.is_match(example),
+                "{provider}: minimal example rejected"
+            );
+            assert!(
+                !full.is_match(&example[..example.len() - 1]),
+                "{provider}: a shorter string still matches — window too large"
+            );
+        }
+    }
+
+    #[test]
+    fn every_unbounded_pattern_has_an_entropy_window() {
+        for (provider, src) in patterns::PROVIDER_PATTERNS {
+            if patterns::ALWAYS_REDACT_PROVIDERS.contains(provider) {
+                continue;
+            }
+            let unbounded = src.contains(",}") || src.contains('*') || src.contains('+');
+            let windowed = patterns::ENTROPY_WINDOWS.iter().any(|(p, _)| p == provider);
+            assert_eq!(
+                unbounded, windowed,
+                "{provider}: unbounded quantifier <=> ENTROPY_WINDOWS entry"
+            );
+        }
+    }
+
+    #[test]
+    fn max_window_entropy_agrees_with_brute_force() {
+        let alphabet = b"aaaaaaaaaaaabbbbcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789-_";
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..500 {
+            let w = (next() % 60 + 8) as usize;
+            let len = w + (next() % 200) as usize + 1;
+            let span = match next() % 4 {
+                0 => alphabet.len(),
+                s => 4 + s as usize * 4,
+            };
+            let bytes: Vec<u8> = (0..len).map(|_| alphabet[next() as usize % span]).collect();
+            let brute = (0..=len - w)
+                .map(|i| bytes_entropy(&bytes[i..i + w]))
+                .fold(0.0_f64, f64::max);
+            let got = max_window_entropy(&bytes, w);
+            assert_eq!(
+                got >= ENTROPY_THRESHOLD,
+                brute >= ENTROPY_THRESHOLD,
+                "gate decision diverged: got {got} brute {brute}"
+            );
+            if brute < ENTROPY_THRESHOLD {
+                assert!((got - brute).abs() < 1e-6, "got {got} brute {brute}");
+            }
+        }
+    }
+
+    #[test]
+    fn scan_budget_exhaustion_fails_closed_and_stays_fast() {
+        // Thousands of anthropic prefixes inside ONE long low-entropy run: the
+        // next-char retry would re-scan the run from every prefix. The budget
+        // stops that and the selector fails CLOSED — a real key appended
+        // after the pathological region is still redacted.
+        let real = F1_CASES[0].1;
+        let hay = format!("{} {real} tail", "sk-ant-".repeat(40_000));
+        let t = std::time::Instant::now();
+        let hits = detect(&hay);
+        let out = sanitize_output(&hay);
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(20),
+            "selector went quadratic: {:?}",
+            t.elapsed()
+        );
+        assert!(hits.iter().any(|h| h.matched_text.contains(real)));
+        assert!(!out.contains(real), "real key leaked past the budget");
+        assert!(out.ends_with(" tail"), "text outside matches mangled");
+    }
+
+    #[test]
+    fn large_benign_input_is_not_flagged_by_the_budget() {
+        let hay = "the quick brown fox jumps over the lazy dog sk- xoxb ".repeat(20_000);
+        assert!(detect(&hay).is_empty());
+        assert_eq!(sanitize_output(&hay), hay);
     }
 }
