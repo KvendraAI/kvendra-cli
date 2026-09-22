@@ -75,7 +75,7 @@ printf '%s\n' "$SMOKE_PASSWORD" | \
   || fail T2 "secret add failed" 30
 
 ALLOWLIST_FILE="$TMPHOME/allow-ok.yaml"
-cat >"$ALLOWLIST_FILE" <<'YAML'
+cat >"$ALLOWLIST_FILE" <<YAML
 profile_id: smoke-git-readonly
 secret:
   type: github_pat
@@ -83,8 +83,13 @@ allowlist:
   primitives:
     - name: kvendra.git
       operations:
+        # 0.6.5: clone is destructive (writes a local tree under the
+        # credential) and needs an explicit opt-in plus declared local_roots.
         - clone:
             repos: ["github.com/KvendraAI/kvendra-cli"]
+            destructive: true
+            accept_destructive: true
+            local_roots: ["${TMPHOME}/clones"]
         - pull:
             repos: ["github.com/KvendraAI/kvendra-cli"]
             refs: ["refs/heads/main"]
@@ -106,6 +111,13 @@ echo "$T2_VALIDATE_OUT" | grep -q "VALID" \
 T2_GETMETA_OUT=$("$KVENDRA_BIN" secret get-meta "$SMOKE_PROFILE_OK")
 echo "$T2_GETMETA_OUT" | grep -q "allowlist_hmac_hex" \
   || fail T2 "HMAC sidecar missing in profile meta" 34
+
+# 0.6.5: the approval gate now applies to clone. CI runners have no
+# presence dialog, so sign `silent` into the config (the env var alone can
+# only tighten the signed policy since 0.6.5).
+mkdir -p "$TMPHOME/clones"
+KVENDRA_PASSWORD="$SMOKE_PASSWORD" "$KVENDRA_BIN" config approval set silent >/dev/null \
+  || fail T2 "config approval set silent failed" 35
 
 # ---------- T3: mcp serve + JSON-RPC roundtrip ----------
 phase T3 "kvendra mcp serve — initialize/tools/list/tools/call shape MCP real"
@@ -139,7 +151,7 @@ done
 echo "$RESP" | grep -q '\[UNSAFE\]' || fail T3 "unsafe escape hatch not flagged" 44
 
 # tools/call — SHAPE MCP REAL ENVELOPE (PAT-KVD-004 critical)
-send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"kvendra.git","arguments":{"profile_id":"smoke-git-readonly","operation":"clone","args":{"url":"github.com/KvendraAI/kvendra-cli"}}}}'
+send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"kvendra.git","arguments":{"profile_id":"smoke-git-readonly","operation":"clone","args":{"url":"github.com/KvendraAI/kvendra-cli","dst":"'"$TMPHOME"'/clones/kvendra-cli"}}}}'
 RESP="$(recv)"
 echo "$RESP" | grep -q '"id":3' || fail T3 "tools/call id mismatch" 45
 if echo "$RESP" | grep -qiE 'allowlist[ _]?violation'; then
