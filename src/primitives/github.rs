@@ -48,7 +48,7 @@ pub async fn execute(args: &Value, secret: Option<&SecretPlaintext>) -> KvendraR
 }
 
 async fn read_repo(client: &reqwest::Client, token: &str, op_args: &Value) -> KvendraResult<Value> {
-    let (owner, repo) = parse_owner_repo(op_args)?;
+    let (owner, repo) = parse_owner_repo("read_repo", op_args)?;
     let url = format!("{GH_API}/repos/{owner}/{repo}");
     let resp = client
         .get(&url)
@@ -60,29 +60,90 @@ async fn read_repo(client: &reqwest::Client, token: &str, op_args: &Value) -> Kv
     finalize("read_repo", resp).await
 }
 
-fn parse_owner_repo(op_args: &Value) -> KvendraResult<(String, String)> {
-    if let Some(repo) = op_args.get("repo").and_then(Value::as_str) {
-        // Accept `owner/repo` or `github.com/owner/repo`.
-        let trimmed = repo.trim_start_matches("github.com/");
-        let mut parts = trimmed.splitn(2, '/');
-        let owner = parts
-            .next()
-            .ok_or_else(|| KvendraError::InvalidArgs("repo must be `owner/repo`".into()))?;
-        let r = parts
-            .next()
-            .ok_or_else(|| KvendraError::InvalidArgs("repo must be `owner/repo`".into()))?;
-        return Ok((owner.to_string(), r.to_string()));
+/// The repository a `kvendra.github` call targets, as resolved by
+/// [`resolve_target`]. Both halves are validated path components.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubTarget {
+    pub owner: String,
+    pub name: String,
+}
+
+/// Why [`resolve_target`] could not produce a target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GithubTargetError {
+    /// No target field the primitive reads is present.
+    Missing,
+    /// A target field is present but malformed (shape or charset).
+    Invalid(String),
+}
+
+impl std::fmt::Display for GithubTargetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => f.write_str("no `repo` and no `owner` + `repo_name` in the call args"),
+            Self::Invalid(m) => f.write_str(m),
+        }
     }
-    let owner = op_args
-        .get("owner")
-        .and_then(Value::as_str)
-        .ok_or_else(|| KvendraError::InvalidArgs("owner required".into()))?;
-    let r = op_args
-        .get("repo_name")
-        .or_else(|| op_args.get("name"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| KvendraError::InvalidArgs("repo_name required".into()))?;
-    Ok((owner.to_string(), r.to_string()))
+}
+
+/// THE resolver of the repository a `kvendra.github` call targets — shared by
+/// the primitive (every endpoint builder in this module, via
+/// [`parse_owner_repo`]) and the allowlist enforcer (`repos`/`repo`/`org`), so
+/// the operand the policy authorizes is by construction the operand the API
+/// call hits (ISSUE-KVD-CLI-DDFB49, PAT-KVD-CLI-C18A74).
+///
+/// Precedence (unchanged from the pre-fix primitive):
+/// 1. `repo`: `owner/name` or `github.com/owner/name` — exactly two segments.
+/// 2. `owner` + `repo_name`, or `owner` + `name` — except on `release`, where
+///    `name` is the release TITLE the endpoint sends, never a repo alias.
+///
+/// `url` is NOT a target field (no endpoint is built from it), so it is
+/// ignored here and can no longer act as a decoy for the enforcer.
+///
+/// Both halves must pass [`crate::path_id::is_safe_path_component`]: they are
+/// interpolated into the `api.github.com/repos/{owner}/{name}` path, so `/`,
+/// `..`, `%`, `?` or `#` would re-target the request.
+pub fn resolve_target(operation: &str, op_args: &Value) -> Result<GithubTarget, GithubTargetError> {
+    let (owner, name) = if let Some(raw) = op_args.get("repo") {
+        let repo = raw.as_str().ok_or_else(|| {
+            GithubTargetError::Invalid("`repo` must be a string `owner/name`".into())
+        })?;
+        let trimmed = repo.strip_prefix("github.com/").unwrap_or(repo);
+        trimmed.split_once('/').ok_or_else(|| {
+            GithubTargetError::Invalid(format!("repo '{repo}' must be `owner/name`"))
+        })?
+    } else {
+        let Some(owner) = op_args.get("owner").and_then(Value::as_str) else {
+            return Err(GithubTargetError::Missing);
+        };
+        let name_field = match op_args.get("repo_name") {
+            Some(v) => Some(v),
+            None if operation == "release" => None,
+            None => op_args.get("name"),
+        };
+        let Some(name) = name_field.and_then(Value::as_str) else {
+            return Err(GithubTargetError::Missing);
+        };
+        (owner, name)
+    };
+    for (half, v) in [("owner", owner), ("repository name", name)] {
+        if !crate::path_id::is_safe_path_component(v) {
+            return Err(GithubTargetError::Invalid(format!(
+                "{half} '{v}' is not a valid GitHub identifier (allowed: [A-Za-z0-9._-], \
+                 no `..`, no leading `.`)"
+            )));
+        }
+    }
+    Ok(GithubTarget {
+        owner: owner.to_string(),
+        name: name.to_string(),
+    })
+}
+
+fn parse_owner_repo(operation: &str, op_args: &Value) -> KvendraResult<(String, String)> {
+    resolve_target(operation, op_args)
+        .map(|t| (t.owner, t.name))
+        .map_err(|e| KvendraError::InvalidArgs(format!("github.{operation}: {e}")))
 }
 
 async fn update_repo(
@@ -90,7 +151,7 @@ async fn update_repo(
     token: &str,
     op_args: &Value,
 ) -> KvendraResult<Value> {
-    let (owner, repo) = parse_owner_repo(op_args)?;
+    let (owner, repo) = parse_owner_repo("update_repo", op_args)?;
     let mut body = serde_json::Map::new();
     for field in ["description", "homepage", "private", "default_branch"] {
         if let Some(v) = op_args.get(field) {
@@ -110,7 +171,7 @@ async fn update_repo(
 }
 
 async fn release(client: &reqwest::Client, token: &str, op_args: &Value) -> KvendraResult<Value> {
-    let (owner, repo) = parse_owner_repo(op_args)?;
+    let (owner, repo) = parse_owner_repo("release", op_args)?;
     let tag = op_args
         .get("tag_name")
         .and_then(Value::as_str)
@@ -162,7 +223,7 @@ async fn read_issue(
     token: &str,
     op_args: &Value,
 ) -> KvendraResult<Value> {
-    let (owner, repo) = parse_owner_repo(op_args)?;
+    let (owner, repo) = parse_owner_repo("read_issue", op_args)?;
     let number = op_args
         .get("number")
         .and_then(Value::as_u64)
@@ -182,7 +243,7 @@ async fn update_issue(
     token: &str,
     op_args: &Value,
 ) -> KvendraResult<Value> {
-    let (owner, repo) = parse_owner_repo(op_args)?;
+    let (owner, repo) = parse_owner_repo("update_issue", op_args)?;
     let number = op_args
         .get("number")
         .and_then(Value::as_u64)
@@ -209,7 +270,7 @@ async fn create_issue(
     token: &str,
     op_args: &Value,
 ) -> KvendraResult<Value> {
-    let (owner, repo) = parse_owner_repo(op_args)?;
+    let (owner, repo) = parse_owner_repo("create_issue", op_args)?;
     let title = op_args
         .get("title")
         .and_then(Value::as_str)
@@ -246,7 +307,7 @@ async fn list_issues(
     token: &str,
     op_args: &Value,
 ) -> KvendraResult<Value> {
-    let (owner, repo) = parse_owner_repo(op_args)?;
+    let (owner, repo) = parse_owner_repo("list_issues", op_args)?;
 
     let state: &str = op_args
         .get("state")
@@ -344,7 +405,7 @@ async fn add_topics(
     // endpoint REST de GitHub (`PUT /repos/{owner}/{repo}/topics`) reemplaza
     // la lista entera; lo combinamos con un GET previo y mezcla unique para
     // honrar la semántica del nombre del primitive.
-    let (owner, repo) = parse_owner_repo(op_args)?;
+    let (owner, repo) = parse_owner_repo("add_topics", op_args)?;
     let new_topics = op_args
         .get("topics")
         .and_then(Value::as_array)

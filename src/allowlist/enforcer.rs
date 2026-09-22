@@ -44,6 +44,10 @@
 use crate::allowlist::dsl::{ArgvConstraint, OperationConstraints, ProfileSpec};
 use crate::allowlist::validator::is_expired;
 use crate::error::{KvendraError, KvendraResult};
+use crate::primitives::github::{GithubTargetError, resolve_target as github_target};
+use crate::primitives::local_operand::{
+    S3Operand, classify_s3_operand, is_within_roots, local_operands,
+};
 use regex::Regex;
 use serde_json::Value;
 
@@ -209,9 +213,9 @@ fn check_args(
     if let Some(buckets) = &c.buckets {
         // Multiple shapes accepted:
         // - `bucket` field — bare bucket name (always validated).
-        // - `src` / `dst` fields — only validated when they look like s3
-        //   URIs (`s3://...`). A local path like `./build` is NOT a bucket
-        //   reference and is left to the primitive layer.
+        // - `src` / `dst` fields — validated when the shared classifier says
+        //   they are `s3://` remotes. Local paths are bounded by the
+        //   `local_roots` block below; malformed remotes are denied there.
         if let Some(bare) = inner.get("bucket").and_then(Value::as_str)
             && !buckets.iter().any(|pat| glob_match(pat, bare))
         {
@@ -221,11 +225,43 @@ fn check_args(
         }
         for key in ["src", "dst"] {
             if let Some(cand) = inner.get(key).and_then(Value::as_str)
-                && let Some(name) = extract_bucket_from_s3_uri(cand)
+                && let Ok(S3Operand::Remote { bucket: name }) = classify_s3_operand(cand)
                 && !buckets.iter().any(|pat| glob_match(pat, name))
             {
                 return Err(KvendraError::AllowlistViolation(format!(
                     "{primitive}.{operation}: bucket '{name}' not allowed"
+                )));
+            }
+        }
+    }
+
+    // local_roots (D9 — ISSUE-KVD-CLI-9D5CF5). The LOCAL operand of a brokered
+    // transfer (`aws.s3_sync`/`s3_cp` src/dst, `git.clone` dst, `pypi.upload`
+    // dist) used to be unconstrained: the bucket rule above short-circuits on
+    // a local path, so any owner-readable directory could be synced into an
+    // allowlisted bucket with the owner's keys. Every local operand must now
+    // resolve (canonically) inside a declared root. FAIL-CLOSED: an operand
+    // that cannot be determined, or a transfer with no `local_roots`, is a
+    // deny. Evaluated after `buckets` so a foreign bucket keeps being reported
+    // by name.
+    let locals = local_operands(primitive, operation, &inner).map_err(|e| {
+        KvendraError::AllowlistViolation(format!(
+            "{primitive}.{operation}: {e} — refusing (fail-closed)"
+        ))
+    })?;
+    if !locals.is_empty() {
+        let roots = c.local_roots.as_deref().unwrap_or_default();
+        for (field, path) in locals {
+            if roots.is_empty() {
+                return Err(KvendraError::AllowlistViolation(format!(
+                    "{primitive}.{operation}: local {field} '{path}' but no `local_roots` \
+                     declared — refusing (fail-closed)"
+                )));
+            }
+            if !is_within_roots(path, roots) {
+                return Err(KvendraError::AllowlistViolation(format!(
+                    "{primitive}.{operation}: local {field} '{path}' is outside every declared \
+                     local root"
                 )));
             }
         }
@@ -385,86 +421,97 @@ fn check_args(
         }
     }
 
-    // org (GitHub organization scope).
-    if let Some(allowed) = &c.org {
-        // Resolve from `owner` directly or by extracting from `repo`.
-        let owner = inner
-            .get("owner")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| {
-                inner
-                    .get("repo")
-                    .and_then(Value::as_str)
-                    .and_then(extract_owner_from_repo)
-                    .map(str::to_string)
-            });
-        if let Some(o) = owner.as_deref()
-            && !allowed.iter().any(|pat| glob_match(pat, o))
-        {
-            return Err(KvendraError::AllowlistViolation(format!(
-                "{primitive}.{operation}: org '{o}' not allowed"
-            )));
-        }
-    }
-
-    // repos UNION repo (D1 — any-match across both lists).
+    // Target repository — resolved ONCE, by the same code the primitive uses,
+    // and shared by the `org` and `repos` checks below.
     //
-    // For `kvendra.github` the target is `args.repo` (or `args.url`). For
-    // `kvendra.git` push/pull/tag/commit there is NO `repo`/`url` field — the
-    // target is the `remote` (a URL, or a name resolved from the `cwd`'s git
-    // config). ISSUE-KVD-CLI-B78ED5 finding **N7**: the enforcer only looked at
-    // `repo`/`url`, so for git ops the `repos` constraint was silently SKIPPED
-    // (a false-green suite hid it by injecting a synthetic `repo` field that the
-    // real `kvendra.git` primitive never sends). An agent could therefore push
-    // any local checkout to any repository — or, with `remote` set to an
-    // attacker URL, exfiltrate code and the credential — with the owner's token.
+    // - `kvendra.github`: `primitives::github::resolve_target`, the resolver
+    //   every github endpoint builder calls (ISSUE-KVD-CLI-DDFB49). Pre-fix the
+    //   enforcer read only `repo`/`url` while the primitive also accepted
+    //   `owner`+`repo_name`/`name` and never read `url`: omission and `url`
+    //   decoys passed a `repos` scope, and the org check took the owner from
+    //   the wrong segment of `owner/name`.
+    // - `kvendra.git`: push/pull/tag/commit carry NO `repo`/`url` field — the
+    //   target is the `remote` (a URL, or a name resolved from the `cwd`'s git
+    //   config). ISSUE-KVD-CLI-B78ED5 finding **N7**: the enforcer only looked
+    //   at `repo`/`url`, so for git ops the `repos` constraint was silently
+    //   SKIPPED and an agent could push any checkout to any repository.
+    // - anything else: the `repo` (or `url`) field.
+    //
+    // Every candidate is host-normalized (`host/owner/name`); patterns are too,
+    // so `Owner/*` and `github.com/Owner/*` are equivalent while an attacker
+    // host never matches a github.com pattern.
     let is_git = primitive == "kvendra.git";
-    let repo_input: Option<String> = if is_git {
+    let is_github = primitive == "kvendra.github";
+    let needs_target = c.org.is_some() || c.repos.is_some() || c.repo.is_some();
+    let target: Result<String, String> = if !needs_target {
+        Err(String::new())
+    } else if is_github {
+        match github_target(operation, &inner) {
+            Ok(t) => Ok(format!("github.com/{}/{}", t.owner, t.name)),
+            Err(GithubTargetError::Invalid(m)) => {
+                return Err(KvendraError::AllowlistViolation(format!(
+                    "{primitive}.{operation}: {m} — refusing (fail-closed)"
+                )));
+            }
+            Err(e @ GithubTargetError::Missing) => Err(e.to_string()),
+        }
+    } else if is_git {
         git_target_repo(&inner, operation)
+            .map(|r| normalize_repo_host(&r))
+            .ok_or_else(|| "no url and no resolvable remote in cwd".to_string())
     } else {
         inner
             .get("repo")
             .or_else(|| inner.get("url"))
             .and_then(Value::as_str)
-            .map(extract_repo_canonical)
+            .map(|r| normalize_repo_host(&extract_repo_canonical(r)))
+            .ok_or_else(|| "no `repo`/`url` field in the call args".to_string())
     };
+    // Fail closed for EVERY primitive: a scope constraint with an
+    // undeterminable target is a deny, never a skip (N7 was git-only; the
+    // early `Ok(())` it left for other primitives also skipped every check
+    // below — cwd_pattern, args_constraints, env_vars_to_inject).
+    let require_target = || {
+        target.as_deref().map_err(|why| {
+            KvendraError::AllowlistViolation(format!(
+                "{primitive}.{operation}: cannot determine the target repository ({why}) \
+                 — refusing (fail-closed)"
+            ))
+        })
+    };
+
+    // org (GitHub organization scope) — the OWNER half of the resolved
+    // `host/owner/name` target.
+    if let Some(allowed) = &c.org {
+        let repo = require_target()?;
+        let Some(o) = extract_owner_from_repo(repo) else {
+            return Err(KvendraError::AllowlistViolation(format!(
+                "{primitive}.{operation}: cannot determine the target owner from '{repo}' \
+                 — refusing (fail-closed)"
+            )));
+        };
+        if !allowed.iter().any(|pat| glob_match(pat, o)) {
+            return Err(KvendraError::AllowlistViolation(format!(
+                "{primitive}.{operation}: org '{o}' not allowed (target '{repo}')"
+            )));
+        }
+    }
+
+    // repos UNION repo (D1 — any-match across both lists).
     if c.repos.is_some() || c.repo.is_some() {
-        let Some(repo) = repo_input.as_deref() else {
-            // Fail closed for git: a `repos` constraint with an undeterminable
-            // target is a deny, never a skip (N7). Non-git callers always carry
-            // the repo, so absence there keeps the prior semantics.
-            if is_git {
-                return Err(KvendraError::AllowlistViolation(format!(
-                    "{primitive}.{operation}: cannot determine the target repository \
-                     (no url and no resolvable remote in cwd) — refusing (fail-closed)"
-                )));
-            }
-            return Ok(());
-        };
-        // Host-normalize so `Owner/Name` patterns compare against a URL-derived
-        // `host/Owner/Name` for git (and keep the host in the comparison so an
-        // attacker-host repo does not match a github.com pattern).
-        let cand = if is_git {
-            normalize_repo_host(repo)
-        } else {
-            repo.to_string()
-        };
+        let cand = require_target()?;
         let matches_pat = |pats: &Option<Vec<String>>| {
-            pats.as_ref().is_some_and(|ps| {
-                ps.iter().any(|p| {
-                    let pat = if is_git {
-                        normalize_repo_host(p)
-                    } else {
-                        p.clone()
-                    };
-                    glob_match(&pat, &cand)
-                })
-            })
+            pats.as_ref()
+                .is_some_and(|ps| ps.iter().any(|p| glob_match(&normalize_repo_host(p), cand)))
         };
         if !matches_pat(&c.repos) && !matches_pat(&c.repo) {
+            let shown = if is_github {
+                cand.strip_prefix("github.com/").unwrap_or(cand)
+            } else {
+                cand
+            };
             return Err(KvendraError::AllowlistViolation(format!(
-                "{primitive}.{operation}: repo '{repo}' not allowed"
+                "{primitive}.{operation}: repo '{shown}' not allowed"
             )));
         }
     }
@@ -588,16 +635,10 @@ fn regex_full_match(pattern: &str, candidate: &str) -> bool {
     Regex::new(&normalized).is_ok_and(|re| re.is_match(candidate))
 }
 
-/// Extract the bucket name from an `s3://NAME/...` URI. Returns `None` for
-/// any other shape (caller may treat the input as a bare bucket name).
-fn extract_bucket_from_s3_uri(uri: &str) -> Option<&str> {
-    let rest = uri.strip_prefix("s3://")?;
-    let end = rest.find('/').unwrap_or(rest.len());
-    if end == 0 { None } else { Some(&rest[..end]) }
-}
-
 /// Extract the owner segment from `<host>/<owner>/<repo>` strings, e.g.
-/// `github.com/KvendraAI/kvendra-cli` → `Some("KvendraAI")`.
+/// `github.com/KvendraAI/kvendra-cli` → `Some("KvendraAI")`. Only valid on a
+/// host-normalized value ([`normalize_repo_host`]): on a bare `owner/name`
+/// it would return the NAME (ISSUE-KVD-CLI-DDFB49).
 fn extract_owner_from_repo(repo: &str) -> Option<&str> {
     let mut parts = repo.split('/');
     let _host = parts.next()?;
@@ -614,7 +655,7 @@ fn extract_owner_from_repo(repo: &str) -> Option<&str> {
 /// - `git@github.com:Org/Repo.git`        → `github.com/Org/Repo`
 /// - `github.com/Org/Repo`                → `github.com/Org/Repo` (passthrough)
 ///
-/// Pattern parallel to `extract_bucket_from_s3_uri` above. Closes the
+/// Pattern parallel to `local_operand::classify_s3_operand`. Closes the
 /// permissive-on-absence gap where `clone` calls with `args.url` bypassed
 /// the `repos:` constraint (ISSUE-KVD-CLI-043).
 fn extract_repo_canonical(input: &str) -> String {
@@ -993,6 +1034,14 @@ allowlist:
 
     // ---- TIER 1 ------------------------------------------------------
 
+    /// Crate root = the cwd `cargo test` runs unit tests in, so a relative
+    /// local operand like `./build` resolves inside it.
+    const CRATE_ROOT: &str = env!("CARGO_MANIFEST_DIR");
+
+    // Re-authored for ISSUE-KVD-CLI-9D5CF5: these bucket tests pass a LOCAL
+    // `src: "./build"`, which is now denied unless it resolves inside a
+    // declared `local_roots` (fail-closed). The crate root is declared so the
+    // tests keep exercising the bucket rule they were written for.
     fn aws_s3_sync_with_buckets(buckets: &[&str]) -> ProfileSpec {
         let list = buckets
             .iter()
@@ -1010,6 +1059,7 @@ allowlist:
       operations:
         - s3_sync:
             buckets: [{list}]
+            local_roots: ["{CRATE_ROOT}"]
             accept_destructive: true
 "#
         ))
@@ -1667,8 +1717,16 @@ allowlist:
             org: ["KvendraAI"]
 "#,
         );
-        let args = env_args(serde_json::json!({ "owner": "KvendraAI", "repo": "kvendra-cli" }));
+        // Re-authored for ISSUE-KVD-CLI-DDFB49: the old payload
+        // `{owner, repo: "kvendra-cli"}` is a shape the primitive REJECTS
+        // (`repo` wins and has no `/`), so the enforcer — now driven by the
+        // same resolver — denies it too. `owner` + `repo_name` is the real
+        // owner-form the primitive parses.
+        let args =
+            env_args(serde_json::json!({ "owner": "KvendraAI", "repo_name": "kvendra-cli" }));
         assert!(check(&s, "kvendra.github", "update_repo", &args).is_ok());
+        let args = env_args(serde_json::json!({ "owner": "KvendraAI", "repo": "kvendra-cli" }));
+        assert!(check(&s, "kvendra.github", "update_repo", &args).is_err());
     }
 
     #[test]
@@ -1690,10 +1748,12 @@ allowlist:
         assert!(check(&s, "kvendra.github", "update_repo", &args).is_err());
     }
 
-    #[test]
-    fn repo_alias_unions_with_repos_happy() {
-        // D1 — `repo` (singular) alias unions with `repos`.
-        let s = spec_with(
+    // Re-authored for ISSUE-KVD-CLI-9D5CF5: a `git clone` now needs a `dst`
+    // inside `local_roots` (fail-closed otherwise), so every clone fixture
+    // below declares the crate root and passes an in-root `dst` — keeping the
+    // tests about the `repos` rule they were written for.
+    fn clone_spec(constraints: &str) -> ProfileSpec {
+        spec_with(&format!(
             r#"
 profile_id: x
 secret:
@@ -1703,35 +1763,40 @@ allowlist:
     - name: kvendra.git
       operations:
         - clone:
-            repo: ["github.com/Foo/legacy"]
-            repos: ["github.com/Foo/*"]
-"#,
+{constraints}
+            local_roots: ["{CRATE_ROOT}"]
+"#
+        ))
+    }
+
+    fn clone_args(mut v: serde_json::Value) -> serde_json::Value {
+        v["dst"] = serde_json::json!("./kvendra-clone-fixture");
+        env_args(v)
+    }
+
+    #[test]
+    fn repo_alias_unions_with_repos_happy() {
+        // D1 — `repo` (singular) alias unions with `repos`.
+        let s = clone_spec(
+            r#"            repo: ["github.com/Foo/legacy"]
+            repos: ["github.com/Foo/*"]"#,
         );
-        let ok_repos = env_args(serde_json::json!({ "repo": "github.com/Foo/bar" }));
+        let ok_repos = clone_args(serde_json::json!({ "repo": "github.com/Foo/bar" }));
         assert!(check(&s, "kvendra.git", "clone", &ok_repos).is_ok());
 
-        let ok_alias = env_args(serde_json::json!({ "repo": "github.com/Foo/legacy" }));
+        let ok_alias = clone_args(serde_json::json!({ "repo": "github.com/Foo/legacy" }));
         assert!(check(&s, "kvendra.git", "clone", &ok_alias).is_ok());
     }
 
     #[test]
     fn repo_alias_blocks_when_neither_matches() {
-        let s = spec_with(
-            r#"
-profile_id: x
-secret:
-  type: t
-allowlist:
-  primitives:
-    - name: kvendra.git
-      operations:
-        - clone:
-            repo: ["github.com/Foo/legacy"]
-            repos: ["github.com/Foo/*"]
-"#,
+        let s = clone_spec(
+            r#"            repo: ["github.com/Foo/legacy"]
+            repos: ["github.com/Foo/*"]"#,
         );
-        let bad = env_args(serde_json::json!({ "repo": "github.com/EvilCorp/x" }));
-        assert!(check(&s, "kvendra.git", "clone", &bad).is_err());
+        let bad = clone_args(serde_json::json!({ "repo": "github.com/EvilCorp/x" }));
+        let err = check(&s, "kvendra.git", "clone", &bad).unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "{err}");
     }
 
     // -----------------------------------------------------------------
@@ -1743,25 +1808,13 @@ allowlist:
 
     #[test]
     fn clone_with_args_url_matches_repos_pattern_happy() {
-        let s = spec_with(
-            r#"
-profile_id: x
-secret:
-  type: t
-allowlist:
-  primitives:
-    - name: kvendra.git
-      operations:
-        - clone:
-            repos: ["github.com/KvendraAI/*"]
-"#,
-        );
-        let ok = env_args(serde_json::json!({
+        let s = clone_spec(r#"            repos: ["github.com/KvendraAI/*"]"#);
+        let ok = clone_args(serde_json::json!({
             "url": "https://github.com/KvendraAI/kvendra-cli"
         }));
         assert!(check(&s, "kvendra.git", "clone", &ok).is_ok());
 
-        let ok_dotgit = env_args(serde_json::json!({
+        let ok_dotgit = clone_args(serde_json::json!({
             "url": "https://github.com/KvendraAI/kvendra-cli.git"
         }));
         assert!(check(&s, "kvendra.git", "clone", &ok_dotgit).is_ok());
@@ -1769,23 +1822,12 @@ allowlist:
 
     #[test]
     fn clone_with_args_url_violates_repos_pattern_rejection() {
-        let s = spec_with(
-            r#"
-profile_id: x
-secret:
-  type: t
-allowlist:
-  primitives:
-    - name: kvendra.git
-      operations:
-        - clone:
-            repos: ["github.com/KvendraAI/*"]
-"#,
-        );
-        let bad = env_args(serde_json::json!({
+        let s = clone_spec(r#"            repos: ["github.com/KvendraAI/*"]"#);
+        let bad = clone_args(serde_json::json!({
             "url": "https://github.com/EvilCorp/malware"
         }));
-        assert!(check(&s, "kvendra.git", "clone", &bad).is_err());
+        let err = check(&s, "kvendra.git", "clone", &bad).unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "{err}");
     }
 
     #[test]
@@ -2038,7 +2080,9 @@ allowlist:
 
     #[test]
     fn missing_inner_args_passes_with_no_constraints() {
-        // No constraints declared → empty inner is fine.
+        // No constraints declared → empty inner is fine. Re-authored on
+        // `pull` (ISSUE-KVD-CLI-9D5CF5): `clone` has a local operand (`dst`)
+        // and now fails closed without one — covered by the next assertion.
         let s = spec_with(
             r#"
 profile_id: x
@@ -2048,11 +2092,14 @@ allowlist:
   primitives:
     - name: kvendra.git
       operations:
+        - pull: {}
         - clone: {}
 "#,
         );
+        let args = serde_json::json!({ "profile_id": "x", "operation": "pull" });
+        assert!(check(&s, "kvendra.git", "pull", &args).is_ok());
         let args = serde_json::json!({ "profile_id": "x", "operation": "clone" });
-        assert!(check(&s, "kvendra.git", "clone", &args).is_ok());
+        assert!(check(&s, "kvendra.git", "clone", &args).is_err());
     }
 
     #[test]
@@ -2062,22 +2109,15 @@ allowlist:
         // (ISSUE-KVD-CLI-B78ED5 N7). This corrects the previous permissive-on-
         // absence semantics (PAT-KVD-CLI-003 anti-pattern) that let the repo
         // constraint be skipped whenever the enforcer could not see a repo.
-        let s = spec_with(
-            r#"
-profile_id: x
-secret:
-  type: t
-allowlist:
-  primitives:
-    - name: kvendra.git
-      operations:
-        - clone:
-            repos: ["github.com/Foo/*"]
-"#,
-        );
-        let args = env_args(serde_json::json!({}));
+        let s = clone_spec(r#"            repos: ["github.com/Foo/*"]"#);
+        let args = clone_args(serde_json::json!({}));
         // Fail-closed: no target repo to validate ⇒ deny, not allow.
-        assert!(check(&s, "kvendra.git", "clone", &args).is_err());
+        let err = check(&s, "kvendra.git", "clone", &args).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot determine the target repository"),
+            "{err}"
+        );
     }
 
     // ---- N7: repo enforcement on the REAL git push shape {cwd, remote, ref} --

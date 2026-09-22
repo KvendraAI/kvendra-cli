@@ -70,6 +70,70 @@ pub fn validate(spec: &ProfileSpec) -> KvendraResult<()> {
     Ok(())
 }
 
+/// Sign-time validation: everything [`validate`] checks PLUS the rules that
+/// must stop a new signature but must NOT brick an already-signed profile at
+/// broker runtime (where [`validate`] runs on every call and a failure denies
+/// every operation of the profile, not just the misconfigured one).
+///
+/// Used by `secret set-allowlist` and `secret validate`.
+///
+/// ISSUE-KVD-CLI-9D5CF5 (D9): every operation with a local operand
+/// ([`crate::primitives::local_operand::LOCAL_OPERAND_OPS`]) must declare
+/// non-empty `local_roots`, each root absolute (the filesystem root `/`
+/// only with `accept_broad_scope: true`); `local_roots` on an operation with
+/// no local operand is refused as an inert constraint. At runtime the
+/// enforcer denies such a call anyway (fail-closed) — this surfaces it to
+/// the owner before signing instead of at first use.
+pub fn validate_for_signing(spec: &ProfileSpec) -> KvendraResult<()> {
+    validate(spec)?;
+    for prim in &spec.allowlist.primitives {
+        for op_map in &prim.operations {
+            for (op_name, c) in op_map {
+                check_local_roots(&prim.name, op_name, c)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_local_roots(primitive: &str, op: &str, c: &OperationConstraints) -> KvendraResult<()> {
+    let needs = crate::primitives::local_operand::has_local_operand(primitive, op);
+    match (&c.local_roots, needs) {
+        (None, false) => Ok(()),
+        (Some(_), false) => Err(KvendraError::AllowlistParse(format!(
+            "{primitive}.{op}: `local_roots` has no effect on this operation (it has no \
+             local filesystem operand) — remove it"
+        ))),
+        (None, true) => Err(KvendraError::AllowlistParse(format!(
+            "{primitive}.{op}: `local_roots` required — this operation moves data between \
+             the local filesystem and a remote with the profile's credential; declare the \
+             absolute directories it may read/write (without it every call is denied)"
+        ))),
+        (Some(roots), true) => {
+            if roots.is_empty() {
+                return Err(KvendraError::AllowlistParse(format!(
+                    "{primitive}.{op}: empty `local_roots` (every call would be denied)"
+                )));
+            }
+            for r in roots {
+                let p = std::path::Path::new(r);
+                if !p.is_absolute() {
+                    return Err(KvendraError::AllowlistParse(format!(
+                        "{primitive}.{op}: `local_roots` entry '{r}' must be an absolute path"
+                    )));
+                }
+                if p.parent().is_none() && !c.accept_broad_scope.unwrap_or(false) {
+                    return Err(KvendraError::AllowlistParse(format!(
+                        "{primitive}.{op}: `local_roots` entry '{r}' is the filesystem root \
+                         — rejected without accept_broad_scope: true"
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 /// REQ-KVD-004 — rechaza la allowlist si contiene operaciones destructive
 /// (según el catálogo canónico OR `destructive: true` declarado por el user)
 /// sin `accept_destructive: true` explícito.

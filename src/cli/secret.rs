@@ -10,7 +10,7 @@
 //!   - `set-allowlist <profile_id> --file PATH`
 
 use crate::allowlist::dsl::OperationConstraints;
-use crate::allowlist::{ProfileSpec, catalog, validate as allowlist_validate};
+use crate::allowlist::{ProfileSpec, catalog, validate_for_signing};
 use crate::config::{Config, kvendra_home};
 use crate::error::{KvendraError, KvendraResult};
 use crate::vault::{Profile, Vault};
@@ -281,7 +281,7 @@ fn set_allowlist(vault: &Vault, home: &Path, args: SetAllowlistArgs) -> KvendraR
             spec.profile_id, args.profile_id
         )));
     }
-    allowlist_validate(&spec)?;
+    validate_for_signing(&spec)?;
 
     // REQ-KVD-007 / ISSUE-018 — `set-allowlist` persists an HMAC of the YAML
     // signed with the `kvendra/allowlist-hmac/v1` HKDF sub-key. The sub-key
@@ -373,7 +373,7 @@ fn print_validation(vault: &Vault, profile_id: &str) -> bool {
     };
 
     let mut issues: Vec<String> = Vec::new();
-    if let Err(e) = allowlist_validate(&spec) {
+    if let Err(e) = validate_for_signing(&spec) {
         issues.push(e.to_string());
     }
     if crate::allowlist::validator::is_expired(&spec) {
@@ -472,6 +472,7 @@ fn format_constraints(c: &crate::allowlist::OperationConstraints) -> String {
         list("functions", &c.functions),
         list("packages", &c.packages),
         list("projects", &c.projects),
+        list("local_roots", &c.local_roots),
         list("endpoints", &c.endpoints),
         c.cwd_pattern
             .as_ref()

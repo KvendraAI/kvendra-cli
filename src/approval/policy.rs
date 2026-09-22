@@ -401,30 +401,32 @@ secret:
   type: aws
 allowlist:
   primitives:
-    - name: kvendra.aws
+    - name: kvendra.git
       operations:
-        - s3_sync:
-            buckets: ["b"]
+        - tag:
+            repos: ["github.com/o/*"]
             accept_destructive: true
 "#;
         let spec: ProfileSpec = serde_yaml_ng::from_str(yaml).unwrap();
-        // Catalog: s3_sync con delete=true → Destructive (sin necesidad de
+        // Re-authored on `git.tag` + `force` (ISSUE-KVD-CLI-9D5CF5 made
+        // `s3_sync` destructive unconditionally, so it has no predicate left).
+        // Catalog: tag con force=true → Destructive (sin necesidad de
         // user-declared field).
-        let args_with_delete = serde_json::json!({ "delete": true });
+        let args_with_force = serde_json::json!({ "force": true });
         assert!(lookup_destructive(
             &spec,
-            "kvendra.aws",
-            "s3_sync",
-            &args_with_delete
+            "kvendra.git",
+            "tag",
+            &args_with_force
         ));
-        // Sin delete=true: catálogo NO marca destructive y el YAML tampoco
+        // Sin force=true: catálogo NO marca destructive y el YAML tampoco
         // declara destructive: true → false.
-        let args_no_delete = serde_json::json!({});
+        let args_no_force = serde_json::json!({});
         assert!(!lookup_destructive(
             &spec,
-            "kvendra.aws",
-            "s3_sync",
-            &args_no_delete
+            "kvendra.git",
+            "tag",
+            &args_no_force
         ));
     }
 

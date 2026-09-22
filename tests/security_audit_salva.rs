@@ -329,10 +329,13 @@ allowlist:
     // The BUG shape: passing the whole envelope (fields one level too deep)
     // hides the mutating fields and reports non-destructive. This asserts the
     // regression we fixed by reading the inner payload in approval::check.
-    let envelope = json!({ "operation": "s3_sync", "args": { "delete": true } });
+    // Re-authored on `git.tag` + `force` (ISSUE-KVD-CLI-9D5CF5 made `s3_sync`
+    // destructive unconditionally, so it no longer has a predicate an
+    // envelope-level read could hide); the H2 shape is the same.
+    let envelope = json!({ "operation": "tag", "args": { "force": true } });
     assert!(
-        !lookup_destructive(&spec, "kvendra.aws", "s3_sync", &envelope),
-        "envelope-level read hides the delete flag — this is exactly the H2 bug"
+        !lookup_destructive(&spec, "kvendra.git", "tag", &envelope),
+        "envelope-level read hides the force flag — this is exactly the H2 bug"
     );
 }
 

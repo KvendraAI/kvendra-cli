@@ -71,9 +71,9 @@ pub fn is_safe_path_component(id: &str) -> bool {
 pub fn is_safe_audit_field(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= MAX_PATH_COMPONENT_ID_LEN
-        && !s.chars().any(|c| {
-            c.is_control() || matches!(c, '|' | '\0' | '\n' | '\r')
-        })
+        && !s
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '|' | '\0' | '\n' | '\r'))
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
@@ -131,7 +131,9 @@ mod tests {
         assert!(!is_safe_audit_field("a\0b"));
         assert!(!is_safe_audit_field("a\nb"));
         assert!(!is_safe_audit_field("a\rb"));
-        assert!(!is_safe_audit_field(&"a".repeat(MAX_PATH_COMPONENT_ID_LEN + 1)));
+        assert!(!is_safe_audit_field(
+            &"a".repeat(MAX_PATH_COMPONENT_ID_LEN + 1)
+        ));
         // Unlike a path component, a leading dot is not a hazard here.
         assert!(is_safe_audit_field(".ok"));
     }

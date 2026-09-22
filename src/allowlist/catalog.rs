@@ -40,10 +40,6 @@ pub struct DestructiveRule {
 
 // --- predicates puras (ADR-KVD-018) ---
 
-fn s3_sync_with_delete(args: &Value) -> bool {
-    args.get("delete").and_then(Value::as_bool).unwrap_or(false)
-}
-
 fn git_tag_with_force(args: &Value) -> bool {
     args.get("force").and_then(Value::as_bool).unwrap_or(false)
 }
@@ -138,11 +134,15 @@ pub const CATALOG: &[DestructiveRule] = &[
         kind: DestructiveKind::Destructive,
         args_predicate: None,
     },
+    // ISSUE-KVD-CLI-9D5CF5 — a sync overwrites its destination (and, upload
+    // direction, exfiltrates the local tree) with or without `--delete`, so
+    // the consent gate must fire unconditionally. It used to be gated on the
+    // `delete` predicate.
     DestructiveRule {
         primitive: "kvendra.aws",
         operation: "s3_sync",
         kind: DestructiveKind::Destructive,
-        args_predicate: Some(s3_sync_with_delete),
+        args_predicate: None,
     },
     DestructiveRule {
         primitive: "kvendra.aws",
@@ -240,7 +240,7 @@ fn matches_kind(kind: DestructiveKind, primitive: &str, operation: &str, args: &
 ///
 /// - Si la regla NO tiene predicate (ej. `lambda_invoke`) → siempre true.
 /// - Si la regla es `kvendra.http.request` → inspecciona `methods` declarados.
-/// - Si la regla tiene predicate runtime-only (ej. `s3_sync.delete`,
+/// - Si la regla tiene predicate runtime-only (ej.
 ///   `git.tag.force`) → worst-case true (fuerza opt-in en validate-time).
 /// - Si la operación no está clasificada (ni regla ni read-only) → true.
 pub fn could_be_destructive(primitive: &str, operation: &str, c: &OperationConstraints) -> bool {
@@ -390,19 +390,18 @@ mod tests {
         ));
     }
 
+    // Inverted from `s3_sync_destructive_only_with_delete`
+    // (ISSUE-KVD-CLI-9D5CF5): a sync writes its destination whether or not
+    // `--delete` is set, so it is destructive unconditionally.
     #[test]
-    fn s3_sync_destructive_only_with_delete() {
-        assert!(is_destructive(
-            "kvendra.aws",
-            "s3_sync",
-            &json!({ "delete": true })
-        ));
-        assert!(!is_destructive(
-            "kvendra.aws",
-            "s3_sync",
-            &json!({ "delete": false })
-        ));
-        assert!(!is_destructive("kvendra.aws", "s3_sync", &Value::Null));
+    fn s3_sync_destructive_unconditional() {
+        for args in [
+            json!({ "delete": true }),
+            json!({ "delete": false }),
+            Value::Null,
+        ] {
+            assert!(is_destructive("kvendra.aws", "s3_sync", &args), "{args}");
+        }
     }
 
     #[test]

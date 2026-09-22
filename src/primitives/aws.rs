@@ -119,6 +119,12 @@ fn aws_command(creds: &AwsCreds) -> Command {
     cmd
 }
 
+fn classify_operand(field: &str, v: &str) -> KvendraResult<()> {
+    crate::primitives::local_operand::classify_s3_operand(v)
+        .map(|_| ())
+        .map_err(|e| KvendraError::InvalidArgs(format!("{field}: {e}")))
+}
+
 async fn s3_sync(op_args: &Value, creds: &AwsCreds) -> KvendraResult<Value> {
     let src = op_args
         .get("src")
@@ -131,6 +137,10 @@ async fn s3_sync(op_args: &Value, creds: &AwsCreds) -> KvendraResult<Value> {
     // N5 — reject option-injection (e.g. src=`--endpoint-url=http://evil/`).
     crate::primitives::spawn::reject_option_like("aws.s3_sync.src", src)?;
     crate::primitives::spawn::reject_option_like("aws.s3_sync.dst", dst)?;
+    // Same classifier as the enforcer (ISSUE-KVD-CLI-9D5CF5): a malformed
+    // remote is never handed to the CLI as if it were a local path.
+    classify_operand("aws.s3_sync.src", src)?;
+    classify_operand("aws.s3_sync.dst", dst)?;
     let mut cmd = aws_command(creds);
     cmd.arg("s3").arg("sync").arg(src).arg(dst);
     if op_args
@@ -155,6 +165,10 @@ async fn s3_cp(op_args: &Value, creds: &AwsCreds) -> KvendraResult<Value> {
     // N5 — reject option-injection on the positional src/dst.
     crate::primitives::spawn::reject_option_like("aws.s3_cp.src", src)?;
     crate::primitives::spawn::reject_option_like("aws.s3_cp.dst", dst)?;
+    // Same classifier as the enforcer (ISSUE-KVD-CLI-9D5CF5): a malformed
+    // remote is never handed to the CLI as if it were a local path.
+    classify_operand("aws.s3_cp.src", src)?;
+    classify_operand("aws.s3_cp.dst", dst)?;
     let mut cmd = aws_command(creds);
     cmd.arg("s3").arg("cp").arg(src).arg(dst);
     run("s3_cp", cmd).await

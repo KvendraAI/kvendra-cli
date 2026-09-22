@@ -126,6 +126,8 @@ pub type Operation = BTreeMap<String, OperationConstraints>;
 /// - **D8** Order of checks in the enforcer:
 ///   `is_expired → primitive lookup → operation lookup → forbidden-first
 ///   denylists → allow-list constraints`.
+/// - **D9** `local_roots` bounds the LOCAL operand of a brokered transfer
+///   (canonical, component-wise containment; fail-closed when absent).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OperationConstraints {
@@ -151,6 +153,16 @@ pub struct OperationConstraints {
     pub functions: Option<Vec<String>>,
     pub packages: Option<Vec<String>>,
     pub projects: Option<Vec<String>>,
+    /// Absolute directories the LOCAL operand of a brokered transfer may
+    /// resolve into (D9 — ISSUE-KVD-CLI-9D5CF5). Applies to the operations in
+    /// [`crate::primitives::local_operand::LOCAL_OPERAND_OPS`]: `aws.s3_sync` /
+    /// `aws.s3_cp` (`src`/`dst` when not `s3://`), `git.clone` (`dst`) and
+    /// `pypi.upload` (`dist`). The operand and each root are canonicalized
+    /// (symlinks resolved; a not-yet-existing leaf is judged by its parent)
+    /// and compared component-wise. FAIL-CLOSED: such an operation with a
+    /// local operand and no `local_roots` is denied at runtime, and refused
+    /// at sign time by [`crate::allowlist::validator::validate_for_signing`].
+    pub local_roots: Option<Vec<String>>,
     /// Literal exact-match alias for HTTP url checks (D6 — union'd with
     /// `url_pattern_regex`).
     pub endpoints: Option<Vec<String>>,
@@ -229,6 +241,7 @@ const KNOWN_FIELDS: &[&str] = &[
     "functions",
     "packages",
     "projects",
+    "local_roots",
     "endpoints",
     "accept_broad_scope",
     "destructive",

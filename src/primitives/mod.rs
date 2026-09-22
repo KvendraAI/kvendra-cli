@@ -12,6 +12,7 @@ pub mod aws;
 pub mod git;
 pub mod github;
 pub mod http;
+pub mod local_operand;
 pub mod npm;
 pub mod pypi;
 pub mod shell;
@@ -103,7 +104,7 @@ const CATALOG: [PrimitiveInfo; 8] = [
         summary: "Run git operations (clone/push/pull/commit/tag) using a stored credential profile. Token plaintext never returned.",
         operations: &["clone", "push", "pull", "commit", "tag"],
         is_unsafe: false,
-        operations_doc: "Operations:\n  clone:  args: { url: \"<git url>\", dst?: \"<path>\" }\n  push:   args: { cwd: \"<path>\", remote?: \"origin\", ref: \"refs/heads/<branch>\" }\n  pull:   args: { cwd: \"<path>\", remote?: \"origin\", ref: \"refs/heads/<branch>\" }\n  commit: args: { cwd: \"<path>\", message: \"<msg>\" }\n  tag:    args: { cwd: \"<path>\", name: \"<tag>\", message?: \"<msg>\" }\nAll operations require profile_id at the top level.",
+        operations_doc: "Operations:\n  clone:  args: { url: \"<git url>\", dst: \"<path inside the allowlist local_roots>\" }\n  push:   args: { cwd: \"<path>\", remote?: \"origin\", ref: \"refs/heads/<branch>\" }\n  pull:   args: { cwd: \"<path>\", remote?: \"origin\", ref: \"refs/heads/<branch>\" }\n  commit: args: { cwd: \"<path>\", message: \"<msg>\" }\n  tag:    args: { cwd: \"<path>\", name: \"<tag>\", message?: \"<msg>\" }\nAll operations require profile_id at the top level.",
         requires_vault: true,
     },
     PrimitiveInfo {
@@ -136,7 +137,7 @@ const CATALOG: [PrimitiveInfo; 8] = [
         summary: "PyPI operations (upload/read_metadata).",
         operations: &["upload", "read_metadata"],
         is_unsafe: false,
-        operations_doc: "Operations:\n  upload:        args: { dist_path: \"<path>\", repository_url?: \"https://upload.pypi.org/legacy/\" }\n  read_metadata: args: { project: \"<name>\" }\nAll operations require profile_id at the top level.",
+        operations_doc: "Operations:\n  upload:        args: { dist: \"<path or glob>\", repository?: \"pypi\" }   # dist must be inside the allowlist local_roots\n  read_metadata: args: { project: \"<name>\" }\nAll operations require profile_id at the top level.",
         requires_vault: true,
     },
     PrimitiveInfo {
@@ -144,7 +145,7 @@ const CATALOG: [PrimitiveInfo; 8] = [
         summary: "AWS CLI brokered operations (s3_sync/s3_cp/cloudfront_invalidate/lambda_invoke).",
         operations: &["s3_sync", "s3_cp", "cloudfront_invalidate", "lambda_invoke"],
         is_unsafe: false,
-        operations_doc: "Operations:\n  s3_sync:               args: { src: \"<src>\", dst: \"<dst>\", delete?: false }   # delete=true is destructive\n  s3_cp:                 args: { src: \"<src>\", dst: \"<dst>\" }\n  cloudfront_invalidate: args: { distribution_id: \"<id>\", paths: [\"/*\"] }\n  lambda_invoke:         args: { function_name: \"<name>\", payload?: <object>, invocation_type?: \"RequestResponse\" }\nAll operations require profile_id at the top level.",
+        operations_doc: "Operations:\n  s3_sync:               args: { src: \"<src>\", dst: \"<dst>\", delete?: false }   # destructive; a local src/dst must be inside the allowlist local_roots\n  s3_cp:                 args: { src: \"<src>\", dst: \"<dst>\" }\n  cloudfront_invalidate: args: { distribution_id: \"<id>\", paths: [\"/*\"] }\n  lambda_invoke:         args: { function_name: \"<name>\", payload?: <object>, invocation_type?: \"RequestResponse\" }\nAll operations require profile_id at the top level.",
         requires_vault: true,
     },
     PrimitiveInfo {

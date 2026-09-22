@@ -18,6 +18,17 @@ use kvendra::allowlist::enforcer::check;
 use kvendra::error::KvendraError;
 use serde_json::json;
 
+// ISSUE-KVD-CLI-9D5CF5: the allowed branch syncs a LOCAL `./build`, which
+// is now denied unless it resolves inside `local_roots` (fail-closed). The
+// crate root (the cwd cargo runs integration tests in) is declared so this
+// test keeps pinning the bucket boundary it was written for.
+fn spec() -> ProfileSpec {
+    ProfileSpec::from_yaml(
+        &KVENDRA_AWS_ALLOWLIST_YAML.replace("@CRATE_ROOT@", env!("CARGO_MANIFEST_DIR")),
+    )
+    .unwrap()
+}
+
 const KVENDRA_AWS_ALLOWLIST_YAML: &str = r#"
 profile_id: aws.kvendra.deployer
 secret:
@@ -28,6 +39,7 @@ allowlist:
       operations:
         - s3_sync:
             buckets: ["kvendra-com-prod"]
+            local_roots: ["@CRATE_ROOT@"]
             accept_destructive: true
         - cloudfront_invalidate:
             distributions: ["E2MSK8NR0QTV9W"]
@@ -37,7 +49,7 @@ allowlist:
 #[test]
 fn aws_s3_sync_blocks_bucket_outside_allowlist() {
     // CANONICAL REGRESSION TEST — AC-M2-6 (ISSUE-KVD-CLI-031).
-    let spec = ProfileSpec::from_yaml(KVENDRA_AWS_ALLOWLIST_YAML).unwrap();
+    let spec = spec();
 
     // Allowed call — bucket matches the allowlist.
     let allowed = json!({
@@ -71,7 +83,7 @@ fn aws_s3_sync_blocks_bucket_outside_allowlist() {
 
 #[test]
 fn aws_cloudfront_invalidate_blocks_distribution_outside_allowlist() {
-    let spec = ProfileSpec::from_yaml(KVENDRA_AWS_ALLOWLIST_YAML).unwrap();
+    let spec = spec();
 
     let allowed = json!({
         "profile_id": "aws.kvendra.deployer",

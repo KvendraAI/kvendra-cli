@@ -14,4 +14,4 @@ pub use catalog::{
 };
 pub use dsl::{Allowlist, Operation, OperationConstraints, PrimitiveAllow, ProfileSpec};
 pub use enforcer::check;
-pub use validator::validate;
+pub use validator::{validate, validate_for_signing};
