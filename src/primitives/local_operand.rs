@@ -280,6 +280,7 @@ mod tests {
 
     /// Iter3 — a literal `/` root (only signable with accept_broad_scope)
     /// is likewise refused at runtime without the flag.
+    #[cfg(unix)]
     #[test]
     fn literal_filesystem_root_requires_broad_scope_at_runtime() {
         let roots = vec!["/".to_string()];

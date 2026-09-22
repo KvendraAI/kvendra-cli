@@ -805,6 +805,7 @@ allowlist:
         .unwrap()
     }
 
+    #[cfg(unix)]
     #[test]
     fn sa2_local_roots_dotdot_component_always_rejected() {
         for root in ["/..", "/Users/..", "/tmp/../etc", "/a/b/.."] {
@@ -817,6 +818,25 @@ allowlist:
         }
     }
 
+    /// Windows counterpart of the two Unix-path tests above: a drive root
+    /// is a filesystem root and `..` is always rejected.
+    #[cfg(windows)]
+    #[test]
+    fn sa2_local_roots_windows_drive_root_and_dotdot() {
+        for root in ["C:/", "C:/."] {
+            let err = validate_for_signing(&s3_sync_spec_with_root(root, false))
+                .expect_err(&format!("'{root}' must require accept_broad_scope"))
+                .to_string();
+            assert!(err.contains("filesystem root"), "{root}: {err}");
+            assert!(validate_for_signing(&s3_sync_spec_with_root(root, true)).is_ok());
+        }
+        let err = validate_for_signing(&s3_sync_spec_with_root("C:/a/..", true))
+            .expect_err("`..` must be rejected")
+            .to_string();
+        assert!(err.contains("`..`"), "{err}");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn sa2_local_roots_lexical_root_variants_need_broad_scope() {
         for root in ["/", "//", "/./", "/.", "///"] {
@@ -845,6 +865,7 @@ allowlist:
         assert!(validate_for_signing(&s3_sync_spec_with_root(&root, true)).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn sa2_local_roots_ordinary_dirs_still_pass() {
         let tmp = tempfile::TempDir::new().unwrap();

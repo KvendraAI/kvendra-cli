@@ -89,6 +89,7 @@ pub fn reject_option_like(field: &str, value: &str) -> KvendraResult<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn sanitized_path_drops_relative_and_empty_entries() {
         // SAFETY: single-threaded test; we set + read PATH atomically here.

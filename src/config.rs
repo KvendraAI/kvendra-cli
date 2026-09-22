@@ -813,6 +813,8 @@ mod tests {
         ];
         let swallowers = ["unwrap_or_default", "unwrap_or(", "unwrap_or_else", ".ok()"];
         for (name, src) in writers {
+            // Windows checkouts may carry CRLF line endings.
+            let src = src.replace("\r\n", "\n");
             let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
             for needle in [
                 "Config::load(",

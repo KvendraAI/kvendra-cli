@@ -1067,7 +1067,7 @@ allowlist:
       operations:
         - s3_sync:
             buckets: [{list}]
-            local_roots: ["{CRATE_ROOT}"]
+            local_roots: ['{CRATE_ROOT}']
             accept_destructive: true
 "#
         ))
@@ -1772,7 +1772,7 @@ allowlist:
       operations:
         - clone:
 {constraints}
-            local_roots: ["{CRATE_ROOT}"]
+            local_roots: ['{CRATE_ROOT}']
 "#
         ))
     }
