@@ -623,6 +623,35 @@ fn try_self_heal_vault(ctx: &ServerContext) {
     }
 }
 
+/// Byte cap for an escaped hostile field stored in an audit refusal row.
+const AUDIT_ESCAPED_FIELD_MAX: usize = 128;
+
+/// Representation of an agent-supplied tool name / operation safe to persist
+/// in an audit refusal row. A value already inside the audit-field charset
+/// (or empty) is kept verbatim; anything else is escaped to printable ASCII
+/// (`char::escape_default`: control bytes, quotes, backslashes and non-ASCII
+/// become `\n`, `\u{1b}`, ...; `|` becomes `\u{7c}`) and capped at
+/// [`AUDIT_ESCAPED_FIELD_MAX`] bytes with a `...` marker.
+fn audit_safe_repr(s: &str) -> String {
+    if s.is_empty() || crate::path_id::is_safe_audit_field(s) {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for c in s.chars() {
+        let piece: String = if c == '|' {
+            "\\u{7c}".to_string()
+        } else {
+            c.escape_default().collect()
+        };
+        if out.len() + piece.len() > AUDIT_ESCAPED_FIELD_MAX {
+            out.push_str("...");
+            break;
+        }
+        out.push_str(&piece);
+    }
+    out
+}
+
 async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -> JsonRpcResponse {
     // Self-healing — if our in-RAM SessionKey expired (idle timeout) but
     // the on-disk session blob is still inside its TTL, recover the
@@ -660,12 +689,17 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             "tool name or operation contains characters outside [A-Za-z0-9._-] — refused"
                 .to_string(),
         );
+        // The refusal row must not carry the hostile bytes themselves: store
+        // an escaped, length-capped form so audit rows / exports / the TUI
+        // can never replay control characters (terminal/log injection).
+        let stored_name = audit_safe_repr(name);
+        let stored_action = audit_safe_repr(&action);
         let _ = record_audit(
             &ctx,
             &arguments,
-            name,
+            &stored_name,
             &profile_id,
-            &action,
+            &stored_action,
             &flags,
             true,
             None,
@@ -1404,6 +1438,24 @@ mod tests {
     use super::*;
     use crate::approval::ApprovalCache;
     use crate::vault::{Profile, kdf::KdfParams};
+
+    /// Log/terminal injection: the refusal row stores an escaped, capped,
+    /// printable-ASCII form of a hostile tool name / operation.
+    #[test]
+    fn audit_safe_repr_escapes_and_caps_hostile_fields() {
+        assert_eq!(audit_safe_repr("kvendra.shell"), "kvendra.shell");
+        assert_eq!(audit_safe_repr(""), "");
+        let r = audit_safe_repr("kvendra.shell|x\x1b[2J\r\n\u{202e}");
+        assert!(
+            r.chars().all(|c| c.is_ascii() && !c.is_ascii_control()),
+            "{r}"
+        );
+        assert!(!r.contains('|'), "{r}");
+        assert!(r.contains("\\u{7c}") && r.contains("\\u{1b}") && r.contains("\\u{202e}"));
+        let long = audit_safe_repr(&format!("x|{}", "\x07".repeat(500)));
+        assert!(long.len() <= AUDIT_ESCAPED_FIELD_MAX + 3, "{}", long.len());
+        assert!(long.ends_with("..."));
+    }
     use std::sync::Arc;
 
     fn fast_params() -> KdfParams {

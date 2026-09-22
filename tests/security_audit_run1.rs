@@ -1730,6 +1730,44 @@ async fn sa4_green_pipe_in_tool_name_or_operation_is_refused() {
     }
 }
 
+/// Iter2 (log/terminal injection) — the refusal row for a hostile tool name
+/// stores an escaped, length-capped form: no control characters, no `|`,
+/// still flagged `invalid_tool_field_denied`, still verifying.
+#[tokio::test]
+async fn iter2_hostile_tool_name_is_stored_escaped_and_capped() {
+    let hostile = format!("kvendra.shell\x1b[2J\r\nFAKE|row{}", "\x07".repeat(300));
+    let (_dir, ctx) = bootstrap("shell.profile", SHELL_ECHO_ONLY, DetectionSeverity::Warn).await;
+    let resp = dispatch(
+        call(
+            &hostile,
+            json!({
+                "profile_id": "shell.profile",
+                "operation": "exec",
+                "args": { "binary": "echo", "argv": ["hi"] }
+            }),
+        ),
+        ctx.clone(),
+    )
+    .await;
+    assert!(resp.error.is_some(), "hostile tool name must be refused");
+    let rows = audit_rows(&ctx).await;
+    let (primitive, _, _) = rows
+        .iter()
+        .find(|(_, flags, status)| {
+            status == "error" && flags.split(',').any(|f| f == "invalid_tool_field_denied")
+        })
+        .unwrap_or_else(|| panic!("no invalid_tool_field_denied row: {rows:?}"));
+    assert!(
+        primitive
+            .chars()
+            .all(|c| c.is_ascii() && !c.is_ascii_control() && c != '|'),
+        "stored tool name carries raw hostile bytes: {primitive:?}"
+    );
+    assert!(primitive.len() <= 131, "not capped: {}", primitive.len());
+    assert!(primitive.starts_with("kvendra.shell\\u{1b}"), "{primitive}");
+    assert!(verify(&ctx).is_ok(), "the refusal row itself must verify");
+}
+
 /// GREEN-only — `kvendra audit --verify` exits NON-ZERO on a layout
 /// violation (it used to print "BROKEN" and fall through to `Ok(())`). The
 /// child gets the temp `KVENDRA_HOME`; this process's env is untouched.

@@ -30,11 +30,11 @@ pub async fn run(cmd: ApprovalCommand) -> KvendraResult<()> {
 
     match cmd {
         ApprovalCommand::Get => {
-            // Read-only — vault is optional. If a signed config is on disk
-            // we still try to verify if the vault happens to be unlockable
-            // via env, but for `get` the cheap path is enough.
-            let cfg = Config::load(&home, None).unwrap_or_default();
-            print_resolved_mode(&cfg);
+            // Read-only (ISSUE-KVD-CLI-705EF0): verify when the vault can be
+            // unlocked non-interactively; otherwise label the output UNVERIFIED.
+            let (cfg, trust) = load_for_display(&home, "approval get")?;
+            print_trust_banner(trust);
+            print_resolved_mode(&cfg, trust);
         }
         ApprovalCommand::Set { mode } => {
             let parsed = policy::parse_mode(&mode).ok_or_else(|| {
@@ -76,8 +76,9 @@ pub async fn run(cmd: ApprovalCommand) -> KvendraResult<()> {
             println!("approval.allow_env_downgrade set to {enabled} in ~/.kvendra/config.toml");
         }
         ApprovalCommand::Status => {
-            let cfg = Config::load(&home, None).unwrap_or_default();
-            print_status(&cfg);
+            let (cfg, trust) = load_for_display(&home, "approval status")?;
+            print_trust_banner(trust);
+            print_status(&cfg, trust);
         }
     }
     Ok(())
@@ -104,7 +105,103 @@ fn unlock_for_approval(home: &std::path::Path) -> KvendraResult<Vault> {
     Ok(vault)
 }
 
-fn print_resolved_mode(cfg: &Config) {
+/// Whether the config shown by a read-only subcommand was HMAC-verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigTrust {
+    /// Loaded through the verifying loader with an unlocked vault.
+    Verified,
+    /// The vault could not be unlocked non-interactively: the values were read
+    /// WITHOUT signature verification and may be tampered.
+    Unverified,
+}
+
+const UNVERIFIED_BANNER: &str = "UNVERIFIED (vault locked): values shown may be tampered; \
+     the broker enforces only a verified config. Run `kvendra unlock` to verify.";
+
+/// Try to unlock the vault WITHOUT prompting: `KVENDRA_PASSWORD` first (an
+/// explicit, wrong password is an error), then the local session blob
+/// written by `kvendra unlock`. `Ok(None)` = locked / not initialized.
+fn unlock_non_interactive(home: &std::path::Path) -> KvendraResult<Option<Vault>> {
+    let vault = Vault::new(home.to_path_buf());
+    if !vault.sentinel_path().exists() {
+        return Ok(None);
+    }
+    if let Ok(password) = std::env::var("KVENDRA_PASSWORD") {
+        vault.unlock(password.as_bytes(), 30)?;
+        return Ok(Some(vault));
+    }
+    if let Ok(state) = crate::session::local::load(home)
+        && vault
+            .unlock_from_derived_key(&state.derived_key, 30)
+            .is_ok()
+    {
+        return Ok(Some(vault));
+    }
+    Ok(None)
+}
+
+/// Load the config for a read-only subcommand (ISSUE-KVD-CLI-705EF0).
+///
+/// With an unlockable vault the config goes through the verifying loader and
+/// every integrity error (`config_tampered_detected`, unsigned, redirected)
+/// propagates → non-zero exit. With a locked vault the values are read
+/// unverified and tagged [`ConfigTrust::Unverified`] so the caller never
+/// presents them as authoritative. Never swallows an error into defaults.
+fn load_for_display(
+    home: &std::path::Path,
+    subcommand: &str,
+) -> KvendraResult<(Config, ConfigTrust)> {
+    match unlock_non_interactive(home)? {
+        Some(vault) => {
+            let cfg = Config::load_for_update(home, &vault, subcommand)?;
+            Ok((cfg, ConfigTrust::Verified))
+        }
+        None => {
+            let cfg = Config::load(home, None)?;
+            Ok((cfg, ConfigTrust::Unverified))
+        }
+    }
+}
+
+fn print_trust_banner(trust: ConfigTrust) {
+    match trust {
+        ConfigTrust::Verified => println!("config.toml: VERIFIED (HMAC ok)"),
+        ConfigTrust::Unverified => println!("{UNVERIFIED_BANNER}"),
+    }
+}
+
+/// Human description of the env-override outcome. Only a VERIFIED config may
+/// be described as fact; an unverified one is phrased conditionally.
+fn env_effect_text(outcome: Option<policy::EnvOverride>, trust: ConfigTrust) -> String {
+    let fact = match outcome {
+        Some(policy::EnvOverride::DowngradeIgnored) => {
+            "IGNORED — looser than the signed mode (no allow_env_downgrade)"
+        }
+        Some(policy::EnvOverride::DowngradeApplied) => {
+            "APPLIED — loosens the signed mode (allow_env_downgrade = true)"
+        }
+        Some(policy::EnvOverride::Tightened) => "APPLIED — tightens the signed mode",
+        None => "same as the signed mode",
+    };
+    match trust {
+        ConfigTrust::Verified => fact.to_string(),
+        ConfigTrust::Unverified => {
+            let cond = match outcome {
+                Some(policy::EnvOverride::DowngradeIgnored) => {
+                    "would be ignored (looser than the signed mode, no allow_env_downgrade)"
+                }
+                Some(policy::EnvOverride::DowngradeApplied) => {
+                    "would loosen the signed mode (allow_env_downgrade = true)"
+                }
+                Some(policy::EnvOverride::Tightened) => "would tighten the signed mode",
+                None => "would match the signed mode",
+            };
+            format!("{cond} — if this config verifies")
+        }
+    }
+}
+
+fn print_resolved_mode(cfg: &Config, trust: ConfigTrust) {
     let env = std::env::var("KVENDRA_APPROVAL_MODE")
         .ok()
         .and_then(|s| policy::parse_mode(&s));
@@ -114,10 +211,11 @@ fn print_resolved_mode(cfg: &Config) {
         cfg.approval.mode,
         cfg.approval.allow_env_downgrade,
     );
-    println!(
-        "approval.mode (resolved): {}",
-        policy::mode_name(outcome.mode)
-    );
+    let resolved_label = match trust {
+        ConfigTrust::Verified => "approval.mode (resolved):",
+        ConfigTrust::Unverified => "approval.mode (would resolve to, UNVERIFIED):",
+    };
+    println!("{resolved_label} {}", policy::mode_name(outcome.mode));
     println!(
         "  global (config.toml):   {}",
         policy::mode_name(cfg.approval.mode)
@@ -127,16 +225,7 @@ fn print_resolved_mode(cfg: &Config) {
         cfg.approval.allow_env_downgrade
     );
     if let Some(m) = env {
-        let effect = match outcome.env_override {
-            Some(policy::EnvOverride::DowngradeIgnored) => {
-                "IGNORED — looser than the signed mode (no allow_env_downgrade)"
-            }
-            Some(policy::EnvOverride::DowngradeApplied) => {
-                "APPLIED — loosens the signed mode (allow_env_downgrade = true)"
-            }
-            Some(policy::EnvOverride::Tightened) => "APPLIED — tightens the signed mode",
-            None => "same as the signed mode",
-        };
+        let effect = env_effect_text(outcome.env_override, trust);
         println!(
             "  env KVENDRA_APPROVAL_MODE: {} ({effect})",
             policy::mode_name(m)
@@ -147,8 +236,8 @@ fn print_resolved_mode(cfg: &Config) {
     println!("  per-profile override:   evaluated at tools/call against profile YAML");
 }
 
-fn print_status(cfg: &Config) {
-    print_resolved_mode(cfg);
+fn print_status(cfg: &Config, trust: ConfigTrust) {
+    print_resolved_mode(cfg, trust);
     println!(
         "approval.timeout_seconds:    {}",
         cfg.approval.timeout_seconds
@@ -235,8 +324,120 @@ mod tests {
             ApprovalMode::Ask,
             ApprovalMode::AskDestructive,
         ] {
-            print_resolved_mode(&build_cfg(m));
+            print_resolved_mode(&build_cfg(m), ConfigTrust::Verified);
+            print_resolved_mode(&build_cfg(m), ConfigTrust::Unverified);
         }
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // V06 — ISSUE-KVD-CLI-705EF0. `config approval get|status` must not
+    // present a ratchet resolution computed from an UNVERIFIED config as
+    // authoritative.
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn v06_unverified_effect_text_is_never_stated_as_fact() {
+        use policy::EnvOverride::*;
+        for o in [
+            Some(DowngradeIgnored),
+            Some(DowngradeApplied),
+            Some(Tightened),
+            None,
+        ] {
+            let t = env_effect_text(o, ConfigTrust::Unverified);
+            assert!(
+                !t.contains("APPLIED") && !t.contains("IGNORED"),
+                "unverified output stated as fact: {t}"
+            );
+            assert!(t.contains("if this config verifies"), "{t}");
+        }
+        assert!(
+            env_effect_text(Some(DowngradeApplied), ConfigTrust::Verified).starts_with("APPLIED")
+        );
+        assert!(UNVERIFIED_BANNER.starts_with("UNVERIFIED (vault locked)"));
+        assert!(UNVERIFIED_BANNER.contains("the broker enforces only a verified config"));
+    }
+
+    /// Run a read-only approval subcommand with the env lock held.
+    async fn v06_run_readonly(
+        home: &std::path::Path,
+        password: Option<&str>,
+        cmd: ApprovalCommand,
+    ) -> KvendraResult<()> {
+        let _guard = crate::test_env_lock().lock().await;
+        unsafe {
+            std::env::set_var("KVENDRA_HOME", home);
+            std::env::remove_var("KVENDRA_APPROVAL_MODE");
+            match password {
+                Some(p) => std::env::set_var("KVENDRA_PASSWORD", p),
+                None => std::env::remove_var("KVENDRA_PASSWORD"),
+            }
+        }
+        let r = run(cmd).await;
+        unsafe {
+            std::env::remove_var("KVENDRA_HOME");
+            std::env::remove_var("KVENDRA_PASSWORD");
+        }
+        r
+    }
+
+    fn v06_flip_hmac(home: &std::path::Path) {
+        let path = home.join("config.toml");
+        let signed = std::fs::read_to_string(&path).unwrap();
+        let idx = signed.rfind("_hmac = \"").unwrap() + "_hmac = \"".len();
+        let mut bytes = signed.into_bytes();
+        bytes[idx] = if bytes[idx] == b'a' { b'b' } else { b'a' };
+        std::fs::write(&path, &bytes).unwrap();
+    }
+
+    #[tokio::test]
+    async fn v06_get_and_status_fail_closed_on_tampered_config_when_unlockable() {
+        let tmp = TempDir::new().unwrap();
+        let _v = sa6_bootstrap_signed_policy(&tmp);
+        v06_flip_hmac(tmp.path());
+        let before = std::fs::read(tmp.path().join("config.toml")).unwrap();
+        for cmd in [ApprovalCommand::Get, ApprovalCommand::Status] {
+            let r = v06_run_readonly(tmp.path(), Some("hunter2-test"), cmd).await;
+            let msg = r
+                .expect_err("tampered config must exit non-zero")
+                .to_string();
+            assert!(msg.contains("config_tampered_detected"), "{msg}");
+        }
+        assert_eq!(
+            before,
+            std::fs::read(tmp.path().join("config.toml")).unwrap(),
+            "read-only commands must never modify config.toml"
+        );
+    }
+
+    #[tokio::test]
+    async fn v06_get_verified_ok_on_genuine_config() {
+        let tmp = TempDir::new().unwrap();
+        let _v = sa6_bootstrap_signed_policy(&tmp);
+        let r = v06_run_readonly(tmp.path(), Some("hunter2-test"), ApprovalCommand::Get).await;
+        assert!(r.is_ok(), "{r:?}");
+        let _guard = crate::test_env_lock().lock().await;
+        unsafe { std::env::set_var("KVENDRA_PASSWORD", "hunter2-test") };
+        let got = load_for_display(tmp.path(), "approval get");
+        unsafe { std::env::remove_var("KVENDRA_PASSWORD") };
+        let (cfg, trust) = got.unwrap();
+        assert_eq!(trust, ConfigTrust::Verified);
+        assert_eq!(cfg.approval.mode, ApprovalMode::Ask);
+    }
+
+    #[tokio::test]
+    async fn v06_locked_vault_is_labelled_unverified() {
+        let tmp = TempDir::new().unwrap();
+        let _v = sa6_bootstrap_signed_policy(&tmp);
+        v06_flip_hmac(tmp.path());
+        // No KVENDRA_PASSWORD and no session blob → cannot verify: the command
+        // still answers, but tagged UNVERIFIED.
+        let r = v06_run_readonly(tmp.path(), None, ApprovalCommand::Status).await;
+        assert!(r.is_ok(), "{r:?}");
+        let _guard = crate::test_env_lock().lock().await;
+        unsafe { std::env::remove_var("KVENDRA_PASSWORD") };
+        let (_cfg, trust) = load_for_display(tmp.path(), "approval get").unwrap();
+        assert_eq!(trust, ConfigTrust::Unverified);
     }
 
     #[test]

@@ -122,7 +122,18 @@ fn check_local_roots(primitive: &str, op: &str, c: &OperationConstraints) -> Kve
                         "{primitive}.{op}: `local_roots` entry '{r}' must be an absolute path"
                     )));
                 }
-                if p.parent().is_none() && !c.accept_broad_scope.unwrap_or(false) {
+                // SA2 residual: a `..` component makes the lexical check
+                // meaningless (`/..`, `/Users/..` canonicalise to `/` at
+                // runtime). Refused outright — there is no legitimate need.
+                if p.components()
+                    .any(|comp| matches!(comp, std::path::Component::ParentDir))
+                {
+                    return Err(KvendraError::AllowlistParse(format!(
+                        "{primitive}.{op}: `local_roots` entry '{r}' contains a `..` \
+                         component — declare the normalised absolute path"
+                    )));
+                }
+                if is_filesystem_root(p) && !c.accept_broad_scope.unwrap_or(false) {
                     return Err(KvendraError::AllowlistParse(format!(
                         "{primitive}.{op}: `local_roots` entry '{r}' is the filesystem root \
                          — rejected without accept_broad_scope: true"
@@ -131,6 +142,28 @@ fn check_local_roots(primitive: &str, op: &str, c: &OperationConstraints) -> Kve
             }
             Ok(())
         }
+    }
+}
+
+/// `true` when `p` denotes the filesystem root, either lexically (`/`, `//`,
+/// `/./`, …: nothing but root/`.` components) or, when it exists, after
+/// canonicalisation (e.g. a symlink to `/`) — the same resolution the
+/// enforcer applies at runtime. A root that does not exist yet cannot be a
+/// symlink, so the lexical answer is final for it.
+fn is_filesystem_root(p: &std::path::Path) -> bool {
+    use std::path::Component;
+    let lexical_root = p.components().all(|c| {
+        matches!(
+            c,
+            Component::RootDir | Component::CurDir | Component::Prefix(_)
+        )
+    });
+    if lexical_root {
+        return true;
+    }
+    match std::fs::canonicalize(p) {
+        Ok(canon) => canon.parent().is_none(),
+        Err(_) => false,
     }
 }
 
@@ -743,5 +776,84 @@ allowlist:
 "#;
         let p = ProfileSpec::from_yaml(yaml).unwrap();
         assert!(validate(&p).is_ok());
+    }
+
+    // ── SA2 residual (ISSUE-KVD-CLI-9D5CF5): filesystem-root check in
+    // `local_roots` must not be lexical-only. ──
+
+    fn s3_sync_spec_with_root(root: &str, accept_broad: bool) -> ProfileSpec {
+        let broad = if accept_broad {
+            "\n            accept_broad_scope: true"
+        } else {
+            ""
+        };
+        ProfileSpec::from_yaml(&format!(
+            r#"
+profile_id: x
+secret:
+  type: aws
+allowlist:
+  primitives:
+    - name: kvendra.aws
+      operations:
+        - s3_sync:
+            buckets: ["b"]
+            local_roots: ["{root}"]
+            accept_destructive: true{broad}
+"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn sa2_local_roots_dotdot_component_always_rejected() {
+        for root in ["/..", "/Users/..", "/tmp/../etc", "/a/b/.."] {
+            for broad in [false, true] {
+                let err = validate_for_signing(&s3_sync_spec_with_root(root, broad))
+                    .expect_err(&format!("'{root}' (broad={broad}) must be rejected"))
+                    .to_string();
+                assert!(err.contains("`..`"), "{root}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn sa2_local_roots_lexical_root_variants_need_broad_scope() {
+        for root in ["/", "//", "/./", "/.", "///"] {
+            let err = validate_for_signing(&s3_sync_spec_with_root(root, false))
+                .expect_err(&format!("'{root}' must require accept_broad_scope"))
+                .to_string();
+            assert!(err.contains("filesystem root"), "{root}: {err}");
+            assert!(
+                validate_for_signing(&s3_sync_spec_with_root(root, true)).is_ok(),
+                "'{root}' with accept_broad_scope must pass"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sa2_local_roots_symlink_to_root_needs_broad_scope() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("to-root");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let root = link.to_string_lossy().into_owned();
+        let err = validate_for_signing(&s3_sync_spec_with_root(&root, false))
+            .expect_err("symlink to / must require accept_broad_scope")
+            .to_string();
+        assert!(err.contains("filesystem root"), "{err}");
+        assert!(validate_for_signing(&s3_sync_spec_with_root(&root, true)).is_ok());
+    }
+
+    #[test]
+    fn sa2_local_roots_ordinary_dirs_still_pass() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let existing = tmp.path().to_string_lossy().into_owned();
+        for root in [existing.as_str(), "/definitely/not/existing/kvendra-root"] {
+            assert!(
+                validate_for_signing(&s3_sync_spec_with_root(root, false)).is_ok(),
+                "'{root}' must pass"
+            );
+        }
     }
 }

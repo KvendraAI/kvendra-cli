@@ -227,7 +227,7 @@ pub async fn sync_once(
                     tracing::warn!(
                         target: "kvendra::workspace",
                         flag = "workspace_template_id_rejected",
-                        template = %tmpl.template_id,
+                        template = ?log_safe_template_id(&tmpl.template_id),
                         workspace = %workspace_id,
                         "broker returned a template id that is not a safe path component — template skipped, nothing written"
                     );
@@ -307,9 +307,45 @@ pub fn hours_since(last_success_at: Option<DateTime<Utc>>) -> i64 {
     }
 }
 
+/// Char cap for a hostile template id echoed into logs.
+const LOG_TEMPLATE_ID_MAX_CHARS: usize = 64;
+
+/// Length-capped form of a REJECTED (broker-supplied, untrusted) template id
+/// for logging. It is emitted with tracing's `?` (Debug), which escapes
+/// control characters, so a hostile id cannot inject ANSI sequences or fake
+/// log lines; the cap bounds log amplification.
+fn log_safe_template_id(id: &str) -> String {
+    if id.chars().count() <= LOG_TEMPLATE_ID_MAX_CHARS {
+        return id.to_string();
+    }
+    let mut out: String = id.chars().take(LOG_TEMPLATE_ID_MAX_CHARS).collect();
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Log injection: a rejected hostile template id is length-capped and,
+    /// logged via Debug, carries no raw control characters.
+    #[test]
+    fn rejected_template_id_is_capped_and_escaped_for_logs() {
+        let hostile = format!("\x1b[31mFAKE\nINFO ok{}", "A".repeat(200));
+        let safe = log_safe_template_id(&hostile);
+        assert_eq!(safe.chars().count(), LOG_TEMPLATE_ID_MAX_CHARS + 1);
+        assert!(safe.ends_with('…'));
+        let logged = format!("{safe:?}");
+        assert!(
+            !logged.chars().any(|c| c.is_control()),
+            "Debug form must escape control chars: {logged}"
+        );
+        assert!(
+            logged.contains("\\u{1b}") && logged.contains("\\n"),
+            "{logged}"
+        );
+        assert_eq!(log_safe_template_id("short-id"), "short-id");
+    }
 
     #[test]
     fn stale_blocked_path_is_under_cache_root() {

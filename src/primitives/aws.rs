@@ -141,15 +141,12 @@ async fn s3_sync(op_args: &Value, creds: &AwsCreds) -> KvendraResult<Value> {
     // remote is never handed to the CLI as if it were a local path.
     classify_operand("aws.s3_sync.src", src)?;
     classify_operand("aws.s3_sync.dst", dst)?;
-    let mut cmd = aws_command(creds);
-    cmd.arg("s3").arg("sync").arg(src).arg(dst);
-    if op_args
+    let delete = op_args
         .get("delete")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        cmd.arg("--delete");
-    }
+        .unwrap_or(false);
+    let mut cmd = aws_command(creds);
+    cmd.args(s3_transfer_argv("sync", src, dst, delete));
     run("s3_sync", cmd).await
 }
 
@@ -170,8 +167,32 @@ async fn s3_cp(op_args: &Value, creds: &AwsCreds) -> KvendraResult<Value> {
     classify_operand("aws.s3_cp.src", src)?;
     classify_operand("aws.s3_cp.dst", dst)?;
     let mut cmd = aws_command(creds);
-    cmd.arg("s3").arg("cp").arg(src).arg(dst);
+    cmd.args(s3_transfer_argv("cp", src, dst, false));
     run("s3_cp", cmd).await
+}
+
+/// argv for `aws s3 <sync|cp>` (after the `aws` binary).
+///
+/// `--no-follow-symlinks` is ALWAYS passed (SA2 residual,
+/// ISSUE-KVD-CLI-9D5CF5): the enforcer canonicalises only the top-level local
+/// operand against the declared `local_roots`, but the AWS CLI follows
+/// symlinks while walking a local source by default, so a symlink planted
+/// under an allowed root would upload files from outside it. The flag is a
+/// documented option of `s3 cp`/`s3 sync` that governs local-source walking;
+/// for downloads and S3→S3 copies it is a no-op, so passing it
+/// unconditionally keeps the argv valid and fails closed.
+fn s3_transfer_argv(verb: &str, src: &str, dst: &str, delete: bool) -> Vec<String> {
+    let mut argv = vec![
+        "s3".to_string(),
+        verb.to_string(),
+        src.to_string(),
+        dst.to_string(),
+        "--no-follow-symlinks".to_string(),
+    ];
+    if delete {
+        argv.push("--delete".to_string());
+    }
+    argv
 }
 
 async fn cloudfront_invalidate(op_args: &Value, creds: &AwsCreds) -> KvendraResult<Value> {
@@ -252,4 +273,32 @@ async fn run(operation: &str, mut cmd: Command) -> KvendraResult<Value> {
 
 fn sanitize(bytes: &[u8]) -> String {
     crate::detection::sanitize_output(&String::from_utf8_lossy(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SA2 residual (ISSUE-KVD-CLI-9D5CF5): symlinks inside a declared local
+    /// root must never be followed by the AWS CLI walker.
+    #[test]
+    fn s3_sync_and_cp_always_pass_no_follow_symlinks() {
+        for (verb, src, dst, delete) in [
+            ("sync", "/work/site", "s3://bucket/prefix", false),
+            ("sync", "/work/site", "s3://bucket/prefix", true),
+            ("sync", "s3://bucket/prefix", "/work/site", false),
+            ("cp", "/work/file.txt", "s3://bucket/file.txt", false),
+            ("cp", "s3://bucket/file.txt", "/work/file.txt", false),
+        ] {
+            let argv = s3_transfer_argv(verb, src, dst, delete);
+            assert_eq!(&argv[..4], ["s3", verb, src, dst], "{argv:?}");
+            assert_eq!(
+                argv.iter().filter(|a| *a == "--no-follow-symlinks").count(),
+                1,
+                "{argv:?}"
+            );
+            assert!(!argv.iter().any(|a| a == "--follow-symlinks"), "{argv:?}");
+            assert_eq!(argv.iter().any(|a| a == "--delete"), delete, "{argv:?}");
+        }
+    }
 }
