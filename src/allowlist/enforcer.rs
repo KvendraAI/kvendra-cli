@@ -37,7 +37,9 @@
 //!   `s3://NAME/...` URI in the call.
 //! - **D6** `endpoints` is a literal exact-match alias for HTTP requests
 //!   that union with `url_pattern_regex` (any-match).
-//! - **D7** `accept_broad_scope` is checked at validator time (NOT here).
+//! - **D7** `accept_broad_scope` is checked at validator time (NOT here),
+//!   with one exception: `local_roots` are re-resolved per call, so a root
+//!   whose canonical form is `/` is re-refused here without the flag.
 //! - **D8** Order of checks: `is_expired → primitive lookup → operation
 //!   lookup → forbidden-first denylists → allow-list constraints`.
 
@@ -258,7 +260,13 @@ fn check_args(
                      declared — refusing (fail-closed)"
                 )));
             }
-            if !is_within_roots(path, roots) {
+            // Iter3 — roots are re-resolved per call; a root swapped to `/`
+            // (without accept_broad_scope) or left dangling fails closed.
+            let within = is_within_roots(path, roots, c.accept_broad_scope.unwrap_or(false))
+                .map_err(|e| {
+                    KvendraError::AllowlistViolation(format!("{primitive}.{operation}: {e}"))
+                })?;
+            if !within {
                 return Err(KvendraError::AllowlistViolation(format!(
                     "{primitive}.{operation}: local {field} '{path}' is outside every declared \
                      local root"

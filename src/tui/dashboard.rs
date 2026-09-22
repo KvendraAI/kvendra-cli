@@ -126,7 +126,11 @@ async fn render_loop(
                         ListItem::new(Line::from(Span::styled(
                             format!(
                                 "[{}] {} {}.{} {}",
-                                e.ts_unix_ms, e.profile_id, e.primitive, e.action, e.status
+                                e.ts_unix_ms,
+                                super::display_safe(&e.profile_id),
+                                super::display_safe(&e.primitive),
+                                super::display_safe(&e.action),
+                                super::display_safe(&e.status)
                             ),
                             Style::default().fg(color),
                         )))

@@ -1768,6 +1768,137 @@ async fn iter2_hostile_tool_name_is_stored_escaped_and_capped() {
     assert!(verify(&ctx).is_ok(), "the refusal row itself must verify");
 }
 
+/// `(profile_id, flags)` for every audit row, oldest first.
+async fn audit_profile_rows(ctx: &Arc<ServerContext>) -> Vec<(String, String)> {
+    drain(ctx).await;
+    let conn = rusqlite::Connection::open(ctx.vault.audit_db_path()).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT profile_id, flags FROM audit_events ORDER BY id ASC")
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+}
+
+fn assert_profile_escaped_and_capped(stored: &str) {
+    assert!(
+        stored
+            .chars()
+            .all(|c| c.is_ascii() && !c.is_ascii_control() && c != '|'),
+        "stored profile_id carries raw hostile bytes: {stored:?}"
+    );
+    assert!(stored.len() <= 131, "not capped: {}", stored.len());
+    assert!(stored.starts_with("shell\\u{1b}"), "{stored}");
+}
+
+/// Iter3 (log/terminal injection) — a hostile profile_id on the
+/// `invalid_profile_denied` refusal row is stored escaped + capped.
+#[tokio::test]
+async fn iter3_hostile_profile_id_on_invalid_profile_row_is_escaped_and_capped() {
+    let hostile = format!("shell\x1b[2J\r\nFAKE|row{}", "\x07".repeat(5000));
+    let (_dir, ctx) = bootstrap("shell.profile", SHELL_ECHO_ONLY, DetectionSeverity::Warn).await;
+    let resp = dispatch(
+        call(
+            "kvendra.shell",
+            json!({
+                "profile_id": hostile,
+                "operation": "exec",
+                "args": { "binary": "echo", "argv": ["hi"] }
+            }),
+        ),
+        ctx.clone(),
+    )
+    .await;
+    assert!(resp.error.is_some(), "hostile profile_id must be refused");
+    let rows = audit_profile_rows(&ctx).await;
+    let (stored, _) = rows
+        .iter()
+        .find(|(_, flags)| flags.split(',').any(|f| f == "invalid_profile_denied"))
+        .unwrap_or_else(|| panic!("no invalid_profile_denied row: {rows:?}"));
+    assert_profile_escaped_and_capped(stored);
+    assert!(verify(&ctx).is_ok(), "the refusal row itself must verify");
+}
+
+/// Iter3 — the `invalid_tool_field_denied` row is written BEFORE profile_id
+/// is validated; a hostile profile_id riding along is escaped too.
+#[tokio::test]
+async fn iter3_hostile_profile_id_on_invalid_tool_field_row_is_escaped_and_capped() {
+    let hostile = format!("shell\x1b[2J\r\nFAKE|row{}", "\x07".repeat(5000));
+    let (_dir, ctx) = bootstrap("shell.profile", SHELL_ECHO_ONLY, DetectionSeverity::Warn).await;
+    let resp = dispatch(
+        call(
+            "kvendra.shell|x",
+            json!({
+                "profile_id": hostile,
+                "operation": "exec",
+                "args": { "binary": "echo", "argv": ["hi"] }
+            }),
+        ),
+        ctx.clone(),
+    )
+    .await;
+    assert!(resp.error.is_some());
+    let rows = audit_profile_rows(&ctx).await;
+    let (stored, _) = rows
+        .iter()
+        .find(|(_, flags)| flags.split(',').any(|f| f == "invalid_tool_field_denied"))
+        .unwrap_or_else(|| panic!("no invalid_tool_field_denied row: {rows:?}"));
+    assert_profile_escaped_and_capped(stored);
+    assert!(verify(&ctx).is_ok(), "the refusal row itself must verify");
+}
+
+/// Iter3 — a VALID profile_id is still stored verbatim on refusal rows
+/// (escaping must not rewrite legitimate identifiers).
+#[tokio::test]
+async fn iter3_valid_profile_id_is_stored_verbatim_on_refusal_rows() {
+    let (_dir, ctx) = bootstrap("shell.profile", SHELL_ECHO_ONLY, DetectionSeverity::Warn).await;
+    let _ = dispatch(
+        call(
+            "kvendra.shell|x",
+            json!({ "profile_id": "shell.profile", "operation": "exec" }),
+        ),
+        ctx.clone(),
+    )
+    .await;
+    let rows = audit_profile_rows(&ctx).await;
+    assert!(
+        rows.iter().any(|(p, flags)| p == "shell.profile"
+            && flags.split(',').any(|f| f == "invalid_tool_field_denied")),
+        "{rows:?}"
+    );
+}
+
+/// Iter3 — end-to-end through the enforcer: a `local_roots` entry that was a
+/// real directory when signed and is later swapped for a symlink to `/`
+/// must fail closed (not turn every local operand into "inside").
+#[cfg(unix)]
+#[test]
+fn iter3_local_root_swapped_to_filesystem_root_is_denied_by_enforcer() {
+    let (_g, root) = sa2_roots_fixture();
+    let s = sa2_transfer_spec(&root);
+    assert!(sa2_sync(&s, "/etc", "s3://kvendra-com-prod/x").is_err());
+    std::fs::remove_dir_all(&root).unwrap();
+    std::os::unix::fs::symlink("/", &root).unwrap();
+    for src in ["/etc", "/Users"] {
+        let r = sa2_sync(&s, src, "s3://kvendra-com-prod/x");
+        let msg = format!("{r:?}");
+        assert!(
+            r.is_err() && msg.contains("filesystem root"),
+            "{src}: root swapped to / must fail closed, got {msg}"
+        );
+    }
+    // Dangling: the symlink target disappears.
+    std::fs::remove_file(&root).unwrap();
+    let gone = std::path::Path::new(&root).with_file_name("gone");
+    std::os::unix::fs::symlink(&gone, &root).unwrap();
+    let r = sa2_sync(&s, "/etc", "s3://kvendra-com-prod/x");
+    assert!(
+        format!("{r:?}").contains("dangling"),
+        "dangling root must fail closed, got {r:?}"
+    );
+}
+
 /// GREEN-only — `kvendra audit --verify` exits NON-ZERO on a layout
 /// violation (it used to print "BROKEN" and fall through to `Ok(())`). The
 /// child gets the temp `KVENDRA_HOME`; this process's env is untouched.

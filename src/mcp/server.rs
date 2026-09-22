@@ -672,6 +672,18 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    // Iter3 (log/terminal injection) — the agent-supplied profile_id is not
+    // validated until the `invalid_profile_denied` gate below, yet every
+    // refusal row written before that gate (and that gate's own row) records
+    // it. Persist an escaped, length-capped form unless it already passes
+    // `is_valid_profile_id`; past the gate `profile_id` is path-safe and this
+    // is identical to it.
+    let audit_profile_id =
+        if profile_id.is_empty() || crate::primitives::is_valid_profile_id(&profile_id) {
+            profile_id.clone()
+        } else {
+            audit_safe_repr(&profile_id)
+        };
     let mut flags = if name == "kvendra.unsafe.raw_token" {
         vec!["unsafe_escape_hatch".to_string()]
     } else {
@@ -698,7 +710,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             &ctx,
             &arguments,
             &stored_name,
-            &profile_id,
+            &audit_profile_id,
             &stored_action,
             &flags,
             true,
@@ -728,7 +740,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             &ctx,
             &arguments,
             name,
-            &profile_id,
+            &audit_profile_id,
             &action,
             &flags,
             true,
@@ -799,7 +811,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             &ctx,
             &arguments,
             name,
-            &profile_id,
+            &audit_profile_id,
             &action,
             &flags,
             true,

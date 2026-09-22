@@ -173,9 +173,13 @@ async fn run_loop(
                             match (&ev.error_code, &ev.error_message) {
                                 (Some(code), Some(msg)) => {
                                     let m: String = msg.chars().take(80).collect();
-                                    format!(" {code}: {m}")
+                                    format!(
+                                        " {}: {}",
+                                        super::display_safe(code),
+                                        super::display_safe(&m)
+                                    )
                                 }
-                                (Some(code), None) => format!(" {code}"),
+                                (Some(code), None) => format!(" {}", super::display_safe(code)),
                                 _ => String::new(),
                             }
                         } else {
@@ -184,10 +188,10 @@ async fn run_loop(
                         let text = format!(
                             "[{ts}] [{pid}] {prim}.{act} {st}{err} (id={id})",
                             ts = ev.ts_unix_ms,
-                            pid = ev.profile_id,
-                            prim = ev.primitive,
-                            act = ev.action,
-                            st = ev.status,
+                            pid = super::display_safe(&ev.profile_id),
+                            prim = super::display_safe(&ev.primitive),
+                            act = super::display_safe(&ev.action),
+                            st = super::display_safe(&ev.status),
                             err = err_suffix,
                             id = ev.id,
                         );

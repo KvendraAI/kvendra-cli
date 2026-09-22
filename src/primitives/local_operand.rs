@@ -138,19 +138,58 @@ pub fn resolve_local_path(p: &str) -> Option<PathBuf> {
     Some(cp.join(leaf))
 }
 
-/// `true` when the operand resolves inside (or equal to) one of `roots`.
+/// `Ok(true)` when the operand resolves inside (or equal to) one of `roots`.
 /// Roots must be absolute; each is canonicalized and a root that does not
 /// exist (or is relative) never matches. Containment is component-wise
 /// (`Path::starts_with` on canonical paths), so `<root>-evil` does not match
 /// `<root>` and `..` cannot survive canonicalization.
-pub fn is_within_roots(operand: &str, roots: &[String]) -> bool {
-    let Some(resolved) = resolve_local_path(operand) else {
-        return false;
-    };
-    roots.iter().any(|r| {
+///
+/// Iter3 — roots are re-canonicalized on every call, so a root that was a
+/// real directory at signing time can later be swapped for a symlink. The
+/// signing-time validator refuses a filesystem-root entry without
+/// `accept_broad_scope`; the same rule is re-applied HERE at runtime, and
+/// FAIL-CLOSED (`Err`, the whole call is refused — not just that root skipped):
+/// - a declared root whose canonical form is `/` is refused unless
+///   `accept_broad_scope` is set (otherwise a swap to `/` makes every operand
+///   "inside");
+/// - a declared root that is a dangling symlink (it exists as a link but no
+///   longer resolves) is refused — a tamper signal, not a missing directory.
+pub fn is_within_roots(
+    operand: &str,
+    roots: &[String],
+    accept_broad_scope: bool,
+) -> Result<bool, String> {
+    let mut canonical_roots = Vec::with_capacity(roots.len());
+    for r in roots {
         let rp = Path::new(r);
-        rp.is_absolute() && std::fs::canonicalize(rp).is_ok_and(|root| resolved.starts_with(&root))
-    })
+        if !rp.is_absolute() {
+            continue;
+        }
+        match std::fs::canonicalize(rp) {
+            Ok(root) => {
+                if root.parent().is_none() && !accept_broad_scope {
+                    return Err(format!(
+                        "local root '{r}' resolves to the filesystem root at runtime — \
+                         refusing without accept_broad_scope (fail-closed)"
+                    ));
+                }
+                canonical_roots.push(root);
+            }
+            Err(_) if std::fs::symlink_metadata(rp).is_ok() => {
+                return Err(format!(
+                    "local root '{r}' no longer resolves (dangling symlink) — refusing \
+                     (fail-closed)"
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+    let Some(resolved) = resolve_local_path(operand) else {
+        return Ok(false);
+    };
+    Ok(canonical_roots
+        .iter()
+        .any(|root| resolved.starts_with(root)))
 }
 
 #[cfg(test)]
@@ -203,11 +242,61 @@ mod tests {
         std::fs::create_dir(dir.path().join("root-evil")).unwrap();
         let roots = vec![root.to_string_lossy().into_owned()];
         let r = root.to_string_lossy();
-        assert!(is_within_roots(&r, &roots));
-        assert!(is_within_roots(&format!("{r}/not-yet"), &roots));
-        assert!(!is_within_roots(&format!("{r}/../root-evil/x"), &roots));
-        assert!(!is_within_roots(&format!("{r}-evil/x"), &roots));
-        assert!(!is_within_roots(&format!("{r}/missing/deeper"), &roots));
-        assert!(!is_within_roots("/etc", &["relative/root".to_string()]));
+        let within = |p: &str, rs: &[String]| is_within_roots(p, rs, false).unwrap();
+        assert!(within(&r, &roots));
+        assert!(within(&format!("{r}/not-yet"), &roots));
+        assert!(!within(&format!("{r}/../root-evil/x"), &roots));
+        assert!(!within(&format!("{r}-evil/x"), &roots));
+        assert!(!within(&format!("{r}/missing/deeper"), &roots));
+        assert!(!within("/etc", &["relative/root".to_string()]));
+        // A root that never existed simply never matches (not a hard deny).
+        let missing = vec![dir.path().join("nope").to_string_lossy().into_owned()];
+        assert!(!within(&r, &missing));
+    }
+
+    /// Iter3 — a declared root that is a real directory at signing time and is
+    /// later swapped for a symlink to `/` must NOT make every operand
+    /// "inside": the call is refused unless `accept_broad_scope` is set.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_swap_of_root_to_filesystem_root_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        assert_eq!(is_within_roots("/etc/hosts", &roots, false), Ok(false));
+
+        // Swap: the directory becomes a symlink to `/`.
+        std::fs::remove_dir(&root).unwrap();
+        std::os::unix::fs::symlink("/", &root).unwrap();
+        let err = is_within_roots("/etc/hosts", &roots, false)
+            .expect_err("root swapped to / must fail closed");
+        assert!(err.contains("filesystem root"), "{err}");
+        // Even an operand that is lexically under the root is refused.
+        assert!(is_within_roots(&format!("{}/etc", root.display()), &roots, false).is_err());
+        // Explicit broad scope keeps the owner's signed intent working.
+        assert_eq!(is_within_roots("/etc/hosts", &roots, true), Ok(true));
+    }
+
+    /// Iter3 — a literal `/` root (only signable with accept_broad_scope)
+    /// is likewise refused at runtime without the flag.
+    #[test]
+    fn literal_filesystem_root_requires_broad_scope_at_runtime() {
+        let roots = vec!["/".to_string()];
+        assert!(is_within_roots("/etc", &roots, false).is_err());
+        assert_eq!(is_within_roots("/etc", &roots, true), Ok(true));
+    }
+
+    /// Iter3 — a root that became a dangling symlink is refused outright.
+    #[cfg(unix)]
+    #[test]
+    fn dangling_root_symlink_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::os::unix::fs::symlink(dir.path().join("gone"), &root).unwrap();
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let err =
+            is_within_roots("/etc", &roots, true).expect_err("dangling root must fail closed");
+        assert!(err.contains("dangling"), "{err}");
     }
 }
