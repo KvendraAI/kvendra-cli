@@ -198,17 +198,20 @@ struct RawMatch {
 /// PAT-KVD-CLI-C18A74.
 ///
 /// Returns EVERY match of provider `idx` in `haystack` that passes the entropy
-/// gate, in order, non-overlapping. The gate is applied per match: a
-/// low-entropy decoy of the right shape must never disqualify the provider for
-/// the whole payload (ISSUE-KVD-CLI-8F501A). Two further rules close SA8-F1:
+/// gate, ordered by start; matches MAY OVERLAP. The gate is applied per match:
+/// a low-entropy decoy of the right shape must never disqualify the provider
+/// for the whole payload (ISSUE-KVD-CLI-8F501A). Further rules close SA8-F1
+/// and SA8-F2:
 ///
 /// - the gate scores a bounded window as well as the whole match
 ///   ([`gate_entropy`]), so in-charset padding cannot dilute a real key;
-/// - a REJECTED match is not consumed: scanning resumes at its next character,
-///   so a decoy whose tail swallows a real token's prefix cannot hide it.
+/// - NO match is consumed, accepted or rejected: scanning resumes at its next
+///   character, so a decoy whose tail swallows a real token's prefix cannot
+///   hide it — whether the decoy is low-entropy (rejected, SA8-F1) or
+///   high-entropy (accepted, SA8-F2). Callers merge overlapping spans.
 ///
 /// Work is capped by [`SCAN_BUDGET_FACTOR`]; past the cap the selector fails
-/// closed (see there).
+/// closed (see there) and goes back to non-overlapping `m.end()` steps.
 fn matches_above_threshold(idx: usize, haystack: &str) -> Vec<RawMatch> {
     let cp = compiled();
     let provider = cp.providers[idx];
@@ -246,10 +249,12 @@ fn matches_above_threshold(idx: usize, haystack: &str) -> Vec<RawMatch> {
                 text: text.to_string(),
                 entropy,
             });
-            pos = m.end();
-        } else {
-            pos = m.start() + text.chars().next().map_or(1, char::len_utf8);
         }
+        pos = if fail_closed {
+            m.end()
+        } else {
+            m.start() + text.chars().next().map_or(1, char::len_utf8)
+        };
     }
     out
 }
@@ -301,33 +306,50 @@ pub fn redact_values(text: &str, values: &[String]) -> String {
 
 /// Sanitize an output string by replacing detected tokens with a redaction
 /// marker. Used by primitive response sanitizers.
+///
+/// Every provider's accepted spans are collected against the ORIGINAL string
+/// (the same selector as [`detect`]), overlapping spans are merged, and the
+/// text is spliced once — so no span [`detect`] accepts can survive, whatever
+/// other span it overlaps (SA8-F2). Only strictly overlapping spans merge;
+/// adjacent tokens keep one marker each. A merged span is labelled with the
+/// provider of its earliest-starting span (ties: the longer span, then pattern
+/// order in [`patterns::PROVIDER_PATTERNS`]) — deterministic, and on inputs
+/// without overlap identical to the historical per-provider replacement.
 pub fn sanitize_output(s: &str) -> String {
     let cp = compiled();
-    let mut out = s.to_string();
-    let hits = cp.set.matches(&out);
+    let hits = cp.set.matches(s);
     if !hits.matched_any() {
-        return out;
+        return s.to_string();
     }
-    // Same selector as `detect`, applied sequentially per provider on the
-    // CURRENT `out` — byte-identical to the previous per-provider
-    // `replace_all` chain, including how a later provider sees the text an
-    // earlier one already rewrote.
+    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
     for idx in hits.iter() {
-        let provider = cp.providers[idx];
-        let marks = matches_above_threshold(idx, &out);
-        if marks.is_empty() {
-            continue;
-        }
-        let mut next = String::with_capacity(out.len());
-        let mut cursor = 0usize;
-        for m in &marks {
-            next.push_str(&out[cursor..m.start]);
-            next.push_str(&format!("<redacted:{provider}>"));
-            cursor = m.end;
-        }
-        next.push_str(&out[cursor..]);
-        out = next;
+        spans.extend(
+            matches_above_threshold(idx, s)
+                .into_iter()
+                .map(|m| (m.start, m.end, idx)),
+        );
     }
+    if spans.is_empty() {
+        return s.to_string();
+    }
+    spans.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0usize;
+    let mut i = 0usize;
+    while i < spans.len() {
+        let (start, mut end, idx) = spans[i];
+        i += 1;
+        while i < spans.len() && spans[i].0 < end {
+            end = end.max(spans[i].1);
+            i += 1;
+        }
+        out.push_str(&s[cursor..start]);
+        out.push_str("<redacted:");
+        out.push_str(cp.providers[idx]);
+        out.push('>');
+        cursor = end;
+    }
+    out.push_str(&s[cursor..]);
     out
 }
 
@@ -740,40 +762,60 @@ mod tests {
         out
     }
 
-    #[test]
-    fn sanitize_output_is_byte_identical_to_the_previous_replace_all() {
-        // On inputs WITHOUT prefix-swallowing overlap or in-charset dilution
-        // (every POOL entry is a standalone token followed by a separator),
-        // the new splice must reproduce `replace_all` exactly, including
-        // cross-provider order. The overlap/dilution shapes are where SA8-F1
-        // DELIBERATELY diverges — see `sa8_f1_*` below.
-        const POOL: &[&str] = &[
-            DECOY_GHP,
-            REAL_GHP,
-            REAL_GHP_2,
-            DECOY_NPM,
-            REAL_NPM,
-            "AKIAIOSFODNN7EXAMPLE",
-            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQ_abc123XYZ",
-            "sk-aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJ",
-            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----",
-            "just a plain log line",
-            "",
-        ];
-        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
-        let mut next = move || {
+    /// Accepted spans of every non-exempt provider against `s`, and whether
+    /// any two of them overlap — the precondition under which the single
+    /// splice may legitimately differ from the legacy chain.
+    fn has_overlapping_spans(s: &str) -> bool {
+        let cp = compiled();
+        let mut spans: Vec<(usize, usize)> = cp
+            .set
+            .matches(s)
+            .iter()
+            .flat_map(|idx| matches_above_threshold(idx, s))
+            .map(|m| (m.start, m.end))
+            .collect();
+        spans.sort_unstable();
+        spans.windows(2).any(|w| w[1].0 < w[0].1)
+    }
+
+    const DIFF_POOL: &[&str] = &[
+        DECOY_GHP,
+        REAL_GHP,
+        REAL_GHP_2,
+        DECOY_NPM,
+        REAL_NPM,
+        "AKIAIOSFODNN7EXAMPLE",
+        "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQ_abc123XYZ",
+        "sk-aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJ",
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----",
+        "just a plain log line",
+        "",
+    ];
+
+    fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed;
+        move || {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
             state
-        };
+        }
+    }
+
+    #[test]
+    fn sanitize_output_is_byte_identical_to_the_previous_replace_all() {
+        // Separated tokens never overlap, so the single splice must reproduce
+        // the legacy per-provider `replace_all` chain exactly, including the
+        // cross-provider label. The overlap/dilution shapes are where SA8-F1
+        // and SA8-F2 DELIBERATELY diverge — see `sa8_f*` below.
+        let mut next = xorshift(0x2545_f491_4f6c_dd1d);
         for _ in 0..4000 {
             let mut hay = String::new();
             let parts = next() % 6 + 1;
             for _ in 0..parts {
                 let r = next();
-                hay.push_str(POOL[(r % POOL.len() as u64) as usize]);
+                hay.push_str(DIFF_POOL[(r % DIFF_POOL.len() as u64) as usize]);
                 // `.is_multiple_of` (not `% 2 == 0`) — clippy::manual_is_multiple_of.
                 if r.is_multiple_of(2) {
                     hay.push(' ');
@@ -781,12 +823,46 @@ mod tests {
                     hay.push_str("\n| ");
                 }
             }
+            assert!(
+                !has_overlapping_spans(&hay),
+                "separated input overlaps: {hay:?}"
+            );
             assert_eq!(
                 sanitize_output(&hay),
                 legacy_sanitize_output(&hay),
                 "outbound bytes diverged on: {hay:?}"
             );
         }
+    }
+
+    #[test]
+    fn glued_tokens_match_legacy_exactly_when_no_accepted_spans_overlap() {
+        // Same pool, NO separators: tokens glue into each other. Identity with
+        // the legacy chain is required exactly when no two accepted spans
+        // overlap; where they do (e.g. an `sk-` body swallowing `AKIA…`) the
+        // bytes may differ and the parity property is asserted instead.
+        let mut next = xorshift(0x51f1_5eed_c0ff_ee01);
+        let (mut identical, mut overlapping) = (0usize, 0usize);
+        for _ in 0..4000 {
+            let mut hay = String::new();
+            for _ in 0..next() % 6 + 1 {
+                hay.push_str(DIFF_POOL[(next() % DIFF_POOL.len() as u64) as usize]);
+            }
+            let out = sanitize_output(&hay);
+            if has_overlapping_spans(&hay) {
+                overlapping += 1;
+                for h in detect(&hay) {
+                    assert!(!out.contains(&h.matched_text), "leak on {hay:?}: {out}");
+                }
+            } else {
+                identical += 1;
+                assert_eq!(out, legacy_sanitize_output(&hay), "diverged on: {hay:?}");
+            }
+        }
+        assert!(
+            identical > 1000 && overlapping > 100,
+            "generator lost coverage: {identical} identical, {overlapping} overlapping"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1035,5 +1111,487 @@ mod tests {
         let hay = "the quick brown fox jumps over the lazy dog sk- xoxb ".repeat(20_000);
         assert!(detect(&hay).is_empty());
         assert_eq!(sanitize_output(&hay), hay);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SA8-F2 — a HIGH-entropy decoy whose tail swallows the real token's
+    // prefix was accepted and consumed, so the real token (and, across
+    // providers, the sequential splice) leaked its body.
+    // ═══════════════════════════════════════════════════════════════════
+
+    const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const UPPER_NUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    /// Uppercase/digits without `A`, `I`, `K`: cannot form a stray `AKIA`.
+    const UPPER_NO_AKIA: &[u8] = b"QWERTYUPSDFGHJLZXCVBNM0123456789";
+
+    /// `n` pseudo-random chars of `charset` — high entropy for n >= 16.
+    fn hi(next: &mut impl FnMut() -> u64, charset: &[u8], n: usize) -> String {
+        (0..n)
+            .map(|_| charset[(next() % charset.len() as u64) as usize] as char)
+            .collect()
+    }
+
+    struct F2Case {
+        provider: &'static str,
+        prefix: &'static str,
+        /// Decoy body length (the quantifier's minimum for unbounded ones).
+        body: usize,
+        charset: &'static [u8],
+        real: String,
+        /// Bytes of `real` the decoy body can swallow (its in-charset head).
+        max_swallow: usize,
+    }
+
+    fn f2_cases() -> Vec<F2Case> {
+        let body36 = "aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJqWxY";
+        let c = |provider, prefix, body, charset, real: String, max_swallow| F2Case {
+            provider,
+            prefix,
+            body,
+            charset,
+            real,
+            max_swallow,
+        };
+        vec![
+            c(
+                "github_pat_classic",
+                "ghp_",
+                36,
+                ALNUM,
+                format!("ghp_{body36}"),
+                3,
+            ),
+            c(
+                "github_oauth",
+                "gho_",
+                36,
+                ALNUM,
+                format!("gho_{body36}"),
+                3,
+            ),
+            c(
+                "github_app_server",
+                "ghs_",
+                36,
+                ALNUM,
+                format!("ghs_{body36}"),
+                3,
+            ),
+            c(
+                "github_user_to_server",
+                "ghu_",
+                36,
+                ALNUM,
+                format!("ghu_{body36}"),
+                3,
+            ),
+            c("npm_token", "npm_", 36, ALNUM, format!("npm_{body36}"), 3),
+            c(
+                "hf_token",
+                "hf_",
+                34,
+                ALNUM,
+                format!("hf_{}", &body36[..34]),
+                2,
+            ),
+            c(
+                "aws_akid",
+                "AKIA",
+                16,
+                UPPER_NO_AKIA,
+                "AKIAIOSFODNN7EXAMPLE".into(),
+                3,
+            ),
+            c(
+                "openai_key",
+                "sk-",
+                48,
+                ALNUM,
+                format!("sk-{body36}Zq7Wm2Xv8Nb4Kc"),
+                2,
+            ),
+            c(
+                "stripe_secret_key",
+                "sk_live_",
+                24,
+                ALNUM,
+                "sk_live_aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0".into(),
+                2,
+            ),
+            c(
+                "aws_secret_env",
+                "aws_secret_access_key=",
+                40,
+                ALNUM,
+                "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+                3,
+            ),
+            c(
+                "google_oauth_token",
+                "ya29.",
+                20,
+                ALNUM,
+                "ya29.a0AfH6SMBx7yQk9vL2mNpQrStUvWxYz0123456789".into(),
+                4,
+            ),
+            c(
+                "google_api_key",
+                "AIza",
+                35,
+                ALNUM,
+                "AIzaSyAaB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJ".into(),
+                3,
+            ),
+            c(
+                "anthropic_key",
+                "sk-ant-",
+                60,
+                ALNUM,
+                F1_CASES[0].1.into(),
+                6,
+            ),
+            c(
+                "gitlab_pat",
+                "glpat-",
+                20,
+                ALNUM,
+                "glpat-aB3kP9zX1mQ7rL5tY2vN".into(),
+                5,
+            ),
+            c(
+                "slack_token",
+                "xoxb-",
+                10,
+                ALNUM,
+                "xoxb-1234567890-9876543210123-aB3kP9zX1mQ7rL5tY2vN4wE6".into(),
+                4,
+            ),
+        ]
+    }
+
+    const SWALLOW_ALL: &[&str] = &["anthropic_key", "gitlab_pat", "slack_token"];
+
+    #[test]
+    fn sa8_f2_high_entropy_decoy_overlap_is_redacted_whole_both_ways() {
+        let mut next = xorshift(0xf2f2_0000_dead_beef);
+        let (mut legacy_leaks, mut probes) = (0usize, 0usize);
+        for c in f2_cases() {
+            let real_body = &c.real[c.real.len() - 16..];
+            for j in 1..=c.max_swallow {
+                for _ in 0..8 {
+                    // `x <prefix><hi><real> y`: the decoy body swallows
+                    // exactly `j` bytes of `real`, and the decoy itself passes
+                    // the entropy gate (a HIGH-entropy decoy — the SA8-F2
+                    // shape). SWALLOW_ALL decoys run to the end of `real`, so
+                    // their own head need not pass.
+                    let decoy_body = loop {
+                        let b = hi(&mut next, c.charset, c.body - j);
+                        let decoy = format!("{}{b}{}", c.prefix, &c.real[..j]);
+                        if SWALLOW_ALL.contains(&c.provider)
+                            || shannon_entropy(&decoy) >= ENTROPY_THRESHOLD
+                        {
+                            break b;
+                        }
+                    };
+                    let hay = format!("x {}{decoy_body}{} y", c.prefix, c.real);
+                    probes += 1;
+                    let out = sanitize_output(&hay);
+                    assert_eq!(
+                        out,
+                        format!("x <redacted:{}> y", c.provider),
+                        "{}/j={j}: decoy+real must collapse to ONE marker: {hay}",
+                        c.provider
+                    );
+                    assert!(
+                        !out.contains(real_body),
+                        "{}/j={j}: body leaked",
+                        c.provider
+                    );
+                    // Where the body charset also holds the real token's
+                    // separator (`-`), the decoy swallows the WHOLE real token
+                    // and even the legacy chain redacted it; everywhere else
+                    // the legacy chain leaked the body.
+                    if legacy_sanitize_output(&hay).contains(real_body) {
+                        legacy_leaks += 1;
+                    } else {
+                        assert!(
+                            SWALLOW_ALL.contains(&c.provider),
+                            "{}: no legacy leak",
+                            c.provider
+                        );
+                        probes -= 1;
+                    }
+                    let hits = detect(&hay);
+                    if patterns::REDACT_ONLY_PROVIDERS.contains(&c.provider) {
+                        assert!(hits.is_empty(), "{}: redact-only blocked", c.provider);
+                        continue;
+                    }
+                    assert!(
+                        hits.iter()
+                            .any(|h| h.provider == c.provider && h.matched_text == c.real),
+                        "{}/j={j}: inbound missed the real token behind an accepted \
+                         decoy; got {:?}",
+                        c.provider,
+                        hits.iter().map(|h| &h.matched_text).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+        // The legacy chain (like the iteration-2 selector) consumed the
+        // accepted decoy and leaked the body on every other probe.
+        assert_eq!(legacy_leaks, probes);
+        assert!(
+            legacy_leaks >= 8 * 30,
+            "coverage: {legacy_leaks} legacy leaks"
+        );
+    }
+
+    #[test]
+    fn sa8_f2_cross_provider_overlap_ghp_then_akid() {
+        let mut next = xorshift(0xa1a1_2b2b_3c3c_4d4d);
+        let akid = "AKIAIOSFODNN7EXAMPLE";
+        for j in 1..=4 {
+            let hay = format!("ghp_{}{akid}", hi(&mut next, ALNUM, 36 - j));
+            let hits = detect(&hay);
+            assert!(
+                hits.iter()
+                    .any(|h| h.provider == "aws_akid" && h.matched_text == akid),
+                "j={j}: AKID behind an accepted ghp lost inbound: {hits:?}"
+            );
+            let out = sanitize_output(&hay);
+            assert_eq!(out, "<redacted:github_pat_classic>", "j={j}");
+            assert!(!out.contains("IOSFODNN7EXAMPLE"), "j={j}: AKID body leaked");
+        }
+    }
+
+    #[test]
+    fn sa8_f2_cross_provider_akid_then_ghp_and_nested() {
+        // `AKIA[0-9A-Z]{16}` cannot swallow a lowercase `ghp_` head, so the
+        // AKID-first shapes are: glued right before a ghp (adjacent, NOT
+        // merged — two tokens, two markers), NESTED in a ghp body, and an AKID
+        // whose tail swallows the head of a second AKID.
+        let mut next = xorshift(0x0bad_cafe_1234_5678);
+        let akid = "AKIAIOSFODNN7EXAMPLE";
+        let ghp = format!("ghp_{}", hi(&mut next, ALNUM, 36));
+        let glued = format!("{akid}{ghp}");
+        assert_eq!(
+            sanitize_output(&glued),
+            "<redacted:aws_akid><redacted:github_pat_classic>"
+        );
+        assert_eq!(detect(&glued).len(), 2);
+
+        let nested = format!(
+            "ghp_{}{akid}{}",
+            hi(&mut next, ALNUM, 8),
+            hi(&mut next, ALNUM, 8)
+        );
+        assert_eq!(sanitize_output(&nested), "<redacted:github_pat_classic>");
+        let hits = detect(&nested);
+        assert!(hits.iter().any(|h| h.provider == "aws_akid"), "{hits:?}");
+        assert!(hits.iter().any(|h| h.provider == "github_pat_classic"));
+
+        let chain = format!("AKIA{}{akid}", hi(&mut next, UPPER_NO_AKIA, 14));
+        assert_eq!(sanitize_output(&chain), "<redacted:aws_akid>");
+        assert!(detect(&chain).iter().any(|h| h.matched_text == akid));
+    }
+
+    #[test]
+    fn sa8_f2_triple_overlap_chains_collapse_to_one_marker() {
+        let mut next = xorshift(0x7777_1111_3333_5555);
+        let akid = "AKIAIOSFODNN7EXAMPLE";
+        for _ in 0..50 {
+            // ghp decoy → ghp real → AKID, each swallowing 2 bytes of the next.
+            let ghp_real = format!("ghp_{}AK", hi(&mut next, ALNUM, 34));
+            let a = format!("ghp_{}{}{}", hi(&mut next, ALNUM, 34), ghp_real, &akid[2..]);
+            // openai → ghp → npm, same shape.
+            let ghp_mid = format!("ghp_{}np", hi(&mut next, ALNUM, 34));
+            let npm = format!("npm_{}", hi(&mut next, ALNUM, 36));
+            let b = format!("sk-{}{}{}", hi(&mut next, ALNUM, 46), ghp_mid, &npm[2..]);
+            for (name, hay, label, secrets) in [
+                (
+                    "ghp>ghp>akid",
+                    &a,
+                    "github_pat_classic",
+                    [ghp_real.as_str(), akid],
+                ),
+                (
+                    "sk>ghp>npm",
+                    &b,
+                    "openai_key",
+                    [ghp_mid.as_str(), npm.as_str()],
+                ),
+            ] {
+                assert_eq!(
+                    sanitize_output(hay),
+                    format!("<redacted:{label}>"),
+                    "{name}"
+                );
+                let hits = detect(hay);
+                assert!(hits.len() >= 3, "{name}: every link reported: {hits:?}");
+                for s in secrets {
+                    assert!(
+                        hits.iter().any(|h| h.matched_text == s),
+                        "{name}: {s} lost inbound"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sa8_f2_parity_property_detected_text_never_survives_sanitize() {
+        // Seeded fuzz over prefixes, high/low-entropy runs, real tokens and
+        // separators glued arbitrarily: whatever `detect` reports must be
+        // absent from `sanitize_output` (decider/executor parity).
+        const PIECES: &[&str] = &[
+            "ghp_",
+            "gho_",
+            "ghs_",
+            "ghu_",
+            "npm_",
+            "hf_",
+            "AKIA",
+            "sk-",
+            "sk-ant-",
+            "sk_live_",
+            "rk_live_",
+            "aws_secret_access_key=",
+            "AWS_SECRET_ACCESS_KEY = ",
+            "ya29.",
+            "xoxb-",
+            "glpat-",
+            "AIza",
+            "pypi-AgEI",
+            "github_pat_",
+            "eyJ",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----END RSA PRIVATE KEY-----",
+            " ",
+            ".",
+            "_",
+            "-",
+            "/",
+            "\n",
+            "=",
+            "gh",
+            "np",
+            "sk",
+            "AK",
+            REAL_GHP,
+            REAL_NPM,
+            "AKIAIOSFODNN7EXAMPLE",
+        ];
+        let mut next = xorshift(0x9a41_7e57_0f00_d5ed);
+        let mut reported = 0usize;
+        for case in 0..20_000 {
+            let mut hay = String::new();
+            for _ in 0..next() % 12 + 1 {
+                match next() % 5 {
+                    0 | 1 => hay.push_str(PIECES[(next() % PIECES.len() as u64) as usize]),
+                    2 => {
+                        let n = (next() % 70 + 1) as usize;
+                        hay.push_str(&hi(&mut next, ALNUM, n));
+                    }
+                    3 => {
+                        let n = (next() % 30 + 1) as usize;
+                        hay.push_str(&hi(&mut next, UPPER_NUM, n));
+                    }
+                    _ => hay.push_str(&"a".repeat((next() % 60 + 1) as usize)),
+                }
+            }
+            let out = sanitize_output(&hay);
+            for h in detect(&hay) {
+                reported += 1;
+                assert!(
+                    !out.contains(&h.matched_text),
+                    "case {case}: {} {:?} survived in {out:?} (input {hay:?})",
+                    h.provider,
+                    h.matched_text
+                );
+            }
+        }
+        assert!(
+            reported > 5_000,
+            "generator lost coverage: {reported} findings"
+        );
+    }
+
+    #[test]
+    fn sa8_f2_lone_tokens_behave_as_before() {
+        // Resuming after an ACCEPTED match changes nothing for a lone token,
+        // and a lone low-entropy decoy is still neither reported nor mangled.
+        let mut next = xorshift(0x1357_9bdf_2468_ace0);
+        let tok = format!("ghp_{}", hi(&mut next, ALNUM, 36));
+        assert_eq!(detect(&tok).len(), 1);
+        assert_eq!(sanitize_output(&tok), "<redacted:github_pat_classic>");
+        assert!(detect(DECOY_GHP).is_empty());
+        assert_eq!(sanitize_output(DECOY_GHP), DECOY_GHP);
+    }
+
+    /// Release-mode perf probe: `cargo test --release --lib -- --ignored
+    /// sa8_f2_perf --nocapture`. 5 MiB adversarial inputs, detect + sanitize.
+    #[test]
+    #[ignore]
+    fn sa8_f2_perf_5mb_adversarial() {
+        const MB5: usize = 5 * 1024 * 1024;
+        let mut next = xorshift(0x5eed_5eed_5eed_5eed);
+        let fill = |unit: &str| unit.repeat(MB5 / unit.len());
+        let mut chain = |prefix: &str, charset: &[u8], n: usize| {
+            let mut s = String::with_capacity(MB5 + 64);
+            while s.len() < MB5 {
+                s.push_str(prefix);
+                s.push_str(&hi(&mut next, charset, n));
+            }
+            s
+        };
+        let ghp_chain = chain("ghp_", ALNUM, 34);
+        let akid_chain = chain("AKIA", UPPER_NO_AKIA, 14);
+        let sk_chain = chain("sk-", ALNUM, 46);
+        let random = hi(&mut next, ALNUM, MB5);
+        let cases: Vec<(&str, String)> = vec![
+            ("ghp_ + 34 hi, every decoy overlapping the next", ghp_chain),
+            ("AKIA + 14 hi, chained", akid_chain),
+            ("sk- + 46 hi, chained", sk_chain),
+            (
+                "xoxb- repeated + random tail",
+                format!("{}{}", fill("xoxb-"), &random[..4096]),
+            ),
+            (
+                "sk-ant- repeated + real key",
+                format!("{}{}", fill("sk-ant-"), F1_CASES[0].1),
+            ),
+            ("sk- + 5 MiB random alnum", format!("sk-{random}")),
+            (
+                "PEM BEGIN repeated, no END",
+                fill("-----BEGIN RSA PRIVATE KEY-----\n"),
+            ),
+            (
+                "pypi-AgEI repeated + random",
+                format!("{}{}", fill("pypi-AgEI"), &random[..4096]),
+            ),
+            ("random alnum", random.clone()),
+            (
+                "benign prose",
+                fill("the quick brown fox jumps over the lazy dog sk- xoxb "),
+            ),
+        ];
+        for (name, hay) in &cases {
+            let t = std::time::Instant::now();
+            let hits = detect(hay);
+            let td = t.elapsed();
+            let t = std::time::Instant::now();
+            let out = sanitize_output(hay);
+            let ts = t.elapsed();
+            println!(
+                "{name:<48} {:>5} KiB  detect {td:>9.2?}  sanitize {ts:>9.2?}  hits {:>6}  out {:>8} B",
+                hay.len() / 1024,
+                hits.len(),
+                out.len()
+            );
+            assert!(
+                td + ts < std::time::Duration::from_secs(1),
+                "{name}: {td:?} + {ts:?}"
+            );
+        }
     }
 }
