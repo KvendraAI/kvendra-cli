@@ -10,14 +10,17 @@ yanked = "deny"
 #  - RUSTSEC-2024-0436: `paste` is unmaintained but pulled in transitively
 #    by `ratatui`. Replacement requires upstream `ratatui` to swap to the
 #    maintained `pastey` fork. Tracked as a Pase C task.
-#  - RUSTSEC-2026-0002: `lru` IterMut soundness — pulled in transitively
-#    by `ratatui`. We never call `IterMut` in our codebase; resolution
-#    deferred until ratatui ships an updated `lru` dependency.
+#  - RUSTSEC-2026-0187 / RUSTSEC-2026-0192: see the `reason` on each entry
+#    below. Both are pinned by `printpdf` 0.7 (no semver-compatible fix);
+#    re-evaluate on the printpdf upgrade (SA10 follow-up).
+# RUSTSEC-2026-0002 (`lru` IterMut) removed 2026-09-22: the locked `lru`
+# 0.12.5 is outside the advisory range (cargo-deny: advisory-not-detected).
 # RUSTSEC-2025-0068 (serde_yml unsound) resolved via M2.5 migration to
 # `serde_yaml_ng`.
 ignore = [
   "RUSTSEC-2024-0436",
-  "RUSTSEC-2026-0002",
+  { id = "RUSTSEC-2026-0187", reason = "2026-09-22 SA10: lopdf 0.31 via printpdf 0.7 (fix needs lopdf >=0.42, no compatible printpdf). kvendra only WRITES PDFs (audit export); it never calls lopdf load/parse on untrusted input, so the parser stack overflow is unreachable." },
+  { id = "RUSTSEC-2026-0192", reason = "2026-09-22 SA10: ttf-parser 0.19 (unmaintained) via printpdf 0.7. kvendra renders with printpdf BuiltinFont only and never loads external/untrusted font files. Replace on the printpdf upgrade." },
 ]
 
 [licenses]
