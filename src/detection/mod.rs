@@ -47,6 +47,7 @@ struct CompiledPatterns {
     individual: Vec<Regex>,
     providers: Vec<&'static str>,
     windows: Vec<Option<usize>>,
+    shapes: Vec<PatternShape>,
 }
 
 static PATTERNS: OnceLock<CompiledPatterns> = OnceLock::new();
@@ -75,11 +76,16 @@ fn compiled() -> &'static CompiledPatterns {
                     .map(|(_, w)| *w)
             })
             .collect();
+        let shapes: Vec<PatternShape> = regexes
+            .iter()
+            .map(|r| PatternShape::of(r).unwrap_or_else(PatternShape::opaque))
+            .collect();
         CompiledPatterns {
             set,
             individual,
             providers,
             windows,
+            shapes,
         }
     })
 }
@@ -113,15 +119,394 @@ fn bytes_entropy(bytes: &[u8]) -> f64 {
 /// like `"ghp_lorem_ipsum_dolor_sit_amet_..."`.
 pub const ENTROPY_THRESHOLD: f64 = 3.5;
 
-/// Scan budget of one selector run, as a multiple of the haystack length (plus
-/// [`SCAN_BUDGET_FLOOR`]). Retrying at the next character after a rejected
-/// match re-runs the regex over overlapping spans; on an adversarial input
-/// (thousands of prefixes inside one long low-entropy run) that is quadratic.
-/// Once the budget is spent the selector FAILS CLOSED: every remaining match
-/// of that provider is accepted without the entropy gate and scanning goes
-/// back to non-overlapping — linear, and never a bypass.
+/// Scan budget of one selector run over an UNBOUNDED pattern, as a multiple of
+/// the haystack length (plus [`SCAN_BUDGET_FLOOR`]). Retrying at the next
+/// character after a match re-runs the regex over overlapping spans; when a
+/// match can be arbitrarily long (thousands of prefixes inside one long
+/// in-charset run) that is quadratic. Once the budget is spent the selector
+/// FAILS CLOSED: every remaining match of that provider is accepted without
+/// the entropy gate and widened to the end of the maximal run of its
+/// pattern's alphabet ([`PatternShape::alphabet`]) — linear, and never a
+/// bypass (see [`select`]). Length-BOUNDED patterns never spend budget: their
+/// next-character retry costs at most `len × max_len`.
 const SCAN_BUDGET_FACTOR: usize = 8;
 const SCAN_BUDGET_FLOOR: usize = 64 * 1024;
+
+/// Largest `max_len` (bytes) for which a pattern is scanned as length-bounded.
+/// A longer bound is treated as unbounded, so the uncapped retry of a bounded
+/// pattern stays within `len × BOUNDED_MATCH_LIMIT`.
+const BOUNDED_MATCH_LIMIT: usize = 256;
+
+/// Static shape of a provider pattern, DERIVED from its regex source by a
+/// small conservative analyser (ISSUE-KVD-CLI-8F501A, SA8-F2-bis).
+///
+/// `max_len` decides how the selector scans the provider; `alphabet` is what
+/// makes the post-budget fallback sound. Both are over-approximations: a
+/// construct the analyser does not understand yields `None` from
+/// [`PatternShape::of`], and the provider falls back to
+/// [`PatternShape::opaque`] — unbounded, every byte in the alphabet — which is
+/// fail-closed (a post-budget match then extends to the end of the text).
+#[derive(Debug, Clone)]
+struct PatternShape {
+    /// Longest possible match in BYTES; `None` = unbounded or longer than
+    /// [`BOUNDED_MATCH_LIMIT`].
+    max_len: Option<usize>,
+    /// Every byte that can occur inside a match. Bytes >= 0x80 are all-or-
+    /// nothing, so a maximal run of alphabet bytes always ends on a char
+    /// boundary.
+    alphabet: [bool; 256],
+}
+
+impl PatternShape {
+    fn opaque() -> Self {
+        PatternShape {
+            max_len: None,
+            alphabet: [true; 256],
+        }
+    }
+
+    fn of(src: &str) -> Option<Self> {
+        if !src.is_ascii() {
+            return None;
+        }
+        let mut parser = ShapeParser {
+            src: src.as_bytes(),
+            pos: 0,
+        };
+        let piece = parser.alt(&mut ShapeFlags::default())?;
+        if parser.pos != parser.src.len() {
+            return None;
+        }
+        Some(PatternShape {
+            max_len: piece.max.filter(|m| *m <= BOUNDED_MATCH_LIMIT),
+            alphabet: piece.alpha,
+        })
+    }
+
+    /// End of the maximal run of alphabet bytes starting at `from`.
+    fn run_end(&self, bytes: &[u8], from: usize) -> usize {
+        bytes[from..]
+            .iter()
+            .position(|b| !self.alphabet[*b as usize])
+            .map_or(bytes.len(), |off| from + off)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ShapeFlags {
+    case_insensitive: bool,
+    dot_all: bool,
+}
+
+/// Max length (`None` = unbounded) and alphabet of a sub-expression.
+struct ShapePiece {
+    max: Option<usize>,
+    alpha: [bool; 256],
+}
+
+impl ShapePiece {
+    fn empty() -> Self {
+        ShapePiece {
+            max: Some(0),
+            alpha: [false; 256],
+        }
+    }
+
+    /// One character drawn from `set` (ASCII bytes). Case folding and
+    /// Unicode-aware classes may match non-ASCII chars (e.g. `(?i)k` matches
+    /// U+212A KELVIN SIGN), which then count up to 4 bytes.
+    fn class(set: &[bool; 128], non_ascii: bool, flags: ShapeFlags) -> Self {
+        let mut alpha = [false; 256];
+        let mut wide = non_ascii;
+        for (b, on) in set.iter().enumerate() {
+            if *on {
+                alpha[b] = true;
+                if flags.case_insensitive && (b as u8).is_ascii_alphabetic() {
+                    alpha[(b as u8 ^ 0x20) as usize] = true;
+                    wide = true;
+                }
+            }
+        }
+        if wide {
+            alpha[128..].fill(true);
+        }
+        ShapePiece {
+            max: Some(if wide { 4 } else { 1 }),
+            alpha,
+        }
+    }
+
+    fn any(flags: ShapeFlags) -> Self {
+        let mut alpha = [true; 256];
+        if !flags.dot_all {
+            alpha[b'\n' as usize] = false;
+        }
+        ShapePiece {
+            max: Some(4),
+            alpha,
+        }
+    }
+
+    fn union_alpha(&mut self, other: &ShapePiece) {
+        for (a, b) in self.alpha.iter_mut().zip(other.alpha.iter()) {
+            *a |= *b;
+        }
+    }
+}
+
+/// Recursive-descent reader for the regex subset the provider table uses:
+/// literals, `\`-escapes, `.`, `[...]` classes, `(...)`/`(?:...)` groups,
+/// `(?is)` flags, `|`, and the `? * + {n} {n,} {n,m}` quantifiers (greedy or
+/// lazy). Anything else returns `None`.
+struct ShapeParser<'a> {
+    src: &'a [u8],
+    pos: usize,
+}
+
+impl ShapeParser<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.src.get(self.pos).copied()
+    }
+
+    fn bump(&mut self) -> Option<u8> {
+        let b = self.peek()?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn alt(&mut self, flags: &mut ShapeFlags) -> Option<ShapePiece> {
+        let mut acc = self.seq(flags)?;
+        while self.peek() == Some(b'|') {
+            self.pos += 1;
+            let branch = self.seq(flags)?;
+            acc.max = match (acc.max, branch.max) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                _ => None,
+            };
+            acc.union_alpha(&branch);
+        }
+        Some(acc)
+    }
+
+    fn seq(&mut self, flags: &mut ShapeFlags) -> Option<ShapePiece> {
+        let mut acc = ShapePiece::empty();
+        while !matches!(self.peek(), None | Some(b'|') | Some(b')')) {
+            let atom = self.atom(flags)?;
+            let piece = self.quantified(atom)?;
+            acc.max = match (acc.max, piece.max) {
+                (Some(a), Some(b)) => a.checked_add(b),
+                _ => None,
+            };
+            acc.union_alpha(&piece);
+        }
+        Some(acc)
+    }
+
+    fn atom(&mut self, flags: &mut ShapeFlags) -> Option<ShapePiece> {
+        match self.bump()? {
+            b'(' => self.group(flags),
+            b'[' => self.class(*flags),
+            b'.' => Some(ShapePiece::any(*flags)),
+            b'^' | b'$' => Some(ShapePiece::empty()),
+            b'\\' => match self.escape()? {
+                Escape::Empty => Some(ShapePiece::empty()),
+                Escape::Set(set, non_ascii) => Some(ShapePiece::class(&set, non_ascii, *flags)),
+                Escape::Any => Some(ShapePiece::any(ShapeFlags {
+                    dot_all: true,
+                    ..*flags
+                })),
+            },
+            b'*' | b'+' | b'?' | b'{' | b')' | b'|' | b']' | b'}' => None,
+            b => Some(ShapePiece::class(&single(b), false, *flags)),
+        }
+    }
+
+    fn group(&mut self, flags: &mut ShapeFlags) -> Option<ShapePiece> {
+        let mut inner = *flags;
+        if self.peek() == Some(b'?') {
+            self.pos += 1;
+            let mut on = true;
+            loop {
+                match self.bump()? {
+                    b'i' if on => inner.case_insensitive = true,
+                    b's' if on => inner.dot_all = true,
+                    b'i' | b's' | b'm' | b'u' | b'U' => {}
+                    b'-' => on = false,
+                    b')' => {
+                        *flags = inner;
+                        return Some(ShapePiece::empty());
+                    }
+                    b':' => break,
+                    _ => return None,
+                }
+            }
+        }
+        let piece = self.alt(&mut inner)?;
+        (self.bump()? == b')').then_some(piece)
+    }
+
+    fn class(&mut self, flags: ShapeFlags) -> Option<ShapePiece> {
+        if self.peek() == Some(b'^') {
+            return Some(ShapePiece::any(ShapeFlags {
+                dot_all: true,
+                ..flags
+            }));
+        }
+        let mut set = [false; 128];
+        let mut non_ascii = false;
+        let mut first = true;
+        loop {
+            let b = self.bump()?;
+            let lo = match b {
+                b']' if !first => break,
+                b'[' => return None,
+                b'&' | b'~' | b'-' if self.peek() == Some(b) && !first => return None,
+                b'\\' => match self.escape()? {
+                    Escape::Set(s, wide) if s.iter().filter(|x| **x).count() == 1 && !wide => {
+                        s.iter().position(|x| *x)? as u8
+                    }
+                    Escape::Set(s, wide) => {
+                        for (dst, src) in set.iter_mut().zip(s.iter()) {
+                            *dst |= *src;
+                        }
+                        non_ascii |= wide;
+                        first = false;
+                        continue;
+                    }
+                    Escape::Any => {
+                        return Some(ShapePiece::any(ShapeFlags {
+                            dot_all: true,
+                            ..flags
+                        }));
+                    }
+                    Escape::Empty => return None,
+                },
+                b => b,
+            };
+            first = false;
+            let hi = if self.peek() == Some(b'-') && self.src.get(self.pos + 1) != Some(&b']') {
+                self.pos += 1;
+                match self.bump()? {
+                    b'\\' => match self.escape()? {
+                        Escape::Set(s, false) if s.iter().filter(|x| **x).count() == 1 => {
+                            s.iter().position(|x| *x)? as u8
+                        }
+                        _ => return None,
+                    },
+                    b'[' | b']' => return None,
+                    h => h,
+                }
+            } else {
+                lo
+            };
+            if hi < lo {
+                return None;
+            }
+            for c in lo..=hi {
+                set[c as usize] = true;
+            }
+        }
+        Some(ShapePiece::class(&set, non_ascii, flags))
+    }
+
+    fn escape(&mut self) -> Option<Escape> {
+        let b = self.bump()?;
+        let ascii = |f: fn(&u8) -> bool| {
+            let mut set = [false; 128];
+            for c in 0u8..128 {
+                set[c as usize] = f(&c);
+            }
+            set
+        };
+        Some(match b {
+            b'A' | b'z' | b'b' | b'B' => Escape::Empty,
+            b's' => Escape::Set(ascii(|c| b"\t\n\x0b\x0c\r ".contains(c)), true),
+            b'd' => Escape::Set(ascii(u8::is_ascii_digit), true),
+            b'w' => Escape::Set(ascii(|c| c.is_ascii_alphanumeric() || *c == b'_'), true),
+            b'S' | b'D' | b'W' => Escape::Any,
+            b'n' => Escape::Set(single(b'\n'), false),
+            b't' => Escape::Set(single(b'\t'), false),
+            b'r' => Escape::Set(single(b'\r'), false),
+            b if b.is_ascii_punctuation() || b == b' ' => Escape::Set(single(b), false),
+            _ => return None,
+        })
+    }
+
+    fn quantified(&mut self, atom: ShapePiece) -> Option<ShapePiece> {
+        let unbounded = |atom: ShapePiece| ShapePiece {
+            max: if atom.max == Some(0) { Some(0) } else { None },
+            alpha: atom.alpha,
+        };
+        let piece = match self.peek() {
+            Some(b'?') => {
+                self.pos += 1;
+                atom
+            }
+            Some(b'*') | Some(b'+') => {
+                self.pos += 1;
+                unbounded(atom)
+            }
+            Some(b'{') => {
+                self.pos += 1;
+                let min = self.number()?;
+                let upper = match self.bump()? {
+                    b'}' => Some(min),
+                    b',' if self.peek() == Some(b'}') => {
+                        self.pos += 1;
+                        None
+                    }
+                    b',' => {
+                        let max = self.number()?;
+                        (self.bump()? == b'}' && max >= min).then_some(())?;
+                        Some(max)
+                    }
+                    _ => return None,
+                };
+                match upper {
+                    None => unbounded(atom),
+                    Some(n) => ShapePiece {
+                        max: atom.max.and_then(|m| m.checked_mul(n)),
+                        alpha: atom.alpha,
+                    },
+                }
+            }
+            _ => return Some(atom),
+        };
+        if self.peek() == Some(b'?') {
+            self.pos += 1;
+        }
+        if matches!(self.peek(), Some(b'?' | b'*' | b'+' | b'{')) {
+            return None;
+        }
+        Some(piece)
+    }
+
+    fn number(&mut self) -> Option<usize> {
+        let start = self.pos;
+        while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        std::str::from_utf8(&self.src[start..self.pos])
+            .ok()?
+            .parse()
+            .ok()
+    }
+}
+
+enum Escape {
+    /// Zero-width assertion (`\A`, `\z`, `\b`, `\B`).
+    Empty,
+    /// A set of ASCII bytes; `true` when the escape may also match non-ASCII.
+    Set([bool; 128], bool),
+    /// A negated class — any char.
+    Any,
+}
+
+fn single(b: u8) -> [bool; 128] {
+    let mut set = [false; 128];
+    set[b as usize] = true;
+    set
+}
 
 /// Entropy the gate compares against [`ENTROPY_THRESHOLD`]: the whole-match
 /// entropy (the historical measure, reported unchanged whenever it passes)
@@ -200,8 +585,8 @@ struct RawMatch {
 /// Returns EVERY match of provider `idx` in `haystack` that passes the entropy
 /// gate, ordered by start; matches MAY OVERLAP. The gate is applied per match:
 /// a low-entropy decoy of the right shape must never disqualify the provider
-/// for the whole payload (ISSUE-KVD-CLI-8F501A). Further rules close SA8-F1
-/// and SA8-F2:
+/// for the whole payload (ISSUE-KVD-CLI-8F501A). Further rules close SA8-F1,
+/// SA8-F2 and SA8-F2-bis:
 ///
 /// - the gate scores a bounded window as well as the whole match
 ///   ([`gate_entropy`]), so in-charset padding cannot dilute a real key;
@@ -210,18 +595,37 @@ struct RawMatch {
 ///   hide it — whether the decoy is low-entropy (rejected, SA8-F1) or
 ///   high-entropy (accepted, SA8-F2). Callers merge overlapping spans.
 ///
-/// Work is capped by [`SCAN_BUDGET_FACTOR`]; past the cap the selector fails
-/// closed (see there) and goes back to non-overlapping `m.end()` steps.
+/// See [`select`] for the work cap.
 fn matches_above_threshold(idx: usize, haystack: &str) -> Vec<RawMatch> {
+    let budget = haystack
+        .len()
+        .saturating_mul(SCAN_BUDGET_FACTOR)
+        .saturating_add(SCAN_BUDGET_FLOOR);
+    select(idx, haystack, budget)
+}
+
+/// [`matches_above_threshold`] with an explicit work budget.
+///
+/// A length-BOUNDED pattern ([`PatternShape::max_len`]) is never capped: the
+/// next-character retry costs at most `len × max_len`, so its semantics hold
+/// on every input (SA8-F2-bis: consuming bounded matches past a cap let a
+/// filler + decoy swallow a real token's prefix and leak its body).
+///
+/// An UNBOUNDED pattern spends `budget`; once it is exhausted every remaining
+/// match is accepted without the gate and its span is WIDENED to the end of
+/// the maximal run of the pattern's alphabet, where scanning resumes. Sound
+/// for any pattern: no match starts before the accepted one (leftmost
+/// search), and a match starting inside the widened span consists only of
+/// alphabet bytes, so it cannot cross the run's end — it is covered. Linear:
+/// every step advances past the widened end.
+fn select(idx: usize, haystack: &str, mut budget: usize) -> Vec<RawMatch> {
     let cp = compiled();
     let provider = cp.providers[idx];
     let always = patterns::ALWAYS_REDACT_PROVIDERS.contains(&provider);
     let window = cp.windows[idx];
+    let shape = &cp.shapes[idx];
+    let bounded = shape.max_len.is_some();
     let re = &cp.individual[idx];
-    let mut budget = haystack
-        .len()
-        .saturating_mul(SCAN_BUDGET_FACTOR)
-        .saturating_add(SCAN_BUDGET_FLOOR);
     let mut fail_closed = false;
     let mut out = Vec::new();
     let mut pos = 0usize;
@@ -229,20 +633,37 @@ fn matches_above_threshold(idx: usize, haystack: &str) -> Vec<RawMatch> {
         let Some(m) = re.find_at(haystack, pos) else {
             break;
         };
-        if !fail_closed {
+        let next_char = m.start()
+            + haystack[m.start()..]
+                .chars()
+                .next()
+                .map_or(1, char::len_utf8);
+        if !bounded && !fail_closed {
             let cost = (m.end() - pos) + m.len();
             match budget.checked_sub(cost) {
                 Some(left) => budget = left,
                 None => fail_closed = true,
             }
         }
+        if fail_closed {
+            let end = shape.run_end(haystack.as_bytes(), m.end());
+            let text = &haystack[m.start()..end];
+            out.push(RawMatch {
+                start: m.start(),
+                end,
+                text: text.to_string(),
+                entropy: shannon_entropy(text),
+            });
+            pos = end.max(next_char);
+            continue;
+        }
         let text = m.as_str();
-        let entropy = if always || fail_closed {
+        let entropy = if always {
             shannon_entropy(text)
         } else {
             gate_entropy(text, window)
         };
-        if always || fail_closed || entropy >= ENTROPY_THRESHOLD {
+        if always || entropy >= ENTROPY_THRESHOLD {
             out.push(RawMatch {
                 start: m.start(),
                 end: m.end(),
@@ -250,13 +671,22 @@ fn matches_above_threshold(idx: usize, haystack: &str) -> Vec<RawMatch> {
                 entropy,
             });
         }
-        pos = if fail_closed {
-            m.end()
-        } else {
-            m.start() + text.chars().next().map_or(1, char::len_utf8)
-        };
+        pos = next_char;
     }
     out
+}
+
+/// Providers whose matches have a bounded length, with that bound in bytes
+/// (derived from each pattern in [`patterns::PROVIDER_PATTERNS`]). These are
+/// scanned exhaustively on every input; every other provider is subject to
+/// the fail-closed work cap.
+pub fn bounded_providers() -> Vec<(&'static str, usize)> {
+    let cp = compiled();
+    cp.providers
+        .iter()
+        .zip(cp.shapes.iter())
+        .filter_map(|(p, s)| s.max_len.map(|m| (*p, m)))
+        .collect()
 }
 
 /// Run the regex set against `haystack`. Returns matches that pass the
@@ -1043,7 +1473,10 @@ mod tests {
             if patterns::ALWAYS_REDACT_PROVIDERS.contains(provider) {
                 continue;
             }
-            let unbounded = src.contains(",}") || src.contains('*') || src.contains('+');
+            let unbounded = PatternShape::of(src)
+                .unwrap_or_else(|| panic!("{provider}: pattern not analysable"))
+                .max_len
+                .is_none();
             let windowed = patterns::ENTROPY_WINDOWS.iter().any(|(p, _)| p == provider);
             assert_eq!(
                 unbounded, windowed,
@@ -1528,6 +1961,412 @@ mod tests {
         assert_eq!(sanitize_output(DECOY_GHP), DECOY_GHP);
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // SA8-F2-bis — past the work cap the selector CONSUMED matches, so a
+    // same-provider filler (`AKIA`×10k) + a bounded decoy swallowing the real
+    // token's prefix leaked its body. Bounded patterns are now never capped;
+    // unbounded ones widen post-cap matches to the end of their alphabet run.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// 92 high-entropy alphanumerics: bodies for synthetic real tokens.
+    const HI_BODY: &str = "Zq7Wm2Xv8Nb4Kc6Rt9Yh3Jd5Fg1Ls0PuAeB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJxQwErTyUiOpAsDfGhJkLzXcVbNm";
+
+    fn provider_index(provider: &str) -> usize {
+        compiled()
+            .providers
+            .iter()
+            .position(|p| *p == provider)
+            .unwrap_or_else(|| panic!("unknown provider {provider}"))
+    }
+
+    #[test]
+    fn pattern_shapes_are_derived_for_every_provider() {
+        let bounded: &[(&str, usize)] = &[
+            ("github_pat_classic", 40),
+            ("github_oauth", 40),
+            ("github_app_server", 40),
+            ("github_user_to_server", 40),
+            ("github_pat_fine", 93),
+            ("npm_token", 40),
+            ("hf_token", 37),
+            ("aws_akid", 20),
+            ("google_api_key", 39),
+        ];
+        for (provider, src) in patterns::PROVIDER_PATTERNS {
+            let shape = PatternShape::of(src)
+                .unwrap_or_else(|| panic!("{provider}: the shape analyser rejected {src}"));
+            let expected = bounded.iter().find(|(p, _)| p == provider).map(|(_, m)| *m);
+            assert_eq!(shape.max_len, expected, "{provider}: max_len");
+        }
+        let mut got = bounded_providers();
+        got.sort();
+        let mut want = bounded.to_vec();
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn pattern_shape_alphabet_and_max_len_are_sound() {
+        // Every match the real regex finds must fit the derived shape: no
+        // byte outside the alphabet, no match longer than max_len.
+        const POOL: &[&str] = &[
+            "ghp_",
+            "gho_",
+            "github_pat_",
+            "npm_",
+            "hf_",
+            "AKIA",
+            "AIza",
+            "sk-",
+            "sk-ant-",
+            "sk_live_",
+            "rk_live_",
+            "pypi-AgEI",
+            "xoxb-",
+            "glpat-",
+            "ya29.",
+            "eyJ",
+            ".",
+            "aws_secret_access_key",
+            "AWS_SECRET_ACCESS_KEY",
+            " = ",
+            "=",
+            "\t",
+            "\n",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----END RSA PRIVATE KEY-----",
+            "/",
+            "+",
+            "_",
+            "-",
+            "\u{212a}",
+            "\u{17f}",
+            "\u{85}",
+            "\u{a0}",
+            "é",
+            "\u{1F511}",
+        ];
+        let mut next = xorshift(0x5a4e_0f5e_ed00_0001);
+        let cp = compiled();
+        let mut checked = 0usize;
+        for _ in 0..6_000 {
+            let mut hay = String::new();
+            for _ in 0..next() % 10 + 1 {
+                match next() % 3 {
+                    0 => hay.push_str(POOL[(next() % POOL.len() as u64) as usize]),
+                    1 => {
+                        let n = (next() % 90 + 1) as usize;
+                        hay.push_str(&hi(&mut next, ALNUM, n));
+                    }
+                    _ => {
+                        let n = (next() % 50 + 1) as usize;
+                        hay.push_str(&hi(&mut next, b"Aa0_-/+=. xXkKsS", n));
+                    }
+                }
+            }
+            for (idx, re) in cp.individual.iter().enumerate() {
+                let shape = &cp.shapes[idx];
+                for m in re.find_iter(&hay) {
+                    checked += 1;
+                    if let Some(max) = shape.max_len {
+                        assert!(m.len() <= max, "{}: {:?}", cp.providers[idx], m.as_str());
+                    }
+                    assert!(
+                        m.as_str().bytes().all(|b| shape.alphabet[b as usize]),
+                        "{}: byte outside the derived alphabet in {:?}",
+                        cp.providers[idx],
+                        m.as_str()
+                    );
+                }
+            }
+        }
+        assert!(checked > 1_000, "generator lost coverage: {checked}");
+    }
+
+    #[test]
+    fn pattern_shape_analyser_is_fail_closed_on_unknown_syntax() {
+        for src in [
+            r"(?x)a b",
+            r"[[:alpha:]]{3}",
+            r"\p{L}{4}",
+            r"(?P<n>ab)",
+            r"a{2",
+            r"[a-z&&[^x]]",
+            r"(ab",
+        ] {
+            assert!(PatternShape::of(src).is_none(), "{src} should be rejected");
+        }
+        let opaque = PatternShape::opaque();
+        assert!(opaque.max_len.is_none());
+        assert!(opaque.alphabet.iter().all(|b| *b));
+        // Case folding reaches non-ASCII (`(?i)k` matches U+212A) — the
+        // alphabet must include it or a post-cap run could stop mid-match.
+        let folded = PatternShape::of(r"(?i)k{3}").unwrap();
+        assert!(folded.alphabet[b'K' as usize] && folded.alphabet[0xE2]);
+        assert_eq!(folded.max_len, Some(12));
+        assert_eq!(PatternShape::of(r"a{300}").unwrap().max_len, None);
+    }
+
+    /// Every match of provider `idx`, next-character retry, no gate, no cap.
+    fn reference_spans(idx: usize, hay: &str) -> Vec<(usize, usize, f64)> {
+        let re = &compiled().individual[idx];
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while let Some(m) = re.find_at(hay, pos) {
+            out.push((m.start(), m.end(), shannon_entropy(m.as_str())));
+            pos = m.start() + hay[m.start()..].chars().next().map_or(1, char::len_utf8);
+        }
+        out
+    }
+
+    #[test]
+    fn sa8_f2_bis_post_budget_selector_covers_every_match() {
+        // With the budget forced to ZERO every unbounded provider runs in
+        // fail-closed mode from its first match: each span the exhaustive
+        // scan finds must lie inside ONE selected span. Bounded providers
+        // ignore the budget: their selection is exactly the gated exhaustive
+        // scan.
+        const PIECES: &[&str] = &[
+            "ghp_",
+            "npm_",
+            "hf_",
+            "AKIA",
+            "AIza",
+            "github_pat_",
+            "sk-",
+            "sk-ant-",
+            "sk_live_",
+            "pypi-AgEI",
+            "xoxb-",
+            "glpat-",
+            "ya29.",
+            "eyJ",
+            ".",
+            "-",
+            "_",
+            " ",
+            "\n",
+            "aws_secret_access_key = ",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----END RSA PRIVATE KEY-----",
+            "-----",
+            "\u{212a}",
+            "AKIAIOSFODNN7EXAMPLE",
+        ];
+        let mut next = xorshift(0xb15b_15b1_5b15_b15b);
+        let cp = compiled();
+        let mut covered = 0usize;
+        for case in 0..3_000 {
+            let mut hay = String::new();
+            for _ in 0..next() % 14 + 1 {
+                match next() % 4 {
+                    0 | 1 => {
+                        let piece = PIECES[(next() % PIECES.len() as u64) as usize];
+                        let reps = if next() % 4 == 1 {
+                            (next() % 40 + 2) as usize
+                        } else {
+                            1
+                        };
+                        hay.push_str(&piece.repeat(reps));
+                    }
+                    2 => {
+                        let n = (next() % 90 + 1) as usize;
+                        hay.push_str(&hi(&mut next, ALNUM, n));
+                    }
+                    _ => hay.push_str(&"A".repeat((next() % 50 + 1) as usize)),
+                }
+            }
+            for idx in 0..cp.providers.len() {
+                let selected = select(idx, &hay, 0);
+                let reference = reference_spans(idx, &hay);
+                if cp.shapes[idx].max_len.is_some() {
+                    let full = select(idx, &hay, usize::MAX);
+                    let spans =
+                        |v: &[RawMatch]| v.iter().map(|m| (m.start, m.end)).collect::<Vec<_>>();
+                    assert_eq!(
+                        spans(&selected),
+                        spans(&full),
+                        "case {case}: {}",
+                        cp.providers[idx]
+                    );
+                    let gated: Vec<(usize, usize)> = reference
+                        .iter()
+                        .filter(|r| r.2 >= ENTROPY_THRESHOLD)
+                        .map(|r| (r.0, r.1))
+                        .collect();
+                    assert_eq!(
+                        spans(&selected),
+                        gated,
+                        "case {case}: {}",
+                        cp.providers[idx]
+                    );
+                    continue;
+                }
+                for (s, e, _) in &reference {
+                    covered += 1;
+                    assert!(
+                        selected.iter().any(|m| m.start <= *s && *e <= m.end),
+                        "case {case}: {} span {s}..{e} {:?} not covered post-cap in {hay:?}",
+                        cp.providers[idx],
+                        &hay[*s..*e]
+                    );
+                }
+            }
+        }
+        assert!(covered > 5_000, "generator lost coverage: {covered}");
+    }
+
+    #[test]
+    fn sa8_f2_bis_bounded_fillers_never_leak() {
+        // Table-driven over every bounded provider: a same-prefix filler big
+        // enough to exhaust the old cap, then (a) a decoy swallowing j bytes
+        // of the real token, (b) the real token glued, (c) after a space.
+        for (provider, max_len) in bounded_providers() {
+            let src = patterns::PROVIDER_PATTERNS
+                .iter()
+                .find(|(p, _)| *p == provider)
+                .unwrap()
+                .1;
+            let prefix: String = src
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            let body_len = max_len - prefix.len();
+            let body: String = if provider == "aws_akid" {
+                "IOSFODNN7EXAMPLE".to_string()
+            } else {
+                HI_BODY[..body_len].to_string()
+            };
+            let real = format!("{prefix}{body}");
+            assert!(
+                Regex::new(&format!("^(?:{src})$")).unwrap().is_match(&real),
+                "{provider}: synthetic token {real} does not match"
+            );
+            let fill = body[..1].to_string();
+            let filler = prefix.repeat(40_000 / prefix.len());
+            let mut hays = vec![format!("{filler}{real} y"), format!("{filler} {real} y")];
+            for j in [1, prefix.len() - 1, prefix.len(), prefix.len() + 3] {
+                let decoy = format!("{prefix}{}", fill.repeat(body_len - j));
+                hays.push(format!("{filler} x {decoy}{real} y"));
+                hays.push(format!("{filler}{decoy}{real} y"));
+            }
+            for hay in &hays {
+                let out = sanitize_output(hay);
+                for w in 0..=body.len() - 16 {
+                    assert!(
+                        !out.contains(&body[w..w + 16]),
+                        "{provider}: body leaked: {}",
+                        &out[out.len().saturating_sub(200)..]
+                    );
+                }
+                assert!(
+                    detect(hay)
+                        .iter()
+                        .any(|h| h.provider == provider && h.matched_text == real),
+                    "{provider}: real token not reported"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sa8_f2_bis_unbounded_post_cap_overlap_is_covered() {
+        // Unbounded prefixes that are NOT in their own body charset (`sk-`,
+        // `sk_live_`, `ya29.`) — a post-cap match used to end right inside
+        // the next real token's prefix. After a cap-exhausting anthropic run
+        // the widened span must still cover it.
+        let real = F1_CASES[0].1;
+        let hay = format!(
+            "{}sk-ant-{}{real} tail",
+            "sk-ant-".repeat(20_000),
+            "a".repeat(58)
+        );
+        let out = sanitize_output(&hay);
+        assert!(!out.contains(&real[7..40]), "anthropic body leaked");
+        assert!(out.ends_with(" tail"));
+        let idx = provider_index("openai_key");
+        let openai = "sk-aB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJaB3kP9zX1mQ7rL5tY2vN4wE6sH8dC0fJ";
+        let glued = format!("sk-{}sk{}", "a".repeat(48), &openai[2..]);
+        let sel = select(idx, &glued, 0);
+        let (s, e) = (glued.len() - openai.len(), glued.len());
+        assert!(
+            sel.iter().any(|m| m.start <= s && e <= m.end),
+            "openai overlap uncovered post-cap"
+        );
+        // JWT: the real token starts inside the post-cap match's second
+        // segment; its signature lies past the match's end (RED at e78ed87).
+        let sig = "Sg7Wm2Xv8Nb4Kc6Rt9Yh3Jd5Fg1Ls0Pu";
+        let jwt = format!(
+            "{}.eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.{sig} end",
+            "eyJ".repeat(20_000)
+        );
+        assert!(!sanitize_output(&jwt).contains(sig), "jwt signature leaked");
+        // PEM: the next BEGIN shares the dashes of the post-cap match's END.
+        let key = "MIIEowIBAAKCAQEAq7Wm2Xv8Nb4Kc6Rt9Yh3Jd5Fg1Ls0Pu";
+        let pem = format!(
+            "{}-----END RSA PRIVATE KEY-----BEGIN RSA PRIVATE KEY-----\n{key}\n-----END RSA PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----".repeat(3_000)
+        );
+        assert!(!sanitize_output(&pem).contains(key), "PEM body leaked");
+    }
+
+    #[test]
+    fn sa8_f2_bis_parity_with_budget_exhausting_fillers() {
+        // The SA8-F2 parity property on inputs that drive unbounded providers
+        // past the cap and bounded providers through long filler runs.
+        const FILLERS: &[&str] = &[
+            "AKIA",
+            "AIza",
+            "github_pat_",
+            "ghp_",
+            "hf_",
+            "sk-ant-",
+            "xoxb-",
+            "pypi-AgEI",
+            "glpat-",
+            "-----BEGIN RSA PRIVATE KEY-----",
+        ];
+        const TAILS: &[&str] = &[
+            REAL_GHP,
+            REAL_NPM,
+            "AKIAIOSFODNN7EXAMPLE",
+            " ",
+            ".",
+            "-",
+            "_",
+            "sk-",
+            "ya29.",
+            "eyJ",
+            "\n",
+        ];
+        let mut next = xorshift(0xf111_e25f_111e_25f1);
+        let mut reported = 0usize;
+        for case in 0..60 {
+            let filler = FILLERS[(next() % FILLERS.len() as u64) as usize];
+            let mut hay = filler.repeat((next() % 12_000 + 2_000) as usize);
+            for _ in 0..next() % 8 + 1 {
+                match next() % 3 {
+                    0 => hay.push_str(TAILS[(next() % TAILS.len() as u64) as usize]),
+                    1 => hay.push_str(filler),
+                    _ => {
+                        let n = (next() % 70 + 1) as usize;
+                        hay.push_str(&hi(&mut next, ALNUM, n));
+                    }
+                }
+            }
+            let out = sanitize_output(&hay);
+            for h in detect(&hay) {
+                reported += 1;
+                assert!(
+                    !out.contains(&h.matched_text),
+                    "case {case}: {} survived (filler {filler})",
+                    h.provider
+                );
+            }
+        }
+        assert!(reported > 30, "generator lost coverage: {reported}");
+    }
+
     /// Release-mode perf probe: `cargo test --release --lib -- --ignored
     /// sa8_f2_perf --nocapture`. 5 MiB adversarial inputs, detect + sanitize.
     #[test]
@@ -1570,6 +2409,31 @@ mod tests {
                 format!("{}{}", fill("pypi-AgEI"), &random[..4096]),
             ),
             ("random alnum", random.clone()),
+            (
+                "AKIA x N + decoy swallowing 1 byte + real",
+                format!(
+                    "{} x AKIA{}AKIAIOSFODNN7EXAMPLE",
+                    fill("AKIA"),
+                    "I".repeat(15)
+                ),
+            ),
+            (
+                "AKIA x N glued to real",
+                format!("{}AKIAIOSFODNN7EXAMPLE", fill("AKIA")),
+            ),
+            (
+                "AIza x N glued to real",
+                format!("{}AIza{}", fill("AIza"), &HI_BODY[..35]),
+            ),
+            (
+                "github_pat_ x N glued to real",
+                format!("{}github_pat_{}", fill("github_pat_"), &HI_BODY[..82]),
+            ),
+            (
+                "ghp_ x N glued to real",
+                format!("{}{REAL_GHP}", fill("ghp_")),
+            ),
+            ("hf_ x N", fill("hf_")),
             (
                 "benign prose",
                 fill("the quick brown fox jumps over the lazy dog sk- xoxb "),

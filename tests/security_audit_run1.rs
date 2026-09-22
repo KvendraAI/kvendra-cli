@@ -51,7 +51,7 @@ use kvendra::approval::{ApprovalCache, ApprovalMode, Transport};
 use kvendra::audit::AuditWriter;
 use kvendra::audit::hmac::{compute_hmac_v2, compute_hmac_v3};
 use kvendra::config::{Config, DetectionSeverity};
-use kvendra::detection::{detect, sanitize_output};
+use kvendra::detection::{bounded_providers, detect, sanitize_output};
 use kvendra::mcp::protocol::JsonRpcRequest;
 use kvendra::mcp::server::{ServerContext, dispatch};
 use kvendra::vault::kdf::KdfParams;
@@ -2921,6 +2921,264 @@ async fn sa8_f1_overlap_must_not_defeat_the_inbound_block_gate() {
         .error
         .as_ref()
         .expect("a key smuggled behind an overlapping decoy must be refused");
+    assert!(
+        err.message.contains("severity=block"),
+        "the inbound detection gate must refuse at severity=block; got: {}",
+        err.message
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SA8-F2-bis (validation-loop iteration 4, Medium) — once the scan budget was
+// spent the selector CONSUMED matches (`m.end()`), so for a length-bounded
+// provider whose prefix lies in its own body charset, a same-provider filler
+// (`"AKIA"×10000`, `"AIza"×10000`, `"github_pat_"×1000`) exhausted the budget
+// and then a bounded decoy swallowing j bytes of the real token — or the
+// filler glued straight onto it — leaked the real body outbound
+// (`x <redacted:aws_akid>KIAIOSFODNN7EXAMPLE y`). Bounded providers are now
+// scanned exhaustively on every input; the matrix below runs for EVERY
+// provider `bounded_providers()` derives from the pattern table.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// (provider, prefix, real-shaped token) — one row per bounded provider.
+const SA8_F2BIS_BOUNDED: &[(&str, &str, &str)] = &[
+    ("github_pat_classic", "ghp_", REAL_GHP),
+    (
+        "github_oauth",
+        "gho_",
+        "gho_Zq7Wm2Xv8Nb4Kc6Rt9Yh3Jd5Fg1Ls0PuAeB3",
+    ),
+    (
+        "github_app_server",
+        "ghs_",
+        "ghs_Zq7Wm2Xv8Nb4Kc6Rt9Yh3Jd5Fg1Ls0PuAeB3",
+    ),
+    (
+        "github_user_to_server",
+        "ghu_",
+        "ghu_Zq7Wm2Xv8Nb4Kc6Rt9Yh3Jd5Fg1Ls0PuAeB3",
+    ),
+    (
+        "github_pat_fine",
+        "github_pat_",
+        "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",
+    ),
+    (
+        "npm_token",
+        "npm_",
+        "npm_Zq7Wm2Xv8Nb4Kc6Rt9Yh3Jd5Fg1Ls0PuAeB3",
+    ),
+    ("hf_token", "hf_", "hf_Zq7Wm2Xv8Nb4Kc6Rt9Yh3Jd5Fg1Ls0PuAe"),
+    ("aws_akid", "AKIA", "AKIAIOSFODNN7EXAMPLE"),
+    (
+        "google_api_key",
+        "AIza",
+        "AIzaZq7Wm2Xv8Nb4Kc6Rt9Yh3Jd5Fg1Ls0PuAeB",
+    ),
+];
+
+/// TABLE CONSISTENCY — a new bounded pattern must get a row here (and so the
+/// filler matrix) before the suite goes green.
+#[test]
+fn sa8_f2bis_every_bounded_provider_has_a_filler_case() {
+    let mut derived: Vec<(&str, usize)> = bounded_providers();
+    derived.sort();
+    let mut table: Vec<(&str, usize)> = SA8_F2BIS_BOUNDED
+        .iter()
+        .map(|(p, _, real)| (*p, real.len()))
+        .collect();
+    table.sort();
+    assert_eq!(
+        derived, table,
+        "bounded providers derived from the pattern table (provider, max_len) \
+         != SA8_F2BIS_BOUNDED rows"
+    );
+}
+
+fn sa8_f2bis_assert_no_leak(provider: &str, prefix: &str, real: &str, shape: &str, hay: &str) {
+    let body = &real[prefix.len()..];
+    let out = sanitize_output(hay);
+    for w in 0..=body.len() - 16 {
+        let window = &body[w..w + 16];
+        assert!(
+            !out.contains(window),
+            "{provider}/{shape}: 16-char body window {window:?} survived \
+             sanitize_output; output tail: {:?}",
+            &out[out.len().saturating_sub(160)..]
+        );
+    }
+    let hits = detect(hay);
+    assert!(
+        hits.iter()
+            .any(|h| h.provider == provider && h.matched_text == real),
+        "{provider}/{shape}: detect() did not report the real token; \
+         providers reported: {:?}",
+        hits.iter().map(|h| h.provider.as_str()).collect::<Vec<_>>()
+    );
+}
+
+/// Fillers of 1k / 10k / 100k prefix repetitions followed by (a) a bounded
+/// low-entropy decoy that swallows j bytes of the real token (after a
+/// separator and glued to the filler), (b) the real token glued to the
+/// filler, (c) the real token after a separator.
+fn sa8_f2bis_filler_matrix(provider: &str) {
+    let (_, prefix, real) = SA8_F2BIS_BOUNDED
+        .iter()
+        .find(|(p, ..)| *p == provider)
+        .unwrap_or_else(|| panic!("no SA8-F2-bis row for {provider}"));
+    let body_len = real.len() - prefix.len();
+    let fill = &real[prefix.len()..prefix.len() + 1];
+    for reps in [1_000usize, 10_000, 100_000] {
+        let filler = prefix.repeat(reps);
+        for j in [1, prefix.len()] {
+            let decoy = format!("{prefix}{}", fill.repeat(body_len - j));
+            sa8_f2bis_assert_no_leak(
+                provider,
+                prefix,
+                real,
+                &format!("{reps}x filler + separator + decoy(j={j}) + real"),
+                &format!("{filler} x {decoy}{real} y"),
+            );
+            sa8_f2bis_assert_no_leak(
+                provider,
+                prefix,
+                real,
+                &format!("{reps}x filler + decoy(j={j}) + real"),
+                &format!("{filler}{decoy}{real} y"),
+            );
+        }
+        sa8_f2bis_assert_no_leak(
+            provider,
+            prefix,
+            real,
+            &format!("{reps}x filler glued to real"),
+            &format!("{filler}{real} y"),
+        );
+        sa8_f2bis_assert_no_leak(
+            provider,
+            prefix,
+            real,
+            &format!("{reps}x filler + separator + real"),
+            &format!("{filler} {real} y"),
+        );
+    }
+}
+
+#[test]
+fn sa8_f2bis_aws_akid_filler_matrix() {
+    sa8_f2bis_filler_matrix("aws_akid");
+}
+
+#[test]
+fn sa8_f2bis_google_api_key_filler_matrix() {
+    sa8_f2bis_filler_matrix("google_api_key");
+}
+
+#[test]
+fn sa8_f2bis_github_pat_fine_filler_matrix() {
+    sa8_f2bis_filler_matrix("github_pat_fine");
+}
+
+#[test]
+fn sa8_f2bis_github_pat_classic_filler_matrix() {
+    sa8_f2bis_filler_matrix("github_pat_classic");
+}
+
+#[test]
+fn sa8_f2bis_github_oauth_filler_matrix() {
+    sa8_f2bis_filler_matrix("github_oauth");
+}
+
+#[test]
+fn sa8_f2bis_github_app_server_filler_matrix() {
+    sa8_f2bis_filler_matrix("github_app_server");
+}
+
+#[test]
+fn sa8_f2bis_github_user_to_server_filler_matrix() {
+    sa8_f2bis_filler_matrix("github_user_to_server");
+}
+
+#[test]
+fn sa8_f2bis_npm_token_filler_matrix() {
+    sa8_f2bis_filler_matrix("npm_token");
+}
+
+#[test]
+fn sa8_f2bis_hf_token_filler_matrix() {
+    sa8_f2bis_filler_matrix("hf_token");
+}
+
+/// The validator's exact reproductions, verbatim shapes.
+#[test]
+fn sa8_f2bis_validator_reproductions_are_closed() {
+    let akid = format!(
+        "{} x AKIA{}AKIAIOSFODNN7EXAMPLE y",
+        "AKIA".repeat(10_000),
+        "A".repeat(15)
+    );
+    let out = sanitize_output(&akid);
+    assert!(!out.contains("IOSFODNN7EXAMPLE"), "aws_akid body leaked");
+    let glued = format!("{}AKIAIOSFODNN7EXAMPLE", "AKIA".repeat(10_000));
+    assert!(!sanitize_output(&glued).contains("IOSFODNN7EXAMPLE"));
+}
+
+/// UNBOUNDED providers were NOT safe either: a post-cap match can end inside
+/// the next true positive whenever the pattern's prefix or separator lies
+/// outside its greedy tail's charset. Both reproduced RED at e78ed87: the JWT
+/// signature and a whole PEM key body leaked. Post-cap matches are now widened
+/// to the end of their alphabet run (PEM: `(?s).` → to end of text).
+#[test]
+fn sa8_f2bis_unbounded_post_cap_overlaps_are_covered() {
+    let sig = "Sg7Wm2Xv8Nb4Kc6Rt9Yh3Jd5Fg1Ls0Pu";
+    let jwt = format!(
+        "{}.eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.{sig} end",
+        "eyJ".repeat(20_000)
+    );
+    let out = sanitize_output(&jwt);
+    assert!(!out.contains(sig), "jwt signature leaked past the cap");
+    assert!(out.ends_with(" end"), "text after the jwt run mangled");
+
+    let key = "MIIEowIBAAKCAQEAq7Wm2Xv8Nb4Kc6Rt9Yh3Jd5Fg1Ls0Pu";
+    let pem = format!(
+        "{}-----END RSA PRIVATE KEY-----BEGIN RSA PRIVATE KEY-----\n{key}\n\
+         -----END RSA PRIVATE KEY----- end",
+        "-----BEGIN RSA PRIVATE KEY-----".repeat(3_000)
+    );
+    let out = sanitize_output(&pem);
+    assert!(!out.contains(key), "PEM key body leaked past the cap");
+    assert!(
+        detect(&pem).iter().any(|h| h.provider == "private_key_pem"),
+        "private_key_pem not reported"
+    );
+}
+
+/// End-to-end: a budget-sized filler + overlapping decoy must still trip the
+/// severity=block gate.
+#[tokio::test]
+async fn sa8_f2bis_filler_must_not_defeat_the_inbound_block_gate() {
+    let (_dir, ctx) = bootstrap("shell.profile", SHELL_ECHO_ONLY, DetectionSeverity::Block).await;
+    let payload = format!(
+        "{} x AKIA{}AKIAIOSFODNN7EXAMPLE",
+        "AKIA".repeat(10_000),
+        "A".repeat(15)
+    );
+    let resp = dispatch(
+        call(
+            "kvendra.shell",
+            json!({
+                "profile_id": "shell.profile",
+                "operation": "exec",
+                "args": { "binary": "id", "argv": [payload] }
+            }),
+        ),
+        ctx.clone(),
+    )
+    .await;
+    let err = resp
+        .error
+        .as_ref()
+        .expect("a key behind a budget-sized filler must be refused");
     assert!(
         err.message.contains("severity=block"),
         "the inbound detection gate must refuse at severity=block; got: {}",
