@@ -59,7 +59,7 @@ in the [0.6.4 advisory](../security/advisory-cli-0.6.4.md) and
 ## Try it in two minutes
 
 ```bash
-cargo install kvendra
+cargo install --locked kvendra
 kvendra init                 # creates the vault; SAVE the recovery material it prints
 kvendra secret add <profile> # store a credential (then sign an allowlist for it)
 kvendra mcp serve            # expose the broker to your MCP client (Claude Code, Cursor, …)

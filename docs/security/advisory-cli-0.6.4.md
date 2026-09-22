@@ -271,7 +271,7 @@ in `THREAT-MODEL.md`; the real fixes are larger and tracked as follow-ups.
 Upgrade to 0.6.4:
 
 ```
-cargo install kvendra    # resolves to 0.6.4
+cargo install --locked kvendra    # resolves to 0.6.4
 ```
 
 After upgrading, audit your profiles: any credential-bound profile now **must**
