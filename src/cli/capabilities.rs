@@ -14,16 +14,18 @@
 //!
 //! Invariants (AC-CLI-3): zero vault unlock, zero network IO, zero
 //! filesystem writes. The handler builds a static manifest from
-//! `crate::primitives::catalog()` plus a small ancillary table for
-//! metadata (`destructive_ops`, `vault_profile_pattern`, `since_version`).
+//! `crate::primitives::catalog()`, derives `destructive_ops` from the
+//! enforcement catalog `crate::allowlist::catalog::CATALOG`, and adds a small
+//! ancillary table for metadata (`vault_profile_pattern`, `since_version`).
 //!
 //! Schema version contract (AC-CLI-4 / AC-CLI-8): `schema_version: 1` is
 //! the stable wire contract. Consumers MUST verify
 //! `schema_version == 1`. Bumping the version requires a major REQ and an
 //! IF-MANIFEST schema bump in lockstep.
 
+use crate::allowlist::catalog;
 use crate::error::KvendraResult;
-use crate::primitives::catalog;
+use crate::primitives::catalog as primitives_catalog;
 use serde::Serialize;
 
 /// Stable wire schema version of the manifest. Bumping requires a major REQ
@@ -48,62 +50,48 @@ pub struct PrimitiveSpec {
     pub deprecated_in: Option<String>,
 }
 
-/// Per-primitive metadata not carried in `PrimitiveInfo`: the subset of
-/// `ops` that mutate external state, the canonical vault profile id
-/// pattern, and the `since_version` (when the primitive first shipped).
+/// Per-primitive metadata not carried in `PrimitiveInfo`: the canonical
+/// vault profile id pattern and the `since_version` (when the primitive
+/// first shipped).
 ///
-/// Source of truth: `CMP-KVD-CLI.content` § "Primitives MCP canónicas"
-/// + per-primitive `operations_doc` in `src/primitives/mod.rs`.
-fn metadata_for(name: &str) -> (Vec<&'static str>, &'static str, &'static str) {
+/// `destructive_ops` is NOT listed here: it is derived from the enforcement
+/// catalog ([`crate::allowlist::catalog::CATALOG`]) so the published contract
+/// and the enforcement table cannot drift (ISSUE-KVD-CLI-9B3395).
+fn metadata_for(name: &str) -> (&'static str, &'static str) {
     match name {
-        // git: push/commit/tag mutate; clone/pull are read-only.
-        "kvendra.git" => (vec!["push", "commit", "tag"], "github.*", "0.1.0"),
-        // github: write/POST/PATCH endpoints are destructive; read_* + list_issues are read-only.
-        "kvendra.github" => (
-            vec![
-                "update_repo",
-                "release",
-                "update_issue",
-                "add_topics",
-                "create_issue",
-            ],
-            "github.*",
-            "0.1.0",
-        ),
-        // npm: publish/deprecate mutate the registry; read_metadata is read-only.
-        "kvendra.npm" => (vec!["publish", "deprecate"], "npm.*", "0.1.0"),
-        // pypi: upload mutates; read_metadata is read-only.
-        "kvendra.pypi" => (vec!["upload"], "pypi.*", "0.1.0"),
-        // aws: every op mutates external state (s3, cloudfront, lambda invoke side effects).
-        "kvendra.aws" => (
-            vec!["s3_sync", "s3_cp", "cloudfront_invalidate", "lambda_invoke"],
-            "aws.*",
-            "0.1.0",
-        ),
-        // http: profile allowlist gates destructive-method opt-in; every request is treated destructive
-        // by default per the operations_doc note. Surface as such for consumer planning.
-        "kvendra.http" => (vec!["request"], "http.*", "0.1.0"),
-        // shell: always destructive per operations_doc.
-        "kvendra.shell" => (vec!["exec"], "shell.*", "0.1.0"),
-        // unsafe escape hatch: the only op exposes plaintext — destructive in audit terms.
-        "kvendra.unsafe.raw_token" => (vec!["get"], "*", "0.1.0"),
-        _ => (vec![], "*", "0.1.0"),
+        "kvendra.git" => ("github.*", "0.1.0"),
+        "kvendra.github" => ("github.*", "0.1.0"),
+        "kvendra.npm" => ("npm.*", "0.1.0"),
+        "kvendra.pypi" => ("pypi.*", "0.1.0"),
+        "kvendra.aws" => ("aws.*", "0.1.0"),
+        "kvendra.http" => ("http.*", "0.1.0"),
+        "kvendra.shell" => ("shell.*", "0.1.0"),
+        "kvendra.unsafe.raw_token" => ("*", "0.1.0"),
+        _ => ("*", "0.1.0"),
     }
+}
+
+/// Every op of `primitive` that carries a rule (any kind) in the enforcement
+/// catalog, or that is unclassified (fail-closed), in `ops` declaration order.
+fn destructive_ops_for(primitive: &str, ops: &[&str]) -> Vec<String> {
+    ops.iter()
+        .filter(|op| catalog::has_rule(primitive, op) || !catalog::is_read_only(primitive, op))
+        .map(|op| (*op).to_string())
+        .collect()
 }
 
 /// Build the canonical capabilities manifest. Pure function: no IO, no
 /// vault, no network. Deterministic in primitive order (matches the
 /// declaration order of the static `CATALOG`).
 pub fn build_manifest() -> CapabilitiesManifest {
-    let primitives = catalog()
+    let primitives = primitives_catalog()
         .iter()
         .map(|p| {
-            let (destructive, pattern, since) = metadata_for(p.name);
-            let destructive_ops: Vec<String> = destructive.into_iter().map(String::from).collect();
+            let (pattern, since) = metadata_for(p.name);
             PrimitiveSpec {
                 id: p.name.to_string(),
                 ops: p.operations.iter().map(|o| (*o).to_string()).collect(),
-                destructive_ops,
+                destructive_ops: destructive_ops_for(p.name, p.operations),
                 vault_profile_pattern: pattern.to_string(),
                 since_version: since.to_string(),
                 deprecated_in: None,
@@ -175,6 +163,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ISSUE-KVD-CLI-9B3395 — the published `destructive_ops` and the
+    /// enforcement catalog agree BOTH ways: every published destructive op has
+    /// a catalog rule, and every catalog rule is published.
+    #[test]
+    fn destructive_ops_equal_enforcement_catalog() {
+        let m = build_manifest();
+        let mut published: Vec<(String, String)> = m
+            .primitives
+            .iter()
+            .flat_map(|p| {
+                p.destructive_ops
+                    .iter()
+                    .map(move |op| (p.id.clone(), op.clone()))
+            })
+            .collect();
+        let mut ruled: Vec<(String, String)> = catalog::CATALOG
+            .iter()
+            .map(|r| (r.primitive.to_string(), r.operation.to_string()))
+            .collect();
+        published.sort();
+        ruled.sort();
+        assert_eq!(published, ruled);
+    }
+
+    /// Frozen public contract (IF-KVD-CLI-5D9FB5). A change here is a
+    /// deliberate public-contract change: re-sync the IF-MANIFEST.
+    #[test]
+    fn published_destructive_ops_match_if_kvd_cli_5d9fb5() {
+        let m = build_manifest();
+        let got: Vec<(&str, Vec<&str>)> = m
+            .primitives
+            .iter()
+            .map(|p| {
+                (
+                    p.id.as_str(),
+                    p.destructive_ops.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("kvendra.git", vec!["clone", "push", "commit", "tag"]),
+                (
+                    "kvendra.github",
+                    vec![
+                        "update_repo",
+                        "release",
+                        "update_issue",
+                        "add_topics",
+                        "create_issue",
+                    ],
+                ),
+                ("kvendra.npm", vec!["publish", "deprecate"]),
+                ("kvendra.pypi", vec!["upload"]),
+                (
+                    "kvendra.aws",
+                    vec!["s3_sync", "s3_cp", "cloudfront_invalidate", "lambda_invoke"],
+                ),
+                ("kvendra.http", vec!["request"]),
+                ("kvendra.shell", vec!["exec"]),
+                ("kvendra.unsafe.raw_token", vec!["get"]),
+            ],
+        );
     }
 
     /// Primitive id set is the canonical catalog. Future additions land

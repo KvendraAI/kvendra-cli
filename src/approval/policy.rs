@@ -1,22 +1,142 @@
 //! Cascade resolution + naming helpers for approval mode.
 //!
-//! Cascade priority (más específica gana):
-//!   1. env var `KVENDRA_APPROVAL_MODE`
-//!   2. profile YAML `approval.mode`
-//!   3. global `~/.kvendra/config.toml` `[approval] mode`
-//!   4. default `ask-destructive` (ADR-KVD-016 — silent es opt-in explícito)
+//! Signed cascade (más específica gana):
+//!   1. profile YAML `approval.mode` (HMAC-signed allowlist)
+//!   2. global `~/.kvendra/config.toml` `[approval] mode` (HMAC-signed)
+//!   3. default `ask-destructive` (ADR-KVD-016 — silent es opt-in explícito)
+//!
+//! The unsigned env var `KVENDRA_APPROVAL_MODE` is a ONE-WAY RATCHET on top of
+//! the signed mode (ISSUE-KVD-CLI-705EF0): it may only TIGHTEN it
+//! (`Silent < AskDestructive < Ask`). A looser env value is ignored — and the
+//! divergence is audit-flagged — unless the signed config sets
+//! `[approval] allow_env_downgrade = true`.
 
 use crate::allowlist::{Operation, ProfileSpec, catalog};
 use crate::approval::{ApprovalMode, Transport};
 use serde_json::Value;
 
-/// Resuelve el modo activo siguiendo la cascade canónica.
-pub fn resolve_mode(
+/// Audit flag: a looser `KVENDRA_APPROVAL_MODE` was present and IGNORED.
+pub const FLAG_APPROVAL_ENV_IGNORED: &str = "approval_env_ignored";
+/// Audit flag: a looser `KVENDRA_APPROVAL_MODE` was APPLIED because the signed
+/// config opted in (`allow_env_downgrade = true`).
+pub const FLAG_APPROVAL_MODE_OVERRIDDEN: &str = "approval_mode_overridden";
+/// Audit flag: a stricter `KVENDRA_APPROVAL_MODE` tightened the signed mode.
+pub const FLAG_APPROVAL_ENV_TIGHTENED: &str = "approval_env_tightened";
+pub const FLAG_APPROVAL_MODE_SILENT: &str = "approval_mode_silent";
+pub const FLAG_APPROVAL_MODE_ASK: &str = "approval_mode_ask";
+pub const FLAG_APPROVAL_MODE_ASK_DESTRUCTIVE: &str = "approval_mode_ask_destructive";
+pub const FLAG_APPROVAL_SRC_ENV: &str = "approval_src_env";
+pub const FLAG_APPROVAL_SRC_PROFILE: &str = "approval_src_profile";
+pub const FLAG_APPROVAL_SRC_SIGNED: &str = "approval_src_signed";
+
+/// Where the effective approval mode came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalSource {
+    /// The unsigned `KVENDRA_APPROVAL_MODE` env var.
+    Env,
+    /// The signed per-profile allowlist YAML `approval.mode`.
+    Profile,
+    /// The signed global `config.toml` `[approval] mode` (or its default).
+    Signed,
+}
+
+/// How the env var interacted with the signed mode, when it diverged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvOverride {
+    /// Looser env value, not opted in → ignored; the signed mode stays.
+    DowngradeIgnored,
+    /// Looser env value, opted in by the signed config → applied.
+    DowngradeApplied,
+    /// Stricter env value → applied (the ratchet only blocks downgrades).
+    Tightened,
+}
+
+/// Effective approval mode + its provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalOutcome {
+    pub mode: ApprovalMode,
+    pub source: ApprovalSource,
+    pub env_override: Option<EnvOverride>,
+}
+
+impl ApprovalOutcome {
+    /// Canonical audit flags for this outcome: the effective mode, its source
+    /// and, when the env var diverged from the signed mode, how.
+    pub fn audit_flags(&self) -> Vec<&'static str> {
+        let mut flags = Vec::with_capacity(3);
+        if let Some(o) = self.env_override {
+            flags.push(match o {
+                EnvOverride::DowngradeIgnored => FLAG_APPROVAL_ENV_IGNORED,
+                EnvOverride::DowngradeApplied => FLAG_APPROVAL_MODE_OVERRIDDEN,
+                EnvOverride::Tightened => FLAG_APPROVAL_ENV_TIGHTENED,
+            });
+        }
+        flags.push(match self.mode {
+            ApprovalMode::Silent => FLAG_APPROVAL_MODE_SILENT,
+            ApprovalMode::Ask => FLAG_APPROVAL_MODE_ASK,
+            ApprovalMode::AskDestructive => FLAG_APPROVAL_MODE_ASK_DESTRUCTIVE,
+        });
+        flags.push(match self.source {
+            ApprovalSource::Env => FLAG_APPROVAL_SRC_ENV,
+            ApprovalSource::Profile => FLAG_APPROVAL_SRC_PROFILE,
+            ApprovalSource::Signed => FLAG_APPROVAL_SRC_SIGNED,
+        });
+        flags
+    }
+}
+
+/// Strictness rank: `Silent(0) < AskDestructive(1) < Ask(2)` — the order
+/// `should_prompt` implements.
+pub fn strictness(mode: ApprovalMode) -> u8 {
+    match mode {
+        ApprovalMode::Silent => 0,
+        ApprovalMode::AskDestructive => 1,
+        ApprovalMode::Ask => 2,
+    }
+}
+
+/// Resolve the effective mode. The signed baseline is
+/// `profile_override.unwrap_or(global)`; the unsigned `env_var` may only
+/// tighten it, unless `allow_env_downgrade` (read from the SIGNED config)
+/// opts in to letting it loosen it too.
+pub fn resolve_mode_ratcheted(
     env_var: Option<ApprovalMode>,
     profile_override: Option<ApprovalMode>,
     global: ApprovalMode,
-) -> ApprovalMode {
-    env_var.or(profile_override).unwrap_or(global)
+    allow_env_downgrade: bool,
+) -> ApprovalOutcome {
+    let signed = match profile_override {
+        Some(mode) => ApprovalOutcome {
+            mode,
+            source: ApprovalSource::Profile,
+            env_override: None,
+        },
+        None => ApprovalOutcome {
+            mode: global,
+            source: ApprovalSource::Signed,
+            env_override: None,
+        },
+    };
+    let Some(env) = env_var else {
+        return signed;
+    };
+    match strictness(env).cmp(&strictness(signed.mode)) {
+        std::cmp::Ordering::Greater => ApprovalOutcome {
+            mode: env,
+            source: ApprovalSource::Env,
+            env_override: Some(EnvOverride::Tightened),
+        },
+        std::cmp::Ordering::Equal => signed,
+        std::cmp::Ordering::Less if allow_env_downgrade => ApprovalOutcome {
+            mode: env,
+            source: ApprovalSource::Env,
+            env_override: Some(EnvOverride::DowngradeApplied),
+        },
+        std::cmp::Ordering::Less => ApprovalOutcome {
+            env_override: Some(EnvOverride::DowngradeIgnored),
+            ..signed
+        },
+    }
 }
 
 /// Decide if the active approval mode + transport requires `/dev/tty` for the
@@ -86,40 +206,151 @@ pub fn lookup_destructive(
 mod tests {
     use super::*;
 
+    fn resolve(
+        env: Option<ApprovalMode>,
+        profile: Option<ApprovalMode>,
+        global: ApprovalMode,
+        optin: bool,
+    ) -> (ApprovalMode, ApprovalSource, Option<EnvOverride>) {
+        let o = resolve_mode_ratcheted(env, profile, global, optin);
+        (o.mode, o.source, o.env_override)
+    }
+
+    /// ISSUE-KVD-CLI-705EF0 — the pre-fix test asserted the bug (env Silent
+    /// won over a signed profile `Ask`). A looser env value is now ignored.
     #[test]
-    fn cascade_env_wins_over_profile_and_global() {
+    fn cascade_env_does_not_weaken_profile_or_global() {
         assert_eq!(
-            resolve_mode(
+            resolve(
                 Some(ApprovalMode::Silent),
                 Some(ApprovalMode::Ask),
-                ApprovalMode::AskDestructive
+                ApprovalMode::AskDestructive,
+                false
             ),
-            ApprovalMode::Silent
+            (
+                ApprovalMode::Ask,
+                ApprovalSource::Profile,
+                Some(EnvOverride::DowngradeIgnored)
+            )
         );
+    }
+
+    #[test]
+    fn env_downgrade_of_global_is_ignored_and_flagged() {
+        let o = resolve_mode_ratcheted(
+            Some(ApprovalMode::Silent),
+            None,
+            ApprovalMode::AskDestructive,
+            false,
+        );
+        assert_eq!(
+            (o.mode, o.source, o.env_override),
+            (
+                ApprovalMode::AskDestructive,
+                ApprovalSource::Signed,
+                Some(EnvOverride::DowngradeIgnored)
+            )
+        );
+        let flags = o.audit_flags();
+        for f in [
+            FLAG_APPROVAL_ENV_IGNORED,
+            FLAG_APPROVAL_MODE_ASK_DESTRUCTIVE,
+            FLAG_APPROVAL_SRC_SIGNED,
+        ] {
+            assert!(flags.contains(&f), "missing {f} in {flags:?}");
+        }
+    }
+
+    #[test]
+    fn env_downgrade_applied_only_with_signed_opt_in() {
+        let o = resolve_mode_ratcheted(
+            Some(ApprovalMode::Silent),
+            None,
+            ApprovalMode::AskDestructive,
+            true,
+        );
+        assert_eq!(
+            (o.mode, o.source, o.env_override),
+            (
+                ApprovalMode::Silent,
+                ApprovalSource::Env,
+                Some(EnvOverride::DowngradeApplied)
+            )
+        );
+        assert!(o.audit_flags().contains(&FLAG_APPROVAL_MODE_OVERRIDDEN));
+    }
+
+    #[test]
+    fn env_may_tighten_regardless_of_opt_in() {
+        for optin in [false, true] {
+            assert_eq!(
+                resolve(
+                    Some(ApprovalMode::Ask),
+                    None,
+                    ApprovalMode::AskDestructive,
+                    optin
+                ),
+                (
+                    ApprovalMode::Ask,
+                    ApprovalSource::Env,
+                    Some(EnvOverride::Tightened)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn env_equal_to_signed_is_not_an_override() {
+        let o = resolve_mode_ratcheted(
+            Some(ApprovalMode::AskDestructive),
+            None,
+            ApprovalMode::AskDestructive,
+            false,
+        );
+        assert_eq!(o.source, ApprovalSource::Signed);
+        assert_eq!(o.env_override, None);
     }
 
     #[test]
     fn cascade_profile_wins_over_global_when_no_env() {
         assert_eq!(
-            resolve_mode(None, Some(ApprovalMode::Silent), ApprovalMode::Ask),
-            ApprovalMode::Silent
+            resolve(None, Some(ApprovalMode::Silent), ApprovalMode::Ask, false),
+            (ApprovalMode::Silent, ApprovalSource::Profile, None)
         );
     }
 
     #[test]
     fn cascade_global_when_no_env_no_profile() {
         assert_eq!(
-            resolve_mode(None, None, ApprovalMode::Ask),
-            ApprovalMode::Ask
+            resolve(None, None, ApprovalMode::Ask, false),
+            (ApprovalMode::Ask, ApprovalSource::Signed, None)
         );
     }
 
     #[test]
     fn cascade_default_when_global_default() {
         assert_eq!(
-            resolve_mode(None, None, ApprovalMode::default()),
+            resolve(None, None, ApprovalMode::default(), false).0,
             ApprovalMode::AskDestructive
         );
+    }
+
+    #[test]
+    fn strictness_agrees_with_should_prompt() {
+        let modes = [
+            ApprovalMode::Silent,
+            ApprovalMode::AskDestructive,
+            ApprovalMode::Ask,
+        ];
+        for a in modes {
+            for b in modes {
+                if strictness(a) <= strictness(b) {
+                    for d in [false, true] {
+                        assert!(!should_prompt(a, d) || should_prompt(b, d));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -226,7 +457,8 @@ allowlist:
             "read_repo",
             &serde_json::Value::Null
         ));
-        assert!(!lookup_destructive(
+        // ISSUE-KVD-CLI-9B3395 — an unclassified primitive/op fails CLOSED.
+        assert!(lookup_destructive(
             &spec,
             "kvendra.unknown",
             "x",

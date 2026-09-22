@@ -901,7 +901,11 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
     // model). Se evalúa entre el enforcement de la allowlist y el record_audit
     // Started: si la allowlist permite y el modo del approval bloquea, NO se
     // emite Started (sólo una row Error con flag estructurada).
-    let approval_decision = approval::check(&ctx, name, &profile_id, &action, &arguments).await;
+    let (approval_decision, approval_outcome) =
+        approval::check(&ctx, name, &profile_id, &action, &arguments).await;
+    // ISSUE-KVD-CLI-705EF0 — every row past this point records the effective
+    // approval mode, its source, and any env divergence from the signed mode.
+    flags.extend(approval_outcome.audit_flags().into_iter().map(String::from));
     if let Some(flag) = approval_decision.audit_flag() {
         flags.push(flag.into());
     }
@@ -1449,7 +1453,7 @@ mod tests {
         (dir, ctx)
     }
 
-    const TEST_ALLOWLIST_YAML: &str = "profile_id: p\nsecret:\n  type: github_pat\nallowlist:\n  primitives:\n    - name: kvendra.shell\n      operations:\n        - run:\n            binaries: [\"echo\"]\n";
+    const TEST_ALLOWLIST_YAML: &str = "profile_id: p\nsecret:\n  type: github_pat\nallowlist:\n  primitives:\n    - name: kvendra.shell\n      operations:\n        - run:\n            binaries: [\"echo\"]\n            accept_destructive: true\n";
 
     /// REQ-KVD-007 AC-2 — a YAML matching the persisted HMAC must pass. Drives
     /// the enforcer with the canonical MCP envelope (`args.binary`) so the
@@ -2161,6 +2165,81 @@ mod tests {
             flags.contains(crate::audit::FLAG_TOOL_CALL_BLOCKED_PENDING_UNLOCK),
             "audit row must carry the canonical pending-unlock flag, got: {flags}"
         );
+    }
+
+    /// ISSUE-KVD-CLI-705EF0 (SA3) e2e — `KVENDRA_APPROVAL_MODE=silent` with a
+    /// signed `ask-destructive` and no `allow_env_downgrade` must be IGNORED,
+    /// and the audit row must carry `approval_env_ignored` + the effective
+    /// mode and source. NON-destructive op (`github.read_repo`) so no dialog
+    /// opens; the secret blob is removed so the call fails before any network.
+    #[tokio::test]
+    async fn sa3_env_silent_is_ignored_and_audit_flagged_e2e() {
+        let yaml = "profile_id: p\nsecret:\n  type: github_pat\nallowlist:\n  primitives:\n    - name: kvendra.github\n      operations:\n        - read_repo:\n            repos: [\"KvendraAI/kvendra-cli\"]\n";
+        let (_dir, ctx) = fixture_with_allowlist_and_writer(yaml);
+        for entry in std::fs::read_dir(ctx.vault.secrets_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_stem().and_then(|s| s.to_str()) == Some("p") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        assert_eq!(
+            ctx.config.read().unwrap().approval.mode,
+            crate::approval::ApprovalMode::AskDestructive
+        );
+        let ctx = Arc::new(ctx);
+
+        let _guard = crate::test_env_lock().lock().await;
+        let prev = std::env::var("KVENDRA_APPROVAL_MODE").ok();
+        unsafe {
+            std::env::set_var("KVENDRA_APPROVAL_MODE", "silent");
+        }
+        let _ = super::tools_call(
+            Some(Value::from(11)),
+            serde_json::json!({
+                "name": "kvendra.github",
+                "arguments": {
+                    "profile_id": "p",
+                    "operation": "read_repo",
+                    "args": { "repo": "KvendraAI/kvendra-cli" }
+                }
+            }),
+            ctx.clone(),
+        )
+        .await;
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KVENDRA_APPROVAL_MODE", v),
+                None => std::env::remove_var("KVENDRA_APPROVAL_MODE"),
+            }
+        }
+
+        ctx.audit_writer().unwrap().shutdown().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let conn = rusqlite::Connection::open(ctx.vault.audit_db_path()).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT flags FROM audit_events \
+                 WHERE primitive = 'kvendra.github' AND profile_id = 'p' ORDER BY id ASC",
+            )
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(!rows.is_empty(), "the call must have written audit rows");
+        for flags in &rows {
+            for f in [
+                crate::approval::policy::FLAG_APPROVAL_ENV_IGNORED,
+                crate::approval::policy::FLAG_APPROVAL_MODE_ASK_DESTRUCTIVE,
+                crate::approval::policy::FLAG_APPROVAL_SRC_SIGNED,
+            ] {
+                assert!(
+                    flags.split(',').any(|x| x == f),
+                    "audit row must carry {f}, got: {flags}"
+                );
+            }
+        }
     }
 
     /// Negative path: with no session blob on disk, the vault stays

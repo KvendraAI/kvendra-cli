@@ -98,7 +98,7 @@ fn tools_call(
     }
 }
 
-const SHELL_ECHO_ONLY_YAML: &str = "profile_id: p\nsecret:\n  type: github_pat\nallowlist:\n  primitives:\n    - name: kvendra.shell\n      operations:\n        - run:\n            binaries: [\"echo\"]\n";
+const SHELL_ECHO_ONLY_YAML: &str = "profile_id: p\nsecret:\n  type: github_pat\nallowlist:\n  primitives:\n    - name: kvendra.shell\n      operations:\n        - run:\n            binaries: [\"echo\"]\n            accept_destructive: true\n";
 
 async fn drain(ctx: &Arc<ServerContext>) {
     if let Some(w) = ctx.audit_writer() {

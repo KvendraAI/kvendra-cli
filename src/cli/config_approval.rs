@@ -19,6 +19,9 @@ pub enum ApprovalCommand {
     Set { mode: String },
     /// Show approval configuration + cascade diagnostics.
     Status,
+    /// Signed opt-in (on | off) letting `KVENDRA_APPROVAL_MODE` LOOSEN the
+    /// signed mode. Off by default: the env var may only tighten it.
+    AllowEnvDowngrade { value: String },
 }
 
 pub async fn run(cmd: ApprovalCommand) -> KvendraResult<()> {
@@ -51,9 +54,26 @@ pub async fn run(cmd: ApprovalCommand) -> KvendraResult<()> {
             );
             if std::env::var("KVENDRA_APPROVAL_MODE").is_ok() {
                 println!(
-                    "note: KVENDRA_APPROVAL_MODE is set in the current shell and overrides the global value."
+                    "note: KVENDRA_APPROVAL_MODE is set in the current shell; it can only tighten the signed mode unless `allow-env-downgrade on`."
                 );
             }
+        }
+        ApprovalCommand::AllowEnvDowngrade { value } => {
+            let enabled = match value.trim().to_ascii_lowercase().as_str() {
+                "on" | "true" => true,
+                "off" | "false" => false,
+                _ => {
+                    return Err(KvendraError::Config(format!(
+                        "invalid value '{value}' (expected: on | off)"
+                    )));
+                }
+            };
+            let vault = unlock_for_approval(&home)?;
+            let mut cfg = Config::load_for_update(&home, &vault, "approval allow-env-downgrade")?;
+            cfg.approval.allow_env_downgrade = enabled;
+            cfg.validate()?;
+            cfg.save(&home, &vault)?;
+            println!("approval.allow_env_downgrade set to {enabled} in ~/.kvendra/config.toml");
         }
         ApprovalCommand::Status => {
             let cfg = Config::load(&home, None).unwrap_or_default();
@@ -88,15 +108,37 @@ fn print_resolved_mode(cfg: &Config) {
     let env = std::env::var("KVENDRA_APPROVAL_MODE")
         .ok()
         .and_then(|s| policy::parse_mode(&s));
-    let resolved = policy::resolve_mode(env, None, cfg.approval.mode);
-    println!("approval.mode (resolved): {}", policy::mode_name(resolved));
+    let outcome = policy::resolve_mode_ratcheted(
+        env,
+        None,
+        cfg.approval.mode,
+        cfg.approval.allow_env_downgrade,
+    );
+    println!(
+        "approval.mode (resolved): {}",
+        policy::mode_name(outcome.mode)
+    );
     println!(
         "  global (config.toml):   {}",
         policy::mode_name(cfg.approval.mode)
     );
+    println!(
+        "  allow_env_downgrade:    {}",
+        cfg.approval.allow_env_downgrade
+    );
     if let Some(m) = env {
+        let effect = match outcome.env_override {
+            Some(policy::EnvOverride::DowngradeIgnored) => {
+                "IGNORED — looser than the signed mode (no allow_env_downgrade)"
+            }
+            Some(policy::EnvOverride::DowngradeApplied) => {
+                "APPLIED — loosens the signed mode (allow_env_downgrade = true)"
+            }
+            Some(policy::EnvOverride::Tightened) => "APPLIED — tightens the signed mode",
+            None => "same as the signed mode",
+        };
         println!(
-            "  env KVENDRA_APPROVAL_MODE: {} (overrides global)",
+            "  env KVENDRA_APPROVAL_MODE: {} ({effect})",
             policy::mode_name(m)
         );
     } else {

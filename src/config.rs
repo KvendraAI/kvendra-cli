@@ -85,6 +85,10 @@ pub struct ApprovalConfig {
     pub mode: ApprovalMode,
     pub timeout_seconds: u32,
     pub cache_ttl_seconds: u32,
+    /// Signed opt-in letting the unsigned `KVENDRA_APPROVAL_MODE` env var
+    /// LOOSEN the signed mode. Default `false`: the env var may only tighten
+    /// it (ISSUE-KVD-CLI-705EF0).
+    pub allow_env_downgrade: bool,
 }
 
 impl Default for ApprovalConfig {
@@ -93,6 +97,7 @@ impl Default for ApprovalConfig {
             mode: ApprovalMode::default(),
             timeout_seconds: 30,
             cache_ttl_seconds: 300,
+            allow_env_downgrade: false,
         }
     }
 }

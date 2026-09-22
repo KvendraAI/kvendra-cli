@@ -135,7 +135,7 @@ fn tools_call(
     }
 }
 
-const SHELL_ECHO_ONLY_YAML: &str = "profile_id: p\nsecret:\n  type: github_pat\nallowlist:\n  primitives:\n    - name: kvendra.shell\n      operations:\n        - run:\n            binaries: [\"echo\"]\n";
+const SHELL_ECHO_ONLY_YAML: &str = "profile_id: p\nsecret:\n  type: github_pat\nallowlist:\n  primitives:\n    - name: kvendra.shell\n      operations:\n        - run:\n            binaries: [\"echo\"]\n            accept_destructive: true\n";
 
 /// REQ-KVD-CLI-002 / ISSUE-023 — `KvendraError::AllowlistViolation` raised by
 /// the enforcer must surface the canonical flag `allowlist_denied` on the
@@ -162,7 +162,7 @@ async fn boundary_allowlist_violation_emits_allowlist_denied_flag() {
 }
 
 /// REQ-KVD-CLI-002 / ISSUE-023 — expired profile rejection.
-const SHELL_EXPIRED_YAML: &str = "profile_id: p\nsecret:\n  type: github_pat\nexpiration: \"2020-01-01\"\nallowlist:\n  primitives:\n    - name: kvendra.shell\n      operations:\n        - run:\n            binaries: [\"echo\"]\n";
+const SHELL_EXPIRED_YAML: &str = "profile_id: p\nsecret:\n  type: github_pat\nexpiration: \"2020-01-01\"\nallowlist:\n  primitives:\n    - name: kvendra.shell\n      operations:\n        - run:\n            binaries: [\"echo\"]\n            accept_destructive: true\n";
 
 #[tokio::test]
 async fn boundary_profile_expired_emits_profile_expired_flag() {

@@ -10,7 +10,9 @@
 //!   `destructive: true` en la allowlist. Requiere TTY si la operación dispara.
 //!
 //! Cascade de configuración (más específica gana):
-//!   env > profile YAML > config.toml > default.
+//!   profile YAML > config.toml > default (ambos firmados con HMAC); el env
+//!   `KVENDRA_APPROVAL_MODE` sólo puede ENDURECER el modo firmado salvo opt-in
+//!   firmado `[approval] allow_env_downgrade = true` (ISSUE-KVD-CLI-705EF0).
 
 pub mod biometric;
 pub mod cache;
@@ -169,16 +171,19 @@ fn json_brief(v: &Value) -> String {
 /// Entry-point invocado por `mcp::server::tools_call` entre el enforcement de
 /// la allowlist y el `record_audit` Started.
 ///
-/// Aplica la cascade env → profile YAML → config.toml → default y delega al
-/// backend TTY si procede. Garantiza la regla **nunca ejecuta sin confirmación
-/// explícita** cuando el modo lo exige.
+/// Aplica la cascade firmada profile YAML → config.toml → default, con el env
+/// como trinquete de un solo sentido ([`policy::resolve_mode_ratcheted`]), y
+/// delega al backend TTY si procede. Garantiza la regla **nunca ejecuta sin
+/// confirmación explícita** cuando el modo lo exige. Devuelve también el
+/// [`policy::ApprovalOutcome`] para que el audit row registre el modo efectivo
+/// y su origen.
 pub async fn check(
     ctx: &ServerContext,
     primitive: &str,
     profile_id: &str,
     operation: &str,
     arguments: &Value,
-) -> ApprovalDecision {
+) -> (ApprovalDecision, policy::ApprovalOutcome) {
     let env_mode = std::env::var("KVENDRA_APPROVAL_MODE")
         .ok()
         .and_then(|s| policy::parse_mode(&s));
@@ -212,16 +217,20 @@ pub async fn check(
         }
     };
 
-    let global = ctx
-        .config
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .approval
-        .mode;
-    let mode = policy::resolve_mode(env_mode, profile_override_mode, global);
+    let (global, allow_env_downgrade) = {
+        let cfg = ctx.config.read().unwrap_or_else(|e| e.into_inner());
+        (cfg.approval.mode, cfg.approval.allow_env_downgrade)
+    };
+    let outcome = policy::resolve_mode_ratcheted(
+        env_mode,
+        profile_override_mode,
+        global,
+        allow_env_downgrade,
+    );
+    let mode = outcome.mode;
 
     if !policy::should_prompt(mode, destructive) {
-        return ApprovalDecision::Silent;
+        return (ApprovalDecision::Silent, outcome);
     }
 
     // REQ-KVD-007 / ISSUE-018: cache key compose with the allowlist YAML's
@@ -251,7 +260,7 @@ pub async fn check(
     if !profile_id.is_empty()
         && let Some(_remaining) = ctx.approval_cache.lookup(&cache_key).await
     {
-        return ApprovalDecision::CacheHit;
+        return (ApprovalDecision::CacheHit, outcome);
     }
 
     let timeout_seconds = ctx
@@ -298,7 +307,7 @@ pub async fn check(
         ctx.approval_cache.approve(cache_key, cache_ttl).await;
     }
 
-    decision
+    (decision, outcome)
 }
 
 fn load_profile_spec(ctx: &ServerContext, profile_id: &str) -> Option<ProfileSpec> {
@@ -319,15 +328,16 @@ pub fn hint_for(decision: ApprovalDecision, timeout_seconds: u32) -> &'static st
             // Static hint genérico — el cliente puede leer timeout_seconds del
             // payload si lo necesita; aquí prima una cadena estable.
             let _ = timeout_seconds;
-            "no response within configured timeout — increase [approval].timeout_seconds in ~/.kvendra/config.toml or set KVENDRA_APPROVAL_MODE=silent"
+            "no response within configured timeout — increase [approval].timeout_seconds in ~/.kvendra/config.toml, or run `kvendra config approval set silent` (signed; KVENDRA_APPROVAL_MODE=silent is honoured only after `kvendra config approval allow-env-downgrade on`)"
         }
         ApprovalDecision::NoTty => {
-            "no TTY available; set KVENDRA_APPROVAL_MODE=silent for non-interactive contexts"
+            "no TTY available; for non-interactive contexts run `kvendra config approval set silent` (signed; KVENDRA_APPROVAL_MODE=silent is honoured only after `kvendra config approval allow-env-downgrade on`)"
         }
         ApprovalDecision::BiometricRejected => "user denied this operation via OS popup",
         ApprovalDecision::BiometricUnavailable => {
             "biometric/OS popup not available on this platform (macOS-only in this release); \
-             set KVENDRA_APPROVAL_MODE=silent for non-supported platforms"
+             run `kvendra config approval set silent` (signed; KVENDRA_APPROVAL_MODE=silent is \
+             honoured only after `kvendra config approval allow-env-downgrade on`)"
         }
         _ => "",
     }
