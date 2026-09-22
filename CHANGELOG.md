@@ -7,6 +7,102 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-09-23 — fix(security): remediation of the cold security audit run 1
+
+Security release. Remediates the 9 findings with a ticket from an independent
+cold audit of 0.6.4 (2 high, 7 medium), plus defects found by four rounds of
+exhaustive adversarial validation of the fixes themselves. The recurring theme
+was again a divergence between what a policy checks and what actually executes
+on the same operand; every fix makes the decider and the executor share one
+canonicalizer and fail closed. New regression suite:
+`tests/security_audit_run1.rs`.
+
+### Upgrade action required
+
+- **`KVENDRA_APPROVAL_MODE` can only tighten the signed approval policy.** A
+  looser value (e.g. `silent`) is ignored and audited unless the signed config
+  opts in. Headless/Linux users who relied on the variable: run
+  `kvendra config approval set silent` (signed), or
+  `kvendra config approval allow-env-downgrade on` and keep the variable.
+- **Profiles with local transfer operands need `local_roots`.** `aws.s3_sync`,
+  `aws.s3_cp`, `git.clone` and `pypi.upload` now require an absolute
+  `local_roots` list in the signed allowlist; without it those operations are
+  denied. Add it and re-sign with `kvendra secret set-allowlist`.
+- **Every primitive operation is classified; unclassified is destructive.**
+  Signed profiles that list `github.release`, `github.add_topics`, `git.clone`
+  or unknown operation names without `accept_destructive: true` are refused
+  until re-signed. Run `kvendra secret validate --all` after upgrading.
+- **Audit log layout v4.** New rows use an injective, versioned MAC layout.
+  Do not run a 0.6.4 binary against the vault after 0.6.5 has written v4 rows.
+  `kvendra audit --verify` now exits non-zero on a broken chain.
+
+### Fixed — high
+
+- **SA1 — `kvendra.github` target-shape bypass.** The enforcer derived the
+  target repo only from `repo`/`url` and allowed the call when it could not,
+  while the primitive also accepted `owner`+`repo_name`/`name`: a
+  `repos`-scoped profile authorized API calls against any repo the token
+  reaches. `primitives::github::resolve_target` is now the single resolver for
+  the primitive and the enforcer; `url` is ignored, `name` is never a repo
+  alias on `release`, owner/name must be safe path components, `org` compares
+  the owner half, and a declared `repos`/`repo`/`org` with no resolvable target
+  fails closed for every primitive.
+- **SA2 — unconstrained local operand of brokered transfers.** `s3_sync`/`s3_cp`
+  source/destination, `git clone` destination and the pypi distribution path
+  were free-form, so any owner-readable directory could be copied to an
+  allowed bucket with the owner's keys. New `primitives::local_operand` and DSL
+  key `local_roots` (validated at sign time: absolute, no `..`, `/` only with
+  `accept_broad_scope`; re-checked at runtime); `s3_sync` and `git.clone` are
+  destructive unconditionally; s3 transfers always pass
+  `--no-follow-symlinks`.
+
+### Fixed — medium
+
+- **SA3 — approval env override outranked the signed policy.**
+  `resolve_mode_ratcheted` replaces `resolve_mode`; new signed
+  `[approval] allow_env_downgrade` and
+  `kvendra config approval allow-env-downgrade on|off`; every audited row past
+  the gate carries `approval_mode_*` / `approval_src_*` /
+  `approval_env_{ignored,tightened}` flags. `config approval get|status` label
+  unverified values as such.
+- **SA4 — audit-chain MAC was non-injective and did not cover the layout
+  version** (v3→v2 downgrade stripped diagnostics undetected). Layout v4:
+  length-prefixed, domain-separated fields with the version inside the MAC;
+  legacy v1–v3 rows stay verifiable only in canonical form; new
+  `kvendra audit commit-layout` appends one commitment row pinning all legacy
+  rows (never rewrites them). Audit writes are serialised with
+  `BEGIN IMMEDIATE` + `busy_timeout`, which also fixes a pre-existing chain
+  fork with two concurrent `kvendra mcp` processes and a pre-existing chain
+  break when a status update landed after a successor row.
+- **SA5 — broker `template_id` used as a cache file path.** New
+  `path_id::is_safe_path_component` (shared with `profile_id`, now max 128
+  bytes, no leading dot) plus parent-equality containment.
+- **SA6 — config writers laundered a tampered config into signed defaults**
+  (completes the 0.6.4 A5 fix). `Config::load_for_update` is the only loader
+  writers use; integrity errors propagate and the file is left untouched;
+  `rebind-home` verifies before consuming a recovery code.
+- **SA7 — `github.release` / `add_topics` missing from the destructive
+  catalog.** Catalog completed; every operation is ruled or explicitly
+  read-only; the `kvendra capabilities` manifest is derived from the catalog
+  (`kvendra.git.destructive_ops` now includes `clone`).
+- **SA8 — secret detection defeated by decoys.** One shared selector for
+  `detect` and `sanitize_output`: per-match entropy gate over a bounded
+  window, rejected and accepted matches are not consumed, overlapping spans of
+  all providers are redacted in one pass over the original text, and the work
+  cap never consumes a true positive (bounded patterns are always fully
+  scanned; unbounded ones widen to their alphabet run).
+- **SA10 — floating dependency closure.** `Cargo.lock` is versioned; CI builds
+  and tests with `--locked`; a blocking `cargo-deny` job runs `deny.toml`;
+  documented installs use `cargo install --locked`. Patch bumps: anyhow
+  1.0.104, rustls 0.23.45, rustls-webpki 0.103.15, webbrowser 1.2.4.
+
+### Hardening
+
+- Hostile agent-supplied tool names, operations and profile ids are stored
+  escaped and length-capped in audit refusal rows; `kvendra audit`, the audit
+  watch view and the dashboard escape control, bidi and zero-width characters.
+
+
 ## [0.6.4] — 2026-09-15 — fix(security): enforcement hardening from external audit (ISSUE-KVD-CLI-B78ED5)
 
 Security release. Remediates an external static security audit of the public
