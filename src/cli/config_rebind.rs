@@ -177,10 +177,12 @@ pub struct RebindOutcome {
 /// 2. `validate_code_unconsumed` (recovery code barrier — NO mutation yet).
 /// 3. typed-path canonicalize + compare to `new_path` canonicalized
 ///    (typed-confirmation barrier).
-/// 4. `mark_code_consumed` + atomic write of `recovery_codes.json` (0600).
-/// 5. `Config::save` at the NEW home (or fall back to re-saving at the
-///    previous home with the new canonical path).
-/// 6. `home_rebound` audit row at severity `warn`.
+/// 4. Verified load of the config to re-sign (NO mutation yet; an integrity
+///    failure aborts here with the slot unconsumed).
+/// 5. `mark_code_consumed` + atomic write of `recovery_codes.json` (0600).
+/// 6. `Config::save` of the verified config at the NEW home (or fall back to
+///    re-saving at the previous home) with the new canonical path.
+/// 7. `home_rebound` audit row at severity `warn`.
 pub async fn rebind_inner(
     prev_home: &Path,
     new_path: &Path,
@@ -264,6 +266,27 @@ pub async fn rebind_inner(
         return Err(KvendraError::RebindConfirmationMismatch);
     }
 
+    // Verify the config that will be re-signed BEFORE any side effect: a
+    // config that fails verification aborts the rebind with the recovery
+    // slot unconsumed and the file untouched (ISSUE-KVD-CLI-BFACC4).
+    //
+    // The new_home directory normally already contains the moved vault
+    // layout; its config is still signed for the old home, which
+    // `load_for_rebind` accepts once the signature verifies. Otherwise fall back to re-saving at the
+    // previous (still-active) home with the new canonical path encoded —
+    // useful in tests where the user is rebinding without physically moving
+    // the directory yet.
+    let new_vault = Vault::new(new_canon.clone());
+    let (mut cfg, save_home, save_vault) = if new_vault.sentinel_path().exists() {
+        new_vault.unlock(master_password, 30)?;
+        let cfg = Config::load_for_rebind(&new_canon, &new_vault)?;
+        (cfg, new_canon.as_path(), &new_vault)
+    } else {
+        let cfg = Config::load_for_update(prev_home, &vault, "rebind-home")?;
+        (cfg, prev_home, &vault)
+    };
+    cfg.vault.home_canonical = Some(new_canon.to_string_lossy().into_owned());
+
     // ───────────────────────────────────────────────────────────────────
     // Post-confirmation: commit side effects.
     // ───────────────────────────────────────────────────────────────────
@@ -276,22 +299,8 @@ pub async fn rebind_inner(
     std::fs::rename(&tmp, &codes_path)?;
     set_file_mode_secure(&codes_path)?;
 
-    // 2. Re-save the config at the NEW home with the new canonical path.
-    //    The new_home directory must already contain a usable vault layout
-    //    (the user is expected to have moved `~/.kvendra/` already).
-    let new_vault = Vault::new(new_canon.clone());
-    if new_vault.sentinel_path().exists() {
-        new_vault.unlock(master_password, 30)?;
-        let cfg_at_new = Config::load(&new_canon, Some(&new_vault)).unwrap_or_default();
-        cfg_at_new.save(&new_canon, &new_vault)?;
-    } else {
-        // Fall back to re-saving at the previous (still-active) home with
-        // the new canonical path encoded — useful in tests where the user
-        // is rebinding without physically moving the directory yet.
-        let mut cfg = Config::load(prev_home, Some(&vault)).unwrap_or_default();
-        cfg.vault.home_canonical = Some(new_canon.to_string_lossy().into_owned());
-        cfg.save(prev_home, &vault)?;
-    }
+    // 2. Re-save the verified config with the new canonical path.
+    cfg.save(save_home, save_vault)?;
 
     // 3. Audit row (D8 schema).
     let writer = AuditWriter::spawn(vault.audit_db_path(), vault.audit_hmac_key()?)?;
@@ -616,6 +625,151 @@ mod tests {
             !codes_raw.contains("home_rebound"),
             "slot must NOT be marked consumed when the typed path mismatches"
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // SA6 / ISSUE-KVD-CLI-BFACC4 — rebind re-signs the VERIFIED config (never
+    // compiled defaults) and verifies it BEFORE consuming a recovery slot.
+    // ----------------------------------------------------------------------
+
+    fn sign_policy(home: &Path, v: &Vault) {
+        let mut cfg = Config::default();
+        cfg.detection.severity = crate::config::DetectionSeverity::Block;
+        cfg.approval.mode = crate::approval::ApprovalMode::Ask;
+        cfg.save(home, v).unwrap();
+    }
+
+    /// Physically move (copy) the top-level vault files of `from` into `to`.
+    fn copy_vault(from: &Path, to: &Path) {
+        ensure_layout(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    fn assert_policy_preserved_at(home: &Path) {
+        let v = Vault::new(home.to_path_buf());
+        v.unlock(b"hunter2-test", 30).unwrap();
+        let cfg = Config::load(home, Some(&v)).unwrap();
+        assert_eq!(
+            cfg.detection.severity,
+            crate::config::DetectionSeverity::Block
+        );
+        assert_eq!(cfg.approval.mode, crate::approval::ApprovalMode::Ask);
+        assert_eq!(
+            cfg.vault.home_canonical.as_deref(),
+            Some(&*std::fs::canonicalize(home).unwrap().to_string_lossy())
+        );
+    }
+
+    /// Branch "vault present at the new home": the moved config (still signed
+    /// for the previous home) keeps the owner's policy after the rebind.
+    #[tokio::test]
+    async fn sa6_rebind_moved_home_preserves_verified_policy() {
+        let tmp = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        let v = bootstrap_vault(tmp.path());
+        sign_policy(tmp.path(), &v);
+        copy_vault(tmp.path(), dest.path());
+        rebind_inner(
+            tmp.path(),
+            dest.path(),
+            b"hunter2-test",
+            "1111-2222-33",
+            dest.path().to_string_lossy().as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_policy_preserved_at(dest.path());
+    }
+
+    /// The documented recovery flow for `home_redirect_detected`: KVENDRA_HOME
+    /// already points at the moved vault and `--new-path` names that same
+    /// location. The policy survives the rebind.
+    #[tokio::test]
+    async fn sa6_rebind_from_moved_home_itself_preserves_verified_policy() {
+        let orig = TempDir::new().unwrap();
+        let moved = TempDir::new().unwrap();
+        let v = bootstrap_vault(orig.path());
+        sign_policy(orig.path(), &v);
+        copy_vault(orig.path(), moved.path());
+        rebind_inner(
+            moved.path(),
+            moved.path(),
+            b"hunter2-test",
+            "1111-2222-33",
+            moved.path().to_string_lossy().as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_policy_preserved_at(moved.path());
+    }
+
+    /// A tampered config at the moved home aborts the rebind BEFORE the
+    /// recovery slot is consumed, and the file is left byte-identical.
+    #[tokio::test]
+    async fn sa6_rebind_tampered_moved_config_refused_before_consuming_slot() {
+        let tmp = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        let v = bootstrap_vault(tmp.path());
+        sign_policy(tmp.path(), &v);
+        copy_vault(tmp.path(), dest.path());
+        let path = dest.path().join("config.toml");
+        let signed = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{signed}appended_by_attacker = true\n")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let r = rebind_inner(
+            tmp.path(),
+            dest.path(),
+            b"hunter2-test",
+            "1111-2222-33",
+            dest.path().to_string_lossy().as_ref(),
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(KvendraError::Config(m)) if m.contains("config_tampered_detected")),
+            "{r:?}"
+        );
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        let codes_raw = std::fs::read_to_string(tmp.path().join("recovery_codes.json")).unwrap();
+        assert!(
+            !codes_raw.contains("home_rebound"),
+            "slot must NOT be consumed when the config fails verification"
+        );
+    }
+
+    /// Fallback branch (no vault at the new home): a tampered config at the
+    /// previous home aborts before consuming the slot, file untouched.
+    #[tokio::test]
+    async fn sa6_rebind_tampered_prev_config_refused_before_consuming_slot() {
+        let tmp = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        let v = bootstrap_vault(tmp.path());
+        sign_policy(tmp.path(), &v);
+        let path = tmp.path().join("config.toml");
+        let signed = std::fs::read_to_string(&path).unwrap();
+        let idx = signed.rfind("_hmac = \"").unwrap() + "_hmac = \"".len();
+        let mut bytes = signed.into_bytes();
+        bytes[idx] = if bytes[idx] == b'a' { b'b' } else { b'a' };
+        std::fs::write(&path, &bytes).unwrap();
+        let r = rebind_inner(
+            tmp.path(),
+            dest.path(),
+            b"hunter2-test",
+            "1111-2222-33",
+            dest.path().to_string_lossy().as_ref(),
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(KvendraError::Config(m)) if m.contains("config_tampered_detected")),
+            "{r:?}"
+        );
+        assert_eq!(bytes, std::fs::read(&path).unwrap());
+        let codes_raw = std::fs::read_to_string(tmp.path().join("recovery_codes.json")).unwrap();
+        assert!(!codes_raw.contains("home_rebound"));
     }
 
     // ----------------------------------------------------------------------

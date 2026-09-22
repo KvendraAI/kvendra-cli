@@ -73,7 +73,7 @@ pub async fn run(cmd: ConfigCommand) -> KvendraResult<()> {
     match cmd {
         ConfigCommand::Keychain(sub) => {
             let vault = unlock_for_config(&home)?;
-            let mut cfg = Config::load(&home, Some(&vault)).unwrap_or_default();
+            let mut cfg = Config::load_for_update(&home, &vault, "keychain")?;
             match sub {
                 KeychainCommand::Enable => {
                     cfg.vault.master_password_cache = MasterPasswordCache::OsKeychain;

@@ -168,6 +168,35 @@ impl Config {
     /// SHOULD pass a vault whenever one is available so the verification
     /// runs on every load.
     pub fn load(home: &Path, vault: Option<&Vault>) -> KvendraResult<Self> {
+        Self::load_inner(home, vault, true)
+    }
+
+    /// The ONLY loader a config-MUTATING subcommand may use before
+    /// [`Config::save`] (ISSUE-KVD-CLI-BFACC4 / SA6).
+    ///
+    /// [`Config::load`] already yields compiled defaults for an ABSENT file,
+    /// so every `Err` it returns is an integrity (or parse/validation)
+    /// failure. Collapsing it into defaults and saving would re-sign a
+    /// tampered, unsigned or home-redirected document as legitimate and erase
+    /// the evidence. This loader verifies with the unlocked `vault` and
+    /// propagates every error; the file on disk is never touched.
+    pub fn load_for_update(home: &Path, vault: &Vault, subcommand: &str) -> KvendraResult<Self> {
+        Self::load_inner(home, Some(vault), true)
+            .map_err(|e| refuse_update(e, subcommand, &home.join("config.toml")))
+    }
+
+    /// Loader for `kvendra config rebind-home` reading the config of a vault
+    /// physically moved to `home`. Identical to [`Config::load_for_update`]
+    /// (the signature must verify under `vault`, every error propagates)
+    /// except that the signed `home_canonical` is NOT compared to `home`: a
+    /// moved vault's config is still signed for the old location, and
+    /// resolving that redirect is exactly what the triple-barrier rebind does.
+    pub fn load_for_rebind(home: &Path, vault: &Vault) -> KvendraResult<Self> {
+        Self::load_inner(home, Some(vault), false)
+            .map_err(|e| refuse_update(e, "rebind-home", &home.join("config.toml")))
+    }
+
+    fn load_inner(home: &Path, vault: Option<&Vault>, check_home: bool) -> KvendraResult<Self> {
         let path = home.join("config.toml");
         if !path.exists() {
             return Ok(Self::default());
@@ -201,8 +230,8 @@ impl Config {
                     );
                     return Err(KvendraError::Config(
                         "config_tampered_detected: ~/.kvendra/config.toml HMAC mismatch. \
-                         Refusing to start. Re-run a `kvendra config <subcommand>` to re-sign \
-                         or restore from backup."
+                         Refusing to start. Restore it from a backup, or move it aside (keep it \
+                         as tamper evidence) to reset to signed defaults."
                             .into(),
                     ));
                 }
@@ -232,8 +261,8 @@ impl Config {
             );
             return Err(KvendraError::Config(format!(
                 "config_tampered_detected: ~/.kvendra/config.toml is not validly signed{}. \
-                 Refusing to start. Restore from backup, or delete ~/.kvendra/config.toml to \
-                 reset to signed defaults.",
+                 Refusing to start. Restore it from a backup, or move ~/.kvendra/config.toml \
+                 aside (keep it as tamper evidence) to reset to signed defaults.",
                 if orphan {
                     " (an `_hmac` line is present but is not the last line — content was appended \
                      after the signature)"
@@ -251,6 +280,7 @@ impl Config {
         // we cannot trust the signed_home, so the redirect check is deferred
         // to the post-unlock load.
         if vault.is_some()
+            && check_home
             && let Some(signed_home) = cfg.vault.home_canonical.as_deref()
         {
             let actual = std::fs::canonicalize(home).map_err(|e| {
@@ -340,6 +370,25 @@ impl Config {
         std::fs::rename(&tmp, &path)?;
         set_file_mode_secure(&path)?;
         Ok(())
+    }
+}
+
+/// Wrap a load error for a config-mutating subcommand: keep the original
+/// diagnosis (`config_tampered_detected`, `home_redirect_detected`, ...) and
+/// state that nothing was written.
+fn refuse_update(err: KvendraError, subcommand: &str, path: &Path) -> KvendraError {
+    tracing::error!(
+        target: "kvendra::config",
+        flag = "config_update_refused",
+        subcommand,
+        "refusing to modify a config.toml that failed verification"
+    );
+    match err {
+        KvendraError::Config(msg) => KvendraError::Config(format!(
+            "{msg} `kvendra config {subcommand}` did not modify '{}'.",
+            path.display()
+        )),
+        other => other,
     }
 }
 
@@ -734,6 +783,111 @@ mod tests {
         assert!(
             matches!(r, Err(KvendraError::Config(ref m)) if m.contains("config_tampered_detected")),
             "expected config_tampered_detected, got {r:?}"
+        );
+    }
+
+    /// SA6 / ISSUE-KVD-CLI-BFACC4 — ENGINE GUARD. No config-mutating
+    /// subcommand may read the config it is about to re-sign through a
+    /// verifying `Config::load(.., Some(..))` (it must use
+    /// `Config::load_for_update` / `Config::load_for_rebind`), and no
+    /// verifying load may be followed by a fallback that swallows its error
+    /// (`unwrap_or_default` & co.) within 220 chars.
+    #[test]
+    fn sa6_engine_guard_config_writers_never_swallow_integrity_errors() {
+        let writers = [
+            ("cli/config_cmd.rs", include_str!("cli/config_cmd.rs")),
+            (
+                "cli/config_telemetry.rs",
+                include_str!("cli/config_telemetry.rs"),
+            ),
+            (
+                "cli/config_approval.rs",
+                include_str!("cli/config_approval.rs"),
+            ),
+            ("cli/config_rebind.rs", include_str!("cli/config_rebind.rs")),
+        ];
+        let swallowers = ["unwrap_or_default", "unwrap_or(", "unwrap_or_else", ".ok()"];
+        for (name, src) in writers {
+            let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+            for needle in [
+                "Config::load(",
+                "Config::load_for_update(",
+                "Config::load_for_rebind(",
+            ] {
+                for (idx, _) in prod.match_indices(needle) {
+                    let after = &prod[idx + needle.len()..];
+                    let args_end = after.find(')').unwrap_or(after.len());
+                    let args = &after[..args_end];
+                    let verifying = needle != "Config::load(" || args.contains("Some(");
+                    if !verifying {
+                        continue;
+                    }
+                    assert!(
+                        needle != "Config::load(",
+                        "{name}: a config writer calls `Config::load(.., Some(..))`; use \
+                         `Config::load_for_update` so integrity errors propagate: `{}`",
+                        &prod[idx..(idx + 120).min(prod.len())]
+                    );
+                    let window = &prod[idx..(idx + 220).min(prod.len())];
+                    for s in swallowers {
+                        assert!(
+                            !window.contains(s),
+                            "{name}: verifying config load followed by `{s}` launders an \
+                             integrity failure into signed defaults: `{window}`"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// SA6 — the HMAC-mismatch diagnosis must not instruct the owner to re-run
+    /// a `kvendra config` subcommand to re-sign: that instruction was the
+    /// laundering path.
+    #[test]
+    fn sa6_tamper_messages_do_not_recommend_resigning() {
+        let tmp = TempDir::new().unwrap();
+        ensure_layout(tmp.path()).unwrap();
+        let v = unlocked_vault(tmp.path());
+        Config::default().save(tmp.path(), &v).unwrap();
+        let path = tmp.path().join("config.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let payload = &raw[..raw.rfind("_hmac = \"").unwrap()];
+        std::fs::write(&path, format!("{payload}_hmac = \"{}\"\n", "0".repeat(64))).unwrap();
+        let err = Config::load(tmp.path(), Some(&v)).unwrap_err().to_string();
+        assert!(err.contains("config_tampered_detected"), "{err}");
+        assert!(
+            !err.contains("re-sign") && !err.contains("Re-run"),
+            "tamper diagnosis must not recommend re-signing: {err}"
+        );
+    }
+
+    /// SA6 — `load_for_update` treats an ABSENT file as first run (defaults)
+    /// and propagates a home redirect without touching the file.
+    #[test]
+    fn sa6_load_for_update_absent_ok_redirect_refused_untouched() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        ensure_layout(src.path()).unwrap();
+        let v = unlocked_vault(src.path());
+        let cfg = Config::load_for_update(src.path(), &v, "test").unwrap();
+        assert!(cfg.vault.home_canonical.is_none());
+        Config::default().save(src.path(), &v).unwrap();
+        std::fs::copy(
+            src.path().join("config.toml"),
+            dst.path().join("config.toml"),
+        )
+        .unwrap();
+        let before = std::fs::read(dst.path().join("config.toml")).unwrap();
+        let r = Config::load_for_update(dst.path(), &v, "test");
+        assert!(
+            matches!(&r, Err(KvendraError::Config(m))
+                if m.contains("home_redirect_detected") && m.contains("did not modify")),
+            "{r:?}"
+        );
+        assert_eq!(
+            before,
+            std::fs::read(dst.path().join("config.toml")).unwrap()
         );
     }
 
