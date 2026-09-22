@@ -2,7 +2,7 @@
 
 ## Descripción
 
-Catálogo de errores comunes, patterns conocidos (`PAT-KVD-*` en KB v3) y preguntas que aparecen recurrentemente. La fuente canónica para incidentes y postmortems es el KB v3 (`PAT-KVD-*`, `ISSUE-KVD-CLI-*`); este capítulo recopila los más frecuentes para acceso rápido.
+Catálogo de errores comunes, patterns conocidos (`PAT-KVD-*` en Kvendra KB) y preguntas que aparecen recurrentemente. La fuente canónica para incidentes y postmortems es el Kvendra KB (`PAT-KVD-*`, `ISSUE-KVD-CLI-*`); este capítulo recopila los más frecuentes para acceso rápido.
 
 ## Errores comunes
 
@@ -93,7 +93,7 @@ Cubierto en el [capítulo 8](./08-audit-log.md). Causas posibles: tampering, sch
 >
 > **Follow-up**: `ISSUE-KVD-CLI-029` traquea un subcomando para forzar restart desde Kvendra side. No bloqueante.
 >
-> **Trazabilidad**: la fuente canónica de este patrón es `PAT-KVD-009` en KB v3, también referenciada en memoria local del workspace.
+> **Trazabilidad**: la fuente canónica de este patrón es `PAT-KVD-009` en Kvendra KB, también referenciada en memoria local del workspace.
 
 ### `PAT-KVD-CLI-001` — approval gate funciona sin Apple Dev ID
 
@@ -137,9 +137,9 @@ A futuro, el marketplace (`kvendra-skills`, post-MVP) permitirá primitives comm
 
 Por diseño. La promesa zero-knowledge implica que ningún canal externo (incluido Kvendra) tiene capacidad para descifrar tu vault. El recovery vive en la **recovery phrase BIP-39** que tú anotaste offline en `kvendra init`. Si la pierdes también, el vault se va — feature, no bug. Ver [capítulo 10](./10-recuperacion.md).
 
-### ¿Por qué `serde_yml` y no `serde_yaml`?
+### ¿Por qué `serde_yaml_ng` y no `serde_yaml`?
 
-`serde_yaml` está sin mantenimiento upstream desde 2024. `serde_yml` es el fork que recoge security fixes. Trade-off documentado en `ADR-KVD-008`.
+`serde_yaml` está sin mantenimiento upstream desde 2024. Kvendra usa el fork mantenido **`serde_yaml_ng`** (0.10), que recoge fixes. Trade-off documentado en `ADR-KVD-008`.
 
 ### ¿Por qué Argon2id y no scrypt o bcrypt?
 
@@ -147,7 +147,7 @@ Argon2id es el ganador de Password Hashing Competition 2015 y la recomendación 
 
 ### ¿Por qué AES-256-GCM y no ChaCha20-Poly1305?
 
-Performance comparable; AES-256-GCM tiene aceleración hardware en CPU modernas (AES-NI). En contextos donde no hay AES-NI (algunos ARM low-power), ChaCha20-Poly1305 sería más rápido — pero el target de Kvendra es laptop/desktop con AES-NI presente. ChaCha20-Poly1305 está en `Cargo.toml` como alternative_aead documentado en `REQ-KVD-002`; no usado en `0.1.0`.
+Performance comparable; AES-256-GCM tiene aceleración hardware en CPU modernas (AES-NI). En contextos donde no hay AES-NI (algunos ARM low-power), ChaCha20-Poly1305 sería más rápido — pero el target de Kvendra es laptop/desktop con AES-NI presente. ChaCha20-Poly1305 sería la alternativa (documentada en `REQ-KVD-002`); Kvendra usa AES-256-GCM.
 
 ### ¿Cómo audito que el binario no tiene backdoors?
 
@@ -155,26 +155,18 @@ Apache-2.0 te da el código fuente completo. La auditoría canónica:
 
 1. Clonar `KvendraAI/kvendra-cli`.
 2. `cargo install --path . --locked` (build local desde fuente).
-3. Comparar checksum del binario con el de GitHub Releases (deben coincidir si `cargo` y toolchain son las mismas — reproducible builds **no** garantizadas en `0.1.0`, llegan en `0.3.0`).
+3. Comparar checksum del binario con el de GitHub Releases (deben coincidir si `cargo` y toolchain son las mismas — reproducible builds / releases firmadas **aún no** garantizadas en 0.6.4; siguen en el roadmap de hardening).
 4. Auditar el path crypto: `vault::session`, `vault::kdf`, `vault::crypto`, `mcp::server::build_sanitized_payload`. La promesa REQ-KVD-002 dice que un reviewer externo lo hace en ≤2h.
 
 ### ¿Hay paquete oficial en Homebrew / apt / yum?
 
-No en `0.1.0`. Track:
-
-> Homebrew: `0.2.0` (`ROAD-KVD-CLI-002`).
->
-> apt / yum: futuro, sin fecha.
->
-> AUR / Snap / Flatpak / Nix: post-Beta, mantenido por community.
-
-Por ahora: `cargo install --locked kvendra` o GitHub Releases.
+No en 0.6.4. La distribución hoy es **`cargo install --locked kvendra`** (crates.io) o los binarios de [GitHub Releases](https://github.com/KvendraAI/kvendra-cli/releases). Homebrew, apt/yum y AUR/Snap/Flatpak/Nix siguen sin fecha (post-Beta, previsiblemente mantenidos por la comunidad).
 
 ## Cómo reportar un bug
 
 > **Bug normal**: GitHub issue en `KvendraAI/kvendra-cli`.
 >
-> **Security bug**: NO public issue. Email a `hello@kvendra.ai` siguiendo `SECURITY.md` (RFC 9116).
+> **Security bug**: NO public issue. Email a `security@kvendra.ai` siguiendo `SECURITY.md` (RFC 9116).
 
 Para bugs reproducibles, incluye:
 
@@ -186,6 +178,6 @@ Para bugs reproducibles, incluye:
 
 ## Notas importantes
 
-> **Nota:** Si encuentras un patrón nuevo que merece documentación, este manual `internal` es buen sitio para anotarlo provisionalmente, pero la fuente canónica del proyecto es el KB v3 (`PAT-KVD-*`). Pasar de "anotación local" a "PAT en KB v3" es el step correcto cuando el patrón se valida en uso real.
+> **Nota:** Si encuentras un patrón nuevo que merece documentación, este manual `internal` es buen sitio para anotarlo provisionalmente, pero la fuente canónica del proyecto es el Kvendra KB (`PAT-KVD-*`). Pasar de "anotación local" a "PAT en Kvendra KB" es el step correcto cuando el patrón se valida en uso real.
 
 > **Advertencia:** No conviertas este capítulo en un dump de errores efímeros. Cada entry debe tener: síntoma, causa, fix. Los errores que solo aplican a una versión vieja del binario o a un setup específico no escalan — viven mejor como issue cerrada o changelog entry.

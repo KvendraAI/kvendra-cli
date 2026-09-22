@@ -32,26 +32,35 @@ Dos puntos de inspección:
 
 ## Patterns canónicos
 
-`detection::patterns` enumera los regex con clase de token:
+`detection::patterns::PROVIDER_PATTERNS` enumera los regex con su clase de token. **19 patterns** en 0.6.4 (la doc-comment del módulo que dice «7 providers» es previa y quedó stale):
 
-| Provider | Regex |
-|----------|-------|
-| GitHub PAT classic | `ghp_[A-Za-z0-9]{36}` |
-| GitHub fine-grained | `github_pat_[A-Za-z0-9_]{82}` |
-| AWS Access Key | `AKIA[0-9A-Z]{16}` |
-| JWT | `eyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_.+/=-]+` |
-| Anthropic | `sk-ant-[A-Za-z0-9_-]+` |
-| OpenAI | `sk-[A-Za-z0-9]{48,}` |
-| npm token | `npm_[A-Za-z0-9]{36,}` |
-| HuggingFace | `hf_[A-Za-z0-9]{34,}` |
-| PyPI | `pypi-AgEI[A-Za-z0-9_=-]+` |
-| Generic high-entropy | `[A-Za-z0-9_-]{40,}` con entropy ≥4.5 bits/char (heurística Shannon) |
+| Provider (id) | Regex |
+|---------------|-------|
+| `github_pat_classic` | `ghp_[A-Za-z0-9]{36}` |
+| `github_oauth` | `gho_[A-Za-z0-9]{36}` |
+| `github_app_server` | `ghs_[A-Za-z0-9]{36}` |
+| `github_user_to_server` | `ghu_[A-Za-z0-9]{36}` |
+| `github_pat_fine` | `github_pat_[A-Za-z0-9_]{82}` |
+| `npm_token` | `npm_[A-Za-z0-9]{36}` |
+| `pypi_token` | `pypi-AgEI[A-Za-z0-9_-]{30,}` |
+| `hf_token` | `hf_[A-Za-z0-9]{34}` |
+| `aws_akid` | `AKIA[0-9A-Z]{16}` |
+| `aws_secret_env` | `(?i)aws_secret_access_key\s*=\s*[A-Za-z0-9/+]{40}` |
+| `anthropic_key` | `sk-ant-[A-Za-z0-9_-]{60,}` |
+| `openai_key` | `sk-[A-Za-z0-9]{48,}` |
+| `slack_token` | `xox[baprs]-[0-9A-Za-z-]{10,}` |
+| `stripe_secret_key` | `(?:sk\|rk)_live_[0-9A-Za-z]{24,}` — los `sk_test_` NO se matchean (no sensibles por guía de Stripe) |
+| `google_api_key` | `AIza[0-9A-Za-z_-]{35}` |
+| `gitlab_pat` | `glpat-[0-9A-Za-z_-]{20,}` |
+| `google_oauth_token` | `ya29\.[0-9A-Za-z_-]{20,}` |
+| `jwt` | `eyJ[0-9A-Za-z_-]{8,}\.[0-9A-Za-z_-]{8,}\.[0-9A-Za-z_-]{8,}` |
+| `private_key_pem` | `(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----\|\z)` — bloque completo, o hasta EOF si el footer está truncado |
 
-La heurística genérica (`generic_high_entropy`) cierra la cobertura para tokens de proveedores no listados explícitamente, mientras minimiza falsos positivos sobre identificadores normales (UUIDs, nombres de fichero, hashes git).
+Los añadidos en el hardening 0.6.4 (`slack_token`, `stripe_secret_key` live, `google_api_key`, `gitlab_pat`, `google_oauth_token`, `private_key_pem`, más los `gho_/ghs_/ghu_`) amplían la cobertura de proveedores. **No hay un pattern genérico catch-all**: la entropía de Shannon no es un matcher, sino un **filtro** que descarta falsos positivos sobre los matches de los patterns anteriores (identificadores normales, UUIDs, hashes git de baja entropía).
 
 ## Severidades workspace
 
-Configurable via `kvendra config set detection.severity <warn|error|block>`. Persiste en `config.toml` (firmado con HMAC sidecar — `kvendra/config-hmac/v1` — para resistir tampering L1).
+Se lee del bloque `[detection]` de `~/.kvendra/config.toml` (`severity`, enum `warn|error|block`, default `warn`). El fichero está firmado con HMAC sidecar (`kvendra/config-hmac/v1`) y en 0.6.4 se **rechaza fail-closed** si está manipulado o sin firmar (A5). En 0.6.4 **no** hay un subcomando `kvendra config set` para la severidad — se lee de `config.toml`; `kvendra config` gestiona keychain/approval/mcp-password/rebind-home/recovery-codes/telemetry.
 
 | Severity | Comportamiento input | Comportamiento output | Audit row |
 |----------|---------------------|----------------------|-----------|
@@ -75,7 +84,7 @@ Si una primitive genera matches falsos positivos repetidos, la lección se docum
 
 Cuando un match dispara warning, el log y la audit row incluyen un mensaje human-readable:
 
-> *"This looks like a `<provider>` token. Want to store it via `kvendra secret import <provider>` and use the capability broker instead?"*
+> *"This looks like a `<provider>` token. Want to store it via `kvendra secret add <profile>` and use the capability broker instead?"*
 
 Tono: educativo, no punitivo. Sugiere la alternativa (importar al vault), no se limita a bloquear.
 
@@ -122,6 +131,21 @@ Conjunto típico:
 > `detection` busca patterns **genéricos** de tokens en input/output, sin saber cuál es el secret activo.
 
 Si una response del servicio externo contiene un token de **otro** servicio (ej. la API de GitHub devuelve un body con un AWS key embebido por error), `sanitize_output` no lo redactará (no es el plaintext del profile actual), pero `detection` sí lo flageará si la severidad es `error` o `block`.
+
+### 0.6.4 — cobertura del redactor de salida ampliada
+
+La auditoría de 0.6.3 encontró dos huecos en el redactor de salida:
+
+- **N9** — `sanitize_output` redactaba el **cuerpo** de las respuestas HTTP pero devolvía las **cabeceras** sin sanitizar (el agente controla `auth_scheme`/cabeceras de request, y un endpoint puede reflejar una cabecera o devolver un token en una). En 0.6.4 los valores de cabecera pasan por el mismo redactor que el cuerpo.
+- **N11** — el redactor no cubría **claves privadas PEM**, **JWT** ni **tokens OAuth de Google (`ya29.`)**; una clave o un JWT en la salida de un comando se devolvía en claro. Se añadieron los tres.
+
+Dos políticas de redacción declaradas en `detection::patterns`:
+
+> **`ALWAYS_REDACT_PROVIDERS`** (`private_key_pem`) — se redacta siempre, saltándose el filtro de entropía: el *framing* `BEGIN … PRIVATE KEY` es señal suficiente y un cuerpo de baja entropía forzado no debe colar una clave real. Redacta el bloque `BEGIN…END` **completo** (o hasta EOF si el footer está truncado), no solo el header.
+>
+> **`REDACT_ONLY_PROVIDERS`** (`jwt`, `google_oauth_token`) — se redactan en la **salida** pero NO bloquean/marcan como *finding* en el **input**: un JWT o un `ya29.` es a menudo un argumento legítimo (un `Authorization: Bearer` que el agente debe mandar), así que tratarlo como smuggling en modo `block` denegaría llamadas válidas. Se redactan sin fricción falsa.
+
+Además, `sanitize_output` redacta por **valor exacto** el secret del profile activo (capturado antes de la ejecución), no solo por pattern.
 
 ## Notas importantes
 

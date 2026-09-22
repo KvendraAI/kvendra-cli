@@ -51,7 +51,7 @@ CLI permisivo para máxima adopción y trust. Server core con copyleft fuerte (A
 
 Esto evita "enshittification gradual" donde features útiles se mueven progresivamente del OSS al closed (caso típico que destruye goodwill).
 
-## Capacidades por tier — `0.1.0` y futuro
+## Capacidades por tier — `0.6.4` y futuro
 
 | Capacidad | Free CLI (OSS) | Pro Cloud | Team Cloud | Enterprise Cloud |
 |-----------|:-:|:-:|:-:|:-:|
@@ -134,7 +134,7 @@ Si usas Kvendra CLI como dev individual o en una empresa interna:
 >
 > Puedes redistribuir el binario modificado bajo Apache-2.0 (manteniendo notice de copyright original y NOTICE).
 >
-> No hay tracking, telemetry ni analytics en `0.1.0`. El binario no llama a ningún servidor de Kvendra durante operación normal.
+> La telemetría es **opt-in y por defecto `off`** (`kvendra config telemetry`); sin activarla, el CLI en modo local/offline no llama a ningún servidor de Kvendra durante operación normal. Las funciones **Pro** (`kvendra login`, `kvendra backup`) sí hablan con la nube de Kvendra por diseño — es su cometido.
 >
 > No hay licencia para activar. No hay key de seriado. No hay limit por máquina.
 
@@ -142,7 +142,7 @@ Si usas Kvendra CLI como dev individual o en una empresa interna:
 
 Si quieres contribuir a `kvendra-cli`:
 
-> Lee `CONTRIBUTING.md` (cuando exista — en `0.1.0` aún no es exhaustivo).
+> Lee `CONTRIBUTING.md` (cuando exista — aún no es exhaustivo).
 >
 > Firma DCO en cada commit (`-s`).
 >
@@ -160,6 +160,6 @@ Si quieres contribuir a `kvendra-cli`:
 
 ## Notas importantes
 
-> **Nota:** El binario `kvendra` no incluye telemetry. Si en algún momento futuro se introduce telemetry opt-in (e.g. crash reports anonymous), será documentado y el flag por defecto `off`. Para `0.1.0` y `0.1.x`, no hay ningún canal de comunicación entre el binario y servidores de Kvendra durante operación normal.
+> **Nota:** La telemetría del binario `kvendra` es **opt-in**, se gestiona con `kvendra config telemetry` y su valor por defecto es `off`. Con la telemetría desactivada y en modo local, no hay canal de comunicación entre el binario y los servidores de Kvendra durante operación normal; las operaciones **Pro** (login OIDC, backup cloud) sí son, por naturaleza, llamadas de red a la nube de Kvendra.
 
 > **Advertencia:** Si forkeas `kvendra-cli` y publicas tu fork bajo otro nombre (rebrandeado), respeta la política de trademark. La buena fe legal sugiere: rebrand efectivo, dejar credit a Kvendra como upstream, no aprovecharse del trademark "Kvendra" para vender competición directa.

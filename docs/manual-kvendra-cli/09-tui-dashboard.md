@@ -62,11 +62,11 @@ La feature Cargo `tui` está activa por defecto. Builds headless (`--no-default-
 
 ## Estados del vault
 
-> **`UNLOCKED · session expires in <hh:mm:ss>`** — derived key en RAM, idle timer activo. El timer se resetea con cada `tools/call` o cualquier comando `kvendra <subcommand>`.
+> **`UNLOCKED · session expires in <hh:mm:ss>`** — derived key en RAM; el contador es el TTL de la sesión (`~/.kvendra/sessions/active.blob`, default 4h). El valor exacto y el modo (local vs workspace) los lees con `kvendra session info`; lo refrescas con `kvendra unlock --extend` (re-autentica con la master password). Aparte, `idle_timeout_minutes` (`config.toml`, default 30) controla la caché en RAM de la clave.
 >
 > **`LOCKED`** — sin derived key. Cualquier intento de invocar primitive falla con `VaultLocked`. Pulsa `u` para unlockar.
 >
-> **`UNLOCKED (keychain)`** — sesión active vía OS keychain ACL (modo `--use-keychain` del broker). El idle timer sigue aplicando, pero el siguiente unlock pedirá Touch ID / Windows Hello / libsecret en lugar de master password textual.
+> **`UNLOCKED (keychain)`** — sesión activa vía OS keychain ACL (modo `--use-keychain` del broker, **solo macOS en 0.6.4**). El idle timer sigue aplicando, pero el siguiente unlock pedirá Touch ID en lugar de la master password textual.
 
 ## Indicadores de profile
 
@@ -82,20 +82,24 @@ Columna final de cada profile:
 
 ## Detection severity
 
-Línea superior `Detection severity: <warn | error | block>`. Cambiable desde el dashboard (atajo futuro) o vía:
+La línea superior `Detection severity: <warn | error | block>` refleja el valor efectivo del bloque `[detection]` de `~/.kvendra/config.toml` (default `warn`). En el dashboard es **informativa / read-only**.
 
-```bash
-kvendra config set detection.severity warn
+```toml
+[detection]
+severity = "warn"   # warn | error | block
 ```
 
-Detalles en el [capítulo 16](./16-detection-layer.md).
+> **Nota:** en **0.6.4 no existe un subcomando para cambiarla** — `kvendra config set` no existe, y `kvendra config` solo cubre `keychain / approval / mcp-password / rebind-home / recovery-codes / telemetry`. Además `config.toml` va firmado con HMAC (rechaza ediciones que no respeten la firma), así que no es un hand-edit trivial. El comportamiento de cada nivel (`warn` / `error` / `block`) está en el [capítulo 16](./16-detection-layer.md).
 
 ## Live tail integrado — `kvendra audit --watch`
 
 Para observación en tiempo real focused (sin la vista global del dashboard):
 
 ```bash
-kvendra audit --watch
+kvendra audit --watch                                   # todo el flujo
+kvendra audit --watch --profile aws.kvendra-web-deployer    # filtra por profile_id
+kvendra audit --watch --primitive kvendra.git               # filtra por primitive
+kvendra audit --watch --since 1h                            # ventana temporal
 ```
 
 Cubierto en el [capítulo 8](./08-audit-log.md). El dashboard y el watch tail son **mutuamente excluyentes** en el mismo terminal — cada uno pinta pantalla completa.

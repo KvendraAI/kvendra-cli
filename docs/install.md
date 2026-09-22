@@ -1,4 +1,4 @@
-# Install guide — kvendra-cli v0.1.0
+# Install guide — kvendra-cli 0.6.4
 
 Detailed install instructions for each platform. For a quick install,
 see the [README install section](../README.md#install).
@@ -8,11 +8,13 @@ see the [README install section](../README.md#install).
 ### Option 1: cargo install (recommended)
 
 ```bash
+cargo install --locked kvendra                                          # from crates.io
+# or track the latest main:
 cargo install --locked --git https://github.com/KvendraAI/kvendra-cli kvendra
 ```
 
-Requires Rust 1.75+. The build downloads ~50 dependencies and takes
-~3-5 minutes on a modern machine.
+Requires Rust 1.88+ (edition 2024). The build downloads its dependencies
+and takes ~3-5 minutes on a modern machine.
 
 ### Option 2: pre-built binary
 
@@ -26,7 +28,7 @@ kvendra --version
 
 ### Gatekeeper "unidentified developer" warning
 
-Because v0.1.0 binaries are unsigned, macOS Gatekeeper warns the first
+Because the 0.6.4 binaries are unsigned, macOS Gatekeeper warns the first
 time you run them. Options:
 
 1. **Recommended**: `xattr -d com.apple.quarantine kvendra` (one-time per binary).
@@ -34,8 +36,9 @@ time you run them. Options:
    "kvendra was blocked from use because it is not from an identified developer"
    → click "Open Anyway".
 
-Touch ID-protected MCP password storage is **not available** in v0.1.0
-and is planned for v0.2.0 (`ROAD-KVD-CLI-002`, requires Apple Developer ID).
+Touch ID-protected MCP password storage is **not available** yet (it requires
+a signed binary / Apple Developer ID); it is on the vault-hardening roadmap
+(`ROAD-KVD-CLI-393064`).
 
 ## Linux (Debian / Ubuntu / Arch / Fedora)
 
@@ -83,10 +86,11 @@ kvendra --version
 
 ### SmartScreen "Unknown publisher" warning
 
-Because v0.1.0 binaries are unsigned, Windows SmartScreen warns the
+Because the 0.6.4 binaries are unsigned, Windows SmartScreen warns the
 first time you run them. Click "More info" → "Run anyway".
 
-Authenticode signing is planned for `ROAD-KVD-CLI-003` (post v0.2.0).
+Signed releases (Authenticode on Windows, notarization on macOS) are future
+work on the vault-hardening roadmap (`ROAD-KVD-CLI-393064`).
 
 ## Building from source (contributors)
 

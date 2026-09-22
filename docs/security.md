@@ -1,4 +1,4 @@
-# Security model — kvendra-cli v0.1.0
+# Security model — kvendra-cli 0.6.4
 
 ## Trust narrative
 
@@ -7,7 +7,14 @@ AES-256-GCM ciphers, master password never stored to disk except as a
 sentinel hash) plus a **capability-based MCP broker** (7 git/github/npm/
 pypi/aws/http/shell primitives + an escape hatch for raw tokens).
 
-The trust narrative for v0.1.0:
+> **Read first:** for plain-language expectations (what protects you, what does
+> not, and how to raise it) see
+> [protection-levels.md](security/protection-levels.md); for the engineering
+> detail of the 0.6.4 security-hardening release — the fail-closed fixes from
+> Salva Ferrer's external audit plus in-house adversarial passes — see the
+> [0.6.4 advisory](security/advisory-cli-0.6.4.md).
+
+The trust narrative (0.6.4):
 
 1. **Defense layer 1 — Filesystem integrity**: `~/.kvendra/` is per-user
    (mode 0700), individual files mode 0600, sentinel + recovery codes +
@@ -15,8 +22,12 @@ The trust narrative for v0.1.0:
 
 2. **Defense layer 2 — Allowlist gate**: each profile's allowlist YAML is
    HMAC-signed with `kvendra/allowlist-hmac/v1` sub-key (TOCTOU-safe).
-   Boundary calls outside scope return `AllowlistViolation` with a
-   canonical audit row flag (`allowlist_denied`).
+   Boundary calls outside scope return `AllowlistViolation` with a canonical
+   audit row flag (`allowlist_denied`). Since 0.6.4 the gate is **fail-closed**:
+   a credential-bound profile with no allowlist, an empty/invalid `profile_id`,
+   or an unsigned/tampered allowlist or `config.toml` are all denied — the
+   external audit found and closed a family of fail-open paths here (see the
+   advisory).
 
 3. **Defense layer 3 — Approval gate**: destructive ops (write, push,
    destroy) require explicit user consent via TTY (CLI) or modal/dialog
@@ -28,7 +39,7 @@ The trust narrative for v0.1.0:
    with sub-key `kvendra/audit-hmac/v1`. Tampering detected via
    `kvendra audit --verify`.
 
-## Session blob threat model (v0.4.0-alpha.2)
+## Session blob threat model
 
 `~/.kvendra/sessions/active.blob` is the new asset that lets
 `kvendra mcp serve` start without re-prompting. It is **not** the
@@ -68,7 +79,10 @@ The blob is readable by any process running under the same user on
 the same machine (`mode 0600`). That is the same trust boundary the
 zero-knowledge vault assumes: a compromised user account ⇒ a
 compromised vault. The blob narrows the window for the attacker by
-adding a TTL, but it does **not** change the trust boundary.
+adding a TTL, but it does **not** change the trust boundary. This is the
+residual tracked as **C3** (`ISSUE-KVD-CLI-B12B18`); closing it locally needs
+hardware-backed key wrapping (on the roadmap). See
+[protection-levels.md](security/protection-levels.md), case B.
 
 For attackers off-machine (backup leak, snapshot leak), the
 machine-bound wrap key makes the blob opaque: the same blob loaded
@@ -98,14 +112,14 @@ in `tracing` rather than `audit.db` because the HMAC sub-key does
 not exist before the unlock — the same documented gap as
 ADR-KVD-020 AC-USE-KEYCHAIN-8.
 
-## v0.1.0 caveats
+## Caveats (0.6.4)
 
 ### MCP password caching: RAM-only, not Touch ID
 
-In v0.1.0, the `master_password_cache = "ram-only"` mode is the default
-and only mode for MCP transport. Touch ID-protected password caching
-(promised in early roadmap material) requires a signed binary
-(Apple Developer ID), which is **not available** in v0.1.0.
+The `master_password_cache = "ram-only"` mode is the default and only mode for
+MCP transport. Touch ID-protected password caching requires a signed binary
+(Apple Developer ID), which is **not available** yet — it is on the
+vault-hardening roadmap.
 
 The full technical analysis of this caveat lives in `PAT-KVD-CLI-001` in
 the project knowledge base. The summary:
@@ -121,8 +135,8 @@ the project knowledge base. The summary:
 - **No silent silent approval** in either transport — `PAT-KVD-CLI-001`
   documents this with audit-log evidence from real-run testing.
 
-Touch ID and signed-binary distribution are planned for v0.2.0 via
-`ROAD-KVD-CLI-002`.
+Touch ID and signed-binary distribution are on the vault-hardening roadmap
+(`ROAD-KVD-CLI-393064`), opt-in and layered.
 
 ## Reporting security issues
 
@@ -131,8 +145,7 @@ Security-relevant issues should be reported per the project's
 
 ## References
 
-- `ROAD-KVD-CLI-001` — v0.1.0 stable readiness roadmap.
-- `ROAD-KVD-CLI-002` — v0.2.0 "Mac compatible" (Apple Dev ID + Touch ID).
-- `PAT-KVD-CLI-001` — v0.1.0 approval gate behavior without Apple Dev ID.
-- `PAT-KVD-CLI-002` — Test verification against binary actual output.
-- `PAT-KVD-CLI-003` — Allowlist enforcer permissive-on-absence anti-pattern.
+- [`docs/security/protection-levels.md`](security/protection-levels.md) — plain-language protection expectations (cases A/B/C).
+- [`docs/security/advisory-cli-0.6.4.md`](security/advisory-cli-0.6.4.md) — the 0.6.4 security-hardening advisory (external audit + fixes).
+- `ROAD-KVD-CLI-393064` — layered vault-hardening roadmap (hardware keys, ephemeral creds, server-assist, remote broker).
+- `PAT-KVD-CLI-003` — allowlist enforcer permissive-on-absence anti-pattern (the class 0.6.4 closed fail-closed).

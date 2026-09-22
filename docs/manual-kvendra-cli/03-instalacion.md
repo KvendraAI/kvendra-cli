@@ -2,11 +2,11 @@
 
 ## Descripción
 
-`kvendra` `0.1.0` se distribuye por dos canales: **crates.io** (`cargo install`) y **GitHub Releases** (binarios `cargo-dist` cross-platform sin firma). Otros canales (Homebrew, npm wrapper, pip wrapper, winget, scoop) son post-MVP — están planificados pero no entregados en esta versión.
+`kvendra` `0.6.4` (versión actual) se distribuye por dos canales: **crates.io** (`cargo install`) y **GitHub Releases** (binarios `cargo-dist` cross-platform sin firma). Otros canales (Homebrew, npm wrapper, pip wrapper, winget, scoop) son post-MVP — están planificados pero no entregados en esta versión.
 
 Existe una guía corta complementaria en `docs/install.md` del repo. Este capítulo cubre la decisión de canal por sistema operativo, requisitos y validación post-instalación.
 
-## Canales disponibles en `0.1.0`
+## Canales disponibles en `0.6.4`
 
 > **crates.io**
 > - Comando: `cargo install --locked kvendra`
@@ -15,10 +15,10 @@ Existe una guía corta complementaria en `docs/install.md` del repo. Este capít
 > - Tamaño: la build local del binario release dura entre 2 y 6 minutos según hardware.
 >
 > **GitHub Releases (`KvendraAI/kvendra-cli`)**
-> - Comando: descarga del archivo `.tar.gz` o `.zip` para tu plataforma desde el tag `v0.1.0`.
+> - Comando: descarga del archivo `.tar.gz` o `.zip` para tu plataforma desde el tag `v0.6.4`.
 > - Requiere: nada — son binarios precompilados sin firma.
 > - Plataformas: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`.
-> - Caveat macOS: el binario no está firmado con Apple Developer ID. Tendrás que aprobar el primer arranque desde *System Settings → Privacy & Security*. Ver [capítulo 20](./20-roadmap.md) para la track `0.2.0` que añade signing.
+> - Caveat macOS: el binario no está firmado con Apple Developer ID. Tendrás que aprobar el primer arranque desde *System Settings → Privacy & Security*. El signing canónico sigue en el roadmap (aún no entregado en 0.6.4) — ver [capítulo 20](./20-roadmap.md).
 
 ## Requisitos por plataforma
 
@@ -32,7 +32,7 @@ Existe una guía corta complementaria en `docs/install.md` del repo. Este capít
 
 ### Linux
 
-> **Arquitectura soportada:** `x86_64-unknown-linux-gnu` en `0.1.0`. ARM Linux no se distribuye binario; usar `cargo install`.
+> **Arquitectura soportada:** `x86_64-unknown-linux-gnu` en `0.6.4`. ARM Linux no se distribuye binario; usar `cargo install`.
 >
 > **Versión mínima del kernel:** la que requiera `secret-service` (libsecret). Distros modernas con GNOME / KDE lo traen.
 >
@@ -69,7 +69,7 @@ El flag `--locked` instala respetando `Cargo.lock`. Recomendado para reproducibi
 **Vía GitHub Releases (macOS arm64 ejemplo):**
 
 ```bash
-curl -fsSL https://github.com/KvendraAI/kvendra-cli/releases/download/v0.1.0/kvendra-aarch64-apple-darwin.tar.gz \
+curl -fsSL https://github.com/KvendraAI/kvendra-cli/releases/download/v0.6.4/kvendra-aarch64-apple-darwin.tar.gz \
   | tar -xz -C ~/.local/bin/
 ```
 
@@ -84,10 +84,10 @@ kvendra --version
 Salida esperada:
 
 ```
-kvendra 0.1.0
+kvendra 0.6.4
 ```
 
-Si ve `0.1.0-alpha.<n>`, está usando una build pre-stable; actualice a `0.1.0`.
+Si ve una versión anterior (por ejemplo `0.1.0` o un `0.6.4-rc.<n>`), actualice a `0.6.4` estable con `cargo install kvendra --locked` o descargando el binario del tag `v0.6.4`.
 
 ### Paso 4 — Compruebe los subcomandos
 
@@ -95,7 +95,7 @@ Si ve `0.1.0-alpha.<n>`, está usando una build pre-stable; actualice a `0.1.0`.
 kvendra --help
 ```
 
-Debe enumerar al menos: `init`, `unlock`, `lock`, `secret`, `primitive`, `mcp`, `dashboard`, `audit`, `config`, `completion`. Cada subcomando tiene `--help` propio con ejemplos.
+Debe enumerar al menos: `init`, `unlock`, `lock`, `secret`, `primitive`, `mcp`, `dashboard`, `audit`, `config`, `backup`, `capabilities`, `completion`. Cada subcomando tiene `--help` propio con ejemplos.
 
 ### Paso 5 — Configure shell completion (opcional)
 
@@ -135,7 +135,7 @@ Hay dos formas de aprobar la ejecución:
 xattr -d com.apple.quarantine ~/.local/bin/kvendra
 ```
 
-> **Advertencia:** Saltarse Gatekeeper es una decisión consciente. Hágalo solo después de comprobar que el binario coincide con los checksums publicados en el GitHub Release. La track de signing canónico llega en `0.2.0` (ver [capítulo 20](./20-roadmap.md)) y desactivará la necesidad de aprobación manual.
+> **Advertencia:** Saltarse Gatekeeper es una decisión consciente. Hágalo solo después de comprobar que el binario coincide con los checksums publicados en el GitHub Release. El signing canónico sigue pendiente en el roadmap (aún no entregado en 0.6.4, ver [capítulo 20](./20-roadmap.md)); cuando llegue, desactivará la necesidad de aprobación manual.
 
 ## Próximos pasos
 

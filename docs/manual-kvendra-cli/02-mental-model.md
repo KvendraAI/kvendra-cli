@@ -72,7 +72,7 @@ Capability-based security no es magia. El modelo Kvendra explícita lo que prote
 
 - Mientras la sesión está *unlocked*, la derived key vive en RAM. Un atacante con root + ptrace puede dumpearla. Esto es el **vector O1**, aceptado como trade-off de la categoría de producto. La mitigación post-MVP es hardware-backed wrapping (Secure Enclave / TPM / Yubikey).
 - Si el agente usa el escape hatch `kvendra.unsafe.raw_token`, el plaintext **sí** llega al contexto del agente — por diseño, para casos edge no cubiertos. Cada uso queda audit-flagged.
-- El detection layer flagea o bloquea tokens detectados en input/output, pero no es un sustituto del workflow correcto: si pegas un token nuevo en el chat, lo más sensato es importarlo (`kvendra secret import`) y rotar el original.
+- El detection layer flagea o bloquea tokens detectados en input/output, pero no es un sustituto del workflow correcto: si pegas un token nuevo en el chat, lo más sensato es darlo de alta como profile (`kvendra secret add`) y rotar el original (`kvendra secret rotate`).
 
 ## Cómo encaja con la promesa de marca
 
@@ -84,6 +84,6 @@ Esa frase es la **Promesa Nivel 2 zero-knowledge** (`ROAD-KVD-004`, formalizada 
 
 ## Notas importantes
 
-> **Nota:** Si vienes de HashiCorp Vault o de AWS Secrets Manager, reconocerás patterns familiares: descifrado server-side, scope binding, audit log. La diferencia es que Kvendra CLI ejecuta todo *local-first*, sin servicio remoto, con un solo binario y sin servidor que mantener. Los modos cloud existirán en `kvendra-platform` (AGPL-3.0) cuando llegue Pro/Team tier.
+> **Nota:** Si vienes de HashiCorp Vault o de AWS Secrets Manager, reconocerás patterns familiares: descifrado server-side, scope binding, audit log. La diferencia es que Kvendra CLI ejecuta todo *local-first*, sin servicio remoto, con un solo binario y sin servidor que mantener. El tier Pro ya añade backup cloud del vault (`kvendra backup`); los modos cloud más avanzados (credenciales efímeras, broker remoto) son opt-in y viven en el roadmap de endurecimiento del vault.
 
 > **Advertencia:** El mental model de capability-based security exige una pequeña fricción adicional: tienes que *crear el profile* la primera vez (`kvendra secret add`) y *escribir su allowlist*. Esa fricción es deliberada — está donde estaría el riesgo si dejases al agente operar libre con el token. Si te sientes tentado a usar `kvendra.unsafe.raw_token` "para ir más rápido", pregúntate antes si no estás justamente reintroduciendo la opción A del [capítulo 1](./01-introduccion.md).

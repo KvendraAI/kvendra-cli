@@ -55,7 +55,7 @@ Edita `~/.claude.json` (o el fichero equivalente de tu instalación):
 }
 ```
 
-> **`--use-keychain`** — opt-in al modo OS keychain ACL (ver [capítulo 12](./12-vault-criptografia.md)). Sin este flag, cada arranque del subprocess pediría master password en TTY, lo que no funciona en clientes MCP que no proporcionan TTY al server. Con keychain, la session unlock se delega a Touch ID / Windows Hello / libsecret y el flujo es transparente para el cliente.
+> **`--use-keychain`** (macOS, 0.6.4) — opt-in al modo OS keychain ACL (ver [capítulo 12](./12-vault-criptografia.md)). El cliente MCP no da TTY al subprocess, así que sin una sesión previa el server no podría pedir la master password. Con keychain, el unlock se delega a Touch ID y es transparente para el cliente. **Es macOS-only en esta release** (REQ-KVD-005 / PAT-KVD-007). En Linux/Windows el patrón portable es **desbloquear en tu propio terminal** (`kvendra unlock`, ver más abajo) y arrancar el server con `args: ["mcp", "serve"]` (sin `--use-keychain`): el subprocess lee la sesión de `~/.kvendra/sessions/active.blob`. Alternativa no-interactiva: `--password-env` con `KVENDRA_MCP_PASSWORD`.
 
 Tras editar el fichero, reinicia Claude Code para que recargue. Verifica:
 
@@ -87,19 +87,21 @@ Edita el fichero de configuración MCP que Cline use en tu plataforma. La sintax
 
 `config.json` de Continue acepta el mismo shape `mcpServers`. Tras añadir la entrada, reinicia el extension.
 
-## Sin keychain (modo TTY-based)
+## Modelo de sesión: `unlock` en tu terminal (cross-platform)
 
-Si prefieres no integrar con keychain (por preferencia de privacy o porque tu OS no lo soporta), puedes operar en modo TTY:
+El `unlock` **siempre corre en TU terminal, nunca dentro del cliente MCP** — el cliente no le da un TTY al subprocess. `kvendra unlock` escribe `~/.kvendra/sessions/active.blob` (+ HMAC sidecar), **machine-bound** (hostname + uid + ruta), con un TTL. Cada `kvendra mcp serve` que arranca el cliente **lee ese blob** para obtener la clave de sesión; ningún `mcp serve` desbloquea el vault por su cuenta.
 
 ```bash
-# En un terminal interactivo:
-kvendra unlock
-# Mantén la sesión activa. La derived key vive en RAM mientras el broker corre.
+# En un terminal interactivo tuyo:
+kvendra unlock                 # TTL default 4h
+kvendra unlock --ttl 8h        # TTL a medida (sujeto a session.max_ttl)
+kvendra session info           # modo (local/workspace) + TTL restante + workspace
+kvendra unlock --extend        # refresca el TTL RE-AUTENTICANDO (master password, v0.6.4, finding A1)
 ```
 
-En este modo, **no** uses `--use-keychain`. El cliente MCP arrancará el subprocess y este leerá la derived key del session lock que `kvendra unlock` mantiene activo. Si el lock expira por idle timeout (`idle_timeout_minutes`), el siguiente `tools/call` falla con `VaultLocked` hasta que vuelvas a unlockar.
+Si el TTL expira, el siguiente `tools/call` falla con `VaultLocked` hasta que vuelvas a `kvendra unlock`. Un segundo temporizador, `idle_timeout_minutes` (`config.toml`, default 30), controla por separado la caché en RAM de la clave derivada.
 
-> **Nota:** El idle timeout default es 30 minutos. En la práctica con Claude Code, esto introduce el patrón conocido `PAT-KVD-009`: tras un periodo largo de inactividad, los `tools/call` fallan hasta que el cliente reinicie su conexión MCP. La fix usual es **reiniciar Claude Code** (no solo unlockar Kvendra) — el cliente cachea handshakes que pueden quedar desincronizados. Detalles en el [capítulo 22](./22-faq-troubleshooting.md).
+> **Nota:** con Claude Code, tras un periodo largo de inactividad aparece el patrón `PAT-KVD-009`: los `tools/call` fallan hasta que el cliente reinicie su conexión MCP. La fix usual es **reiniciar Claude Code** (no solo re-`unlock`ar) — el cliente cachea handshakes que pueden quedar desincronizados. Para saber si el problema es la sesión o el cliente, mira primero `kvendra session info`. Detalles en el [capítulo 22](./22-faq-troubleshooting.md).
 
 ## Llamadas MCP típicas (visto desde el agente)
 
@@ -173,16 +175,18 @@ El plaintext del PAT no aparece en ningún campo (invariante `AC-MCP-3` validado
 Para depuración manual:
 
 ```bash
-kvendra mcp serve [--use-keychain] [--log-level debug]
+kvendra mcp serve [--use-keychain] [--password-env <VAR>] [--no-unlock]
 ```
 
-Banderas:
+Banderas reales en 0.6.4 (`kvendra mcp serve --help`):
 
-> **`--use-keychain`** — usa el OS keychain con biometric ACL `userPresence` para session unlock. Decisión `ADR-KVD-012`.
+> **`--use-keychain`** — lee la master password del OS keychain con ACL de presencia/biometría (**macOS-only en esta release** — REQ-KVD-005 / PAT-KVD-007).
 >
-> **`--log-level <level>`** — `error | warn | info | debug | trace`. Default `warn`. El log va a stderr; el agente solo lee stdout.
+> **`--password-env <VAR>`** — lee la master password de una env var (CI / no-interactivo, camino legacy). Var por defecto: `KVENDRA_MCP_PASSWORD`.
 >
-> **`--accept-destructive`** — flag avanzado. Permite que el primitive ejecute operaciones marcadas `destructive: true` en el catálogo (ver [capítulo 15](./15-allowlist-enforcer.md)). Sin este flag, las operaciones destructive piden re-prompt.
+> **`--no-unlock`** — arranca sin paso de unlock. **El audit log queda deshabilitado** (relajación V4); úsalo solo para inspección sin credenciales.
+
+> **Nota:** las operaciones destructivas **no** se habilitan con un flag de `mcp serve`. Se marcan por operación en el allowlist con `accept_destructive: true` (validado al `secret set-allowlist`); ver [capítulo 7](./07-allowlist-dsl.md) y [capítulo 15](./15-allowlist-enforcer.md).
 
 ## Verificación end-to-end
 
@@ -195,6 +199,17 @@ El agente debe enumerar las 8 primitives. Si falla, revisa:
 - `kvendra mcp serve` no arranca: verifica que `kvendra` está en el `PATH` del proceso del cliente MCP. Algunos clientes lanzan el subprocess con un `PATH` reducido — usa la ruta absoluta en `command`.
 - "VaultLocked": ejecuta `kvendra unlock` (modo TTY) o reconfigura `--use-keychain`.
 - "ProfileNotFound": el agente está pidiendo `profile_id` que no creaste. Lista con `kvendra secret list`.
+
+## Manifest de capabilities y break-glass
+
+Para inspeccionar qué expone el broker sin abrir una sesión MCP, `kvendra capabilities` emite el **manifest canónico** del broker en JSON (read-only, auth-less; añadido en **0.5.0**, consumido por kvendra-skills):
+
+```bash
+kvendra capabilities            # JSON compacto de una línea
+kvendra capabilities --pretty   # JSON multi-línea indentado
+```
+
+Si necesitas **relajar temporalmente** el enforcement del hook `kvendra-skills` (break-glass: `bypass` / `protect` / `grant-pubkey` / `verify-grant`, añadidos en 0.6.0), **no** se hace desde aquí: está cubierto en el [capítulo 23](./23-break-glass.md). Ese mecanismo actúa una capa por encima del allowlist y nunca entrega al agente el plaintext de un secreto.
 
 ## Notas importantes
 

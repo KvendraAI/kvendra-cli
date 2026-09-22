@@ -51,11 +51,19 @@ Hasta el paso 9 nada toca disco. Si abortas con Ctrl+C antes, no hay residuos.
 kvendra init
 ```
 
-No acepta argumentos posicionales. Banderas relevantes:
+No acepta argumentos posicionales. Banderas reales en `0.6.4` (`kvendra init --help`):
 
-> **`--force`** — borra `~/.kvendra/` existente sin pedir confirmación adicional. **Operación destructiva.** Solo úselo si está re-inicializando desde cero un vault que no necesita.
+> **`--password-env <VAR>`** (env: `KVENDRA_INIT_PASSWORD`) — lee el master password de esa variable de entorno en vez de pedirlo por prompt. Para setups CI / no interactivos.
 >
-> **`--non-interactive`** — falla si el TTY no está disponible. Útil para CI / scripts que pretenden detectar configuración faltante en lugar de bloquearse en un prompt.
+> **`--confirm-code <CODE>`** (env: `KVENDRA_INIT_CONFIRM_CODE`) — código de pre-confirmación para saltar el prompt "yes" interactivo en setups no interactivos.
+>
+> **`--save-to <PATH>`** — guarda los recovery codes (mnemónica BIP-39 + los numéricos) en ese fichero. Avisa si el modo no es `0600`. **Trade-off:** escribirlos a disco anula parte de la garantía offline (ver Paso 4); úselo solo con un destino que borre o custodie después.
+>
+> **`--no-verify`** — salta el paso interactivo de verificación. **Solo testing.**
+>
+> **`--home-override <PATH>`** (env: `KVENDRA_HOME`) — reubica el home del vault. Pensado para testing; para mover `~/.kvendra/` en producción use `kvendra config rebind-home` (triple barrera; ver [capítulo 10](./10-recuperacion.md)).
+
+> **Nota:** En `0.6.4` `kvendra init` **no** tiene un flag `--force` que borre un vault existente. Si `~/.kvendra/` ya existe y quiere empezar de cero, borre la carpeta a mano (`rm -rf ~/.kvendra/`, ver «Aborto seguro») antes de reinicializar.
 
 ### Paso 2 — Introduzca el master password
 
@@ -78,7 +86,7 @@ Reglas:
 
 Tras la confirmación, el binario ejecuta Argon2id con cost params calibrados a aproximadamente 1 segundo en hardware moderno. Verá un breve "computing..." y la prompt se libera cuando la derived key está en RAM.
 
-La cost params están en `config.toml` y son fijas para `0.1.0`:
+La cost params están en `config.toml` y son fijas para `0.6.4`:
 
 > **Argon2id parameters:**
 > - `m_cost`: 65536 KiB (64 MiB)
@@ -129,7 +137,7 @@ Diferencias con la recovery phrase:
 | Storage | Solo offline (tú) | `~/.kvendra/recovery_codes.json` (Argon2id-hashed) |
 | Uso | Reset del master password | Confirmar acciones críticas |
 | Reutilizables | Sí, hasta nuevo `init` | No, single-use |
-| Regenerables | Solo con re-init | Sí: `kvendra config recovery-codes regenerate` (post `0.1.0`) |
+| Regenerables | Solo con re-init | Sí: `kvendra config recovery-codes regenerate` (doble barrera; disponible en `0.6.4`) |
 
 Ver detalle de uso en el [capítulo 10](./10-recuperacion.md).
 
@@ -198,10 +206,10 @@ Confirme que el unlock funciona antes de cerrar la sesión:
 kvendra unlock
 ```
 
-Introduzca el master password. Salida esperada:
+Introduzca el master password. La sesión queda activa hasta que expire su TTL (por defecto **4h**; se puede acotar por unlock con `kvendra unlock --ttl 1h`). El TTL vigente se **lee** con `kvendra session info` — no se deduce del reloj de pared. Salida aproximada:
 
 ```
-✓ Vault unlocked. Session active until idle timeout (default 30 min).
+✓ Vault unlocked. Session active (TTL 4h). Check with `kvendra session info`.
 ```
 
 Lock manual:
@@ -214,6 +222,6 @@ Esto zeroiza la derived key en RAM y deja el vault locked. El siguiente `unlock`
 
 ## Notas importantes
 
-> **Nota:** El default de `idle_timeout_minutes` en `config.toml` es 30. Puede cambiarlo con `kvendra config set idle_timeout_minutes <N>`. Ver decisión en `ADR-KVD-012` y patrón conocido sobre el restart de Claude Code en `PAT-KVD-009` (también recogido en el [capítulo 22](./22-faq-troubleshooting.md)).
+> **Nota:** El TTL de sesión por defecto es **4h**. En `0.6.4` **no** existe `kvendra config set …`: el TTL se ajusta **por unlock** con `kvendra unlock --ttl <30m|4h|8h|1d>` (sujeto al cap `session.max_ttl` cuando sea configurable), se **refresca** re-autenticando con `kvendra unlock --extend`, y se **consulta** con `kvendra session info`. Ver patrón conocido sobre el restart de Claude Code en `PAT-KVD-009` (también recogido en el [capítulo 22](./22-faq-troubleshooting.md)).
 
 > **Advertencia:** No edite manualmente `config.toml` ni `recovery_codes.json`. Ambos están firmados con HMAC sidecar (`config.toml.hmac`) o hasheados (`recovery_codes.json` no editable trivialmente). Cualquier mismatch detectado al startup hace que el binario rechace la sesión con error explícito (vector L1 GAP_5/GAP_7 cerrados, ver [capítulo 18](./18-threat-model.md)).

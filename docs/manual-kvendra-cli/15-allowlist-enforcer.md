@@ -2,7 +2,7 @@
 
 ## Descripción
 
-El **enforcer** (`allowlist::enforcer`) es el componente que ejecuta la validación runtime del allowlist contra los args reales de cada `tools/call`. En `0.1.0` post fix `ISSUE-KVD-CLI-032` cubre **22/22 fields del DSL** runtime-enforced. Pre-alpha.10 sólo 3 fields tenían branches y además sufrían un shape mismatch MCP (PAT-KVD-004 reapareciendo) que hacía el enforcement no-op en producción.
+El **enforcer** (`allowlist::enforcer`) es el componente que ejecuta la validación runtime del allowlist contra los args reales de cada `tools/call`. Evalúa los campos del struct `OperationConstraints` (`src/allowlist/dsl.rs`) contra el envelope canónico `{profile_id, operation, args:{…}}`. Históricamente (pre-alpha.10) sólo 3 fields tenían branches y además sufrían un shape mismatch MCP (PAT-KVD-004 reapareciendo) que hacía el enforcement no-op en producción; la clase volvió en 0.6.3 como mismatch de **nombre de campo** y se cerró fail-closed en 0.6.4 (ver más abajo).
 
 Este capítulo documenta el modelo en capas (TIER 0-4), las decisiones D1-D8 plasmadas inline en el código, la separación entre `validator` (setup-time) y `enforcer` (runtime), y cómo se cierra el shape MCP envelope.
 
@@ -122,33 +122,37 @@ Cada `allowed` es un template: el argv real se compara token-a-token contra los 
 
 Decisión **D3**: los templates son sequence-strict (orden importa). Decisión **D4**: el match es exhaustivo — extra tokens en argv que no aparecen en el template son rechazados.
 
-## Las 22 fields runtime-enforced
+## Los campos del DSL (struct `OperationConstraints`)
 
-Distribución por primitive:
+Los campos **válidos** del allowlist son EXACTAMENTE los del struct `OperationConstraints` en `src/allowlist/dsl.rs`, que lleva `#[serde(deny_unknown_fields)]`: **cualquier campo no listado hace fallar `secret set-allowlist`** (con pista «did you mean»). Distribución por primitive (los que el enforcer evalúa contra los args reales):
 
-| Primitive | Fields enforced | Fuente |
-|-----------|-----------------|--------|
-| `kvendra.git` | `repos`, `refs`, `tag_pattern`, `forbidden_args` | TIER 1, 3 |
-| `kvendra.github` | `org`, `repo`, `fields_allowed`, `forbidden_fields` | TIER 1, 2 |
-| `kvendra.npm` | `packages`, `access`, `version_pattern`, `forbidden_tags` | TIER 1 |
-| `kvendra.pypi` | `projects`, `dist_pattern` | TIER 1 |
-| `kvendra.aws` | `buckets`, `prefix_pattern`, `distributions`, `paths_pattern`, `functions`, `delete_allowed` | TIER 2 |
-| `kvendra.http` | `url_pattern_regex`, `methods`, `forbidden_methods`, `forbidden_headers`, `max_body_size_kb` | TIER 1, 3 |
+| Primitive | Fields | Helper |
+|-----------|--------|--------|
+| `kvendra.git` | `repos` / `repo` (alias, unión), `refs`, `tag_pattern`, `forbidden_args` | TIER 1, 3 |
+| `kvendra.github` | `org`, `repo` / `repos`, `fields_allowed`, `forbidden_fields` | TIER 1, 2 |
+| `kvendra.npm` | `packages` | TIER 1 |
+| `kvendra.pypi` | `projects` | TIER 1 |
+| `kvendra.aws` | `buckets`, `distributions`, `functions` | TIER 2 |
+| `kvendra.http` | `url_pattern_regex`, `endpoints` (alias exacto, unión), `methods`, `forbidden_methods` | TIER 1, 3 |
 | `kvendra.shell` | `binaries`, `args_constraints`, `cwd_pattern`, `env_vars_to_inject`, `forbidden_env_export_to_agent` | TIER 3, 4 |
 
-Total: **22 fields**. Todos enforced runtime via branches en `enforcer::check_args` post alpha.10. Antes del fix, sólo 3 (`forbidden_args`, `methods`, `repos`) tenían branches **y** sufrían shape mismatch — net effect: TODOS los 22 fields no-op en producción. SECURITY/HIGH gap.
+Meta (cualquier primitive): `destructive`, `accept_destructive` (opt-in del owner; sin él, una op destructiva se rechaza al `set-allowlist`) y `accept_broad_scope` (**validator-time**, D7 — no runtime). A nivel de `PrimitiveAllow` (no de `OperationConstraints`) están los del escape hatch: `unsafe_raw_token_allowed`, `unsafe_max_uses_per_session` (default 1), `unsafe_reason_min_length` (default 10).
 
-## Separación validator vs enforcer (decisión D7)
+> **Corrección (vs versiones viejas del manual):** ediciones previas listaban `prefix_pattern`, `paths_pattern`, `delete_allowed`, `access`, `version_pattern`, `forbidden_tags`, `dist_pattern`, `forbidden_headers` y `max_body_size_kb`. **Ninguno existe** en el struct de 0.6.4 — usarlos rompe la firma del allowlist (`deny_unknown_fields`). Purgados de aquí y del [cap. 7](./07-allowlist-dsl.md).
 
-3 fields meta NO viven en `enforcer`:
+> **La clase «campo que el primitive no manda» (0.6.4).** Aun con el nombre de campo correcto, en 0.6.3 tres checks leían un campo que el primitive real nunca envía → no-op silencioso: `binaries` leía `bin`, `repos` leía un `repo`/`url` del caller en vez de resolver el `remote`, y `tag_pattern` leía `tag` en vez de `name`. Cerrado fail-closed en 0.6.4 — ver la sección «0.6.4 — cierre fail-closed de la capa de autorización» más abajo.
 
-> **`accept_broad_scope`** — flag setup-time. Permite a `secret add` aceptar allowlists con `methods: []` o `url_pattern_regex: ".*"`. Vive en `validator.rs` y catalog.
+## Meta-fields: validator vs enforcer (D7)
+
+Algunos campos NO son enforcement runtime; son meta-flags de setup/catalog:
+
+> **`accept_broad_scope`** — campo YAML **validator-time** (D7): permite firmar un allowlist con patrones de scope amplio (p. ej. un `url_pattern_regex` no host-específico). Se comprueba al `secret set-allowlist`, nunca en el enforcer. En 0.6.4 esa validación es **semántica por canarios** (ver [cap. 16](./16-detection-layer.md) y el validator), no literal.
 >
-> **`destructive`** — marca operations en el catálogo de primitives. Los primitives definen qué operaciones son destructivas (ej. `s3_sync` con `delete: true`).
+> **`destructive`** — marca una operación como destructiva. En modo `ask-destructive` dispara el prompt de aprobación.
 >
-> **`accept_destructive`** — flag CLI (`kvendra mcp serve --accept-destructive`) que permite ejecutar operaciones destructive. Vive en `policy.rs`.
+> **`accept_destructive`** — campo YAML opt-in del owner por operación (REQ-KVD-004): sin él, una operación marcada destructiva se **rechaza al `secret set-allowlist`**. NO es un flag de `mcp serve` (los flags reales de `mcp serve` son `--use-keychain`, `--password-env`, `--no-unlock`).
 
-Decisión D7: estos no son enforcement runtime per se; son meta-flags de setup/catalog/policy. El enforcer solo evalúa los 22 fields que sí impactan la decisión runtime de aceptar/rechazar la invocación.
+El enforcer solo evalúa los campos que impactan la decisión runtime de aceptar/rechazar; `accept_broad_scope` y `accept_destructive` se resuelven al firmar el allowlist.
 
 ## Decisiones inline D1-D8
 
@@ -156,14 +160,14 @@ Todas documentadas como doc-comments en `src/allowlist/dsl.rs`:
 
 | Decisión | Resumen |
 |----------|---------|
-| **D1** | `regex_full_match` por defecto (evita bypass por substring) |
-| **D2** | Repo parser tolerante: stripea `https://`, `github.com/` antes de fragmentar |
-| **D3** | `args_constraints` templates son sequence-strict (orden importa) |
-| **D4** | `args_constraints` exhaustivo (no permite extra tokens fuera del template) |
-| **D5** | `prefix_pattern` para S3 acepta wildcard `/*` literal solo si está pinned a un bucket |
-| **D6** | `version_pattern` para npm/pypi siempre `regex_full_match` |
-| **D7** | `accept_broad_scope` / `destructive` / `accept_destructive` viven fuera del enforcer |
-| **D8** | `forbidden_*` se evalúa **después** del positivo (`allowed_*`); negación gana |
+| **D1** | `repo` (singular) es alias de `repos` y se une con él (any-match, glob) |
+| **D2** | `args_constraints` es un array de templates de argv; el argv de la call debe casar al menos uno (any-match, longitud estricta) |
+| **D3** | `forbidden_env_export_to_agent` deniega claves env pedidas por la call ANTES del exec (defense-in-depth con el scrub de salida) |
+| **D4** | `forbidden_methods` se AND-ea con `methods` (la denylist gana; fail-closed aunque `methods` lo permita) |
+| **D5** | `buckets` extrae el nombre del `s3://NAME/...`; también acepta nombres de bucket pelados |
+| **D6** | `endpoints` es alias exacto de las urls HTTP, unido con `url_pattern_regex` (any-match) |
+| **D7** | `accept_broad_scope` se comprueba solo en validator-time, nunca en el enforcer |
+| **D8** | Orden de checks: `is_expired → primitive → operation → denylists forbidden-first → allow-list` |
 
 ## Tests del enforcer
 
@@ -180,6 +184,31 @@ Conteos:
 El enforcer cierra estos vectores enumerados en Sesión 3 threat modeling:
 
 > **GAP_4** — allowlist YAML modificable por atacante L1 + cache TOCTOU. Cerrado por **REQ-KVD-007** (alpha.6): HMAC sub-key `kvendra/allowlist-hmac/v1` + composite cache key con HMAC del YAML. Atacante con perms de user no puede modificar el YAML sin que el HMAC mismatch lo detecte al startup.
+
+## 0.6.4 — cierre fail-closed de la capa de autorización (auditoría externa)
+
+En 0.6.3 una auditoría estática externa (**Salva Ferrer**, avtn.es) y varios pases adversariales internos encontraron que la clase de bug que documenta **PAT-KVD-004 había vuelto en una forma más sutil**. En alpha.10 se arregló el *shape* del envelope (leer `inner_args`), pero varias branches seguían leyendo un **campo con el nombre equivocado** — uno que el primitive real nunca envía:
+
+| Finding | Field que leía el enforcer | Field que manda el primitive | Efecto en 0.6.3 |
+|---------|----------------------------|------------------------------|-----------------|
+| **C2** | `bin` | `binary` (`kvendra.shell`) | `binaries:` no se comprobaba nunca |
+| **N7** | `repo` / `url` | `{cwd, remote, ref}` (`kvendra.git` push/pull/tag/commit) | `repos:` saltado → push a cualquier repo |
+| **N10** | `tag` | `name` (`kvendra.git tag`) | `tag_pattern` saltado |
+
+Es el mismo *permissive-on-absence*: el campo no existe → el check se salta → allow. Y como en el C2 original, los **tests eran cómplices**: inyectaban el campo sintético (`bin`, `repo`, `tag`) que el primitive real no manda, así que pasaban en verde mientras producción estaba abierta (verde falso). N7 es el más grave: un agente con perfil git podía pushear cualquier checkout a **cualquier** repo, o poner `remote` a una URL de atacante, exfiltrando código privado y la credencial con el token GitHub del owner.
+
+**Correcciones en 0.6.4** (todas fail-closed):
+
+- **Nombre de campo compartido** primitive↔enforcer como constante única; si `binaries:` está declarado y falta `binary` en el payload → deny.
+- **N7 — resolución del destino real de git**: el enforcer ya no confía en un `repo`/`url` del caller. Resuelve el destino real (la URL del `remote`, o el nombre de remote vía `git -C <cwd> remote get-url --push`, con host normalizado), lo casa contra `repos:` y **falla cerrado si no puede determinarlo**. El flujo legítimo `remote=origin` sigue pasando.
+- **N10** — lee `name` para `tag_pattern` y falla cerrado si el pattern está declarado sin `name`.
+- **C1 — `profile_id` vacío** era fail-open (saltaba allowlist y approval). Ahora todo primitive del catálogo es credential-bound → `profile_id` vacío es deny duro (`empty_profile_denied`). Un `profile_id` con `..`/`/` se rechaza (`invalid_profile_denied`, patrón `[A-Za-z0-9._-]`).
+- **C4 — perfil con secreto y sin allowlist** era allow. Ahora es deny duro (`missing_allowlist_denied`).
+- **D1 reforzada**: el match de `url_pattern_regex` se ancla al inicio de forma **incondicional** (`^(?:pattern)`), incluidas las ramas de alternación — antes un `is_match` por substring permitía `https://evil/?x=https://api.github.com/`, filtrando el token.
+
+Detalle completo en `../security/advisory-cli-0.6.4.md`. Suite de regresión adversarial: `tests/security_audit_salva.rs` (roja en 0.6.3, verde en 0.6.4) + los `n7_*` en `cargo test --lib allowlist::enforcer`. Trazabilidad KB: `ISSUE-KVD-CLI-B78ED5` (cerrado), `REL-KVD-CLI-0.6.4`.
+
+> **Lección (extiende PAT-KVD-004):** un test que inyecta un campo que el primitive real nunca manda da **verde falso** y esconde un enforcement no-op. Toda branch nueva del enforcer debe testearse con la **forma real** del envelope que produce el primitive, no con una sintética.
 
 ## Notas importantes
 

@@ -6,14 +6,18 @@ Cada invocación MCP que pasa por el broker — incluyendo invocaciones que fall
 
 Este capítulo cubre el lado de uso del comando `kvendra audit`. La estructura interna de la base de datos, el HMAC chain y la derivación de la sub-key viven en el [capítulo 17](./17-audit-internals.md).
 
-## Subcomandos disponibles
+## Subcomandos y flags disponibles
 
 ```
-kvendra audit              # TUI viewer (default, requires feature `tui`)
-kvendra audit --watch      # live tail (TUI), AC-TUI-2
-kvendra audit --json       # export completo a stdout en JSON
-kvendra audit --verify     # validar HMAC chain cross-process, AC-AUDIT-2
+kvendra audit                 # TUI viewer (default, requires feature `tui`)
+kvendra audit --watch         # live tail (TUI), AC-TUI-2  [+ --profile / --primitive / --since]
+kvendra audit --json          # export completo a stdout en JSON (flag legacy)
+kvendra audit --verify        # validar HMAC chain cross-process, AC-AUDIT-2 (flag legacy)
+kvendra audit export          # export firmado: PDF + CSV + JSON canónico (REQ-KVD-CLI-007)
+kvendra audit verify-export   # verifica un export JSON canónico previo
 ```
+
+> **Nota:** `--json` y `--verify` son **flags** de `kvendra audit`, no subcomandos — `kvendra audit verify` **no existe** (el binario sugiere `verify-export`). Los subcomandos reales son `export` y `verify-export`, añadidos en la **audit v3** (0.6.2).
 
 ## TUI viewer — `kvendra audit`
 
@@ -70,10 +74,13 @@ Atajos:
 Para observación en tiempo real (útil mientras un agente está ejecutando una tarea larga):
 
 ```bash
-kvendra audit --watch
+kvendra audit --watch                                      # todo el flujo
+kvendra audit --watch --profile aws.kvendra-web-deployer   # filtra por profile_id
+kvendra audit --watch --primitive kvendra.git              # filtra por primitive
+kvendra audit --watch --since 1h                           # ventana temporal (5m, 1h, ...)
 ```
 
-Polling al WAL de SQLite con latencia <500 ms (AC-TUI-2). Cada nueva row aparece coloreada por severidad:
+Los filtros `--profile`, `--primitive` y `--since` se combinan y solo aplican al watcher. Polling al WAL de SQLite con latencia <500 ms (AC-TUI-2). Cada nueva row aparece coloreada por severidad:
 
 > Verde — `severity: info`, `status: ok`.
 >
@@ -128,6 +135,47 @@ kvendra audit --json | jq 'group_by(.profile_id) | map({profile: .[0].profile_id
 ```
 
 Para el patrón canónico de inspección sin password (acceso directo SQLite), ver `CLAUDE.md` del workspace o el [capítulo 17](./17-audit-internals.md).
+
+## Export firmado — `kvendra audit export`
+
+Mientras `--json` es un volcado rápido a stdout, `kvendra audit export` (audit v3, `REQ-KVD-CLI-007`) genera un **paquete firmado** para compliance/SIEM: PDF legible + CSV + JSON canónico, con la semilla de la cadena HMAC embebida y una URL de verificación.
+
+```bash
+kvendra audit export \
+  --from 2026-05-01 --to 2026-05-10 \
+  --filter "profile_id=github.kvendraai.org-admin,primitive=kvendra.git" \
+  --format pdf,csv,json \
+  --out ./exports \
+  --password-stdin < master.pw
+```
+
+Flags reales en 0.6.4 (`kvendra audit export --help`):
+
+> **`--from <ISO-8601>`** — límite inferior inclusivo. Default: hace 30 días.
+>
+> **`--to <ISO-8601>`** — límite superior inclusivo. Default: ahora.
+>
+> **`--filter <expr>`** — expresión `clave=valor` separada por comas, p. ej. `profile_id=alice,primitive=kvendra.git`.
+>
+> **`--format <lista>`** — subconjunto de `pdf,csv,json` separado por comas. Default: `pdf,csv,json` (los tres).
+>
+> **`--out <DIR>`** — directorio de salida. Default: directorio actual.
+>
+> **`--include-raw-args`** — desactiva la redacción por defecto e incluye los summaries de args crudos (imprime un warning; revisa antes de compartir).
+>
+> **`--password-stdin`** — lee la master password de stdin, necesaria para derivar la semilla de la cadena HMAC. Si el vault ya está desbloqueado, usa la clave de sesión.
+
+Los ficheros se escriben como `kvendra-audit-<fecha>.{pdf,csv,json}` y el comando imprime el conteo, el rango, la `Verify online:` URL y el comando exacto de `verify-export`.
+
+## Verificación offline de un export — `kvendra audit verify-export`
+
+Re-verifica la integridad de un JSON canónico generado por `audit export`, sin tocar la `audit.db` original (útil para un tercero que recibe el export):
+
+```bash
+kvendra audit verify-export kvendra-audit-2026-05-10.json
+```
+
+El argumento es la **ruta posicional** al `*.json` canónico. Devuelve `Pass` (con el número de eventos) o `Fail` con el detalle del primer mismatch.
 
 ## Verificación de integridad — `kvendra audit --verify`
 
@@ -207,10 +255,18 @@ sqlite3 ~/.kvendra/audit.db \
 
 ### Rows con `status: error` que no esperabas
 
-Lo más común es `AllowlistViolation` por un PR que modificó el YAML del allowlist sin recalcular el HMAC, o una operación que el agente intentó ejecutar fuera de scope. Inspecciona la row con detail TUI o con `jq` para ver el `reason`.
+Lo más común es `AllowlistViolation` por un PR que modificó el YAML del allowlist sin re-firmar el HMAC (con `secret set-allowlist`), o una operación que el agente intentó ejecutar fuera de scope. Inspecciona la row con detail TUI o con `jq` para ver el `reason`.
+
+El endurecimiento fail-closed de 0.6.4 añadió flags de denegación propios que verás en estas rows (ver [capítulo 7](./07-allowlist-dsl.md) y [capítulo 15](./15-allowlist-enforcer.md)):
+
+> **`empty_profile_denied`** — `profile_id` ausente/vacío en un primitive credential-bound.
+>
+> **`invalid_profile_denied`** — `profile_id` con `..` o `/` (fuera del patrón `[A-Za-z0-9._-]`).
+>
+> **`missing_allowlist_denied`** — profile con secreto pero sin allowlist YAML.
 
 ## Notas importantes
 
-> **Nota:** El audit log no rota automáticamente en `0.1.0`. Si crece mucho, puedes archivarlo manualmente: `mv ~/.kvendra/audit.db ~/.kvendra/audit-archive-2026-05.db && kvendra <restart broker>`. La rotación gestionada con retention policy es post-MVP (Team tier).
+> **Nota:** El audit log no rota automáticamente en `0.6.4`. Si crece mucho, puedes archivarlo manualmente: `mv ~/.kvendra/audit.db ~/.kvendra/audit-archive-2026-05.db && kvendra <restart broker>`. La rotación gestionada con retention policy es post-MVP (Team tier).
 
 > **Advertencia:** No borres `audit.db` para "limpiar". Si lo haces, pierdes la cadena histórica. El siguiente arranque del broker creará un nuevo `audit.db` con genesis row, pero ese archivo tendrá una cadena nueva, sin relación criptográfica con la anterior.
