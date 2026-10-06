@@ -77,6 +77,10 @@ impl From<crate::protocol::v1::ScopeMetaWire> for ScopeMeta {
 
 /// Trait implemented by the two resolvers. `Send + Sync` so the dispatcher
 /// can hold an `Arc<dyn SecretResolver>`.
+// `#[async_trait]` expands each method into a `#[must_use]` fn returning
+// `Pin<Box<dyn Future>>` (itself must_use); clippy >= 1.99 flags that as
+// `double_must_use`. The duplication is in the macro output, not our code.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait SecretResolver: Send + Sync {
     async fn resolve(&self, profile_id: &str, ctx: &CallCtx) -> KvendraResult<EphemeralSecret>;

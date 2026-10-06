@@ -7,6 +7,44 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.6.6] — 2026-10-06 — fix(security): profile_id path traversal in `kvendra secret` and the vault
+
+Security release. `kvendra secret` subcommands passed `profile_id` straight
+into the vault's path builders, which joined it into a file path without
+validation. Only the MCP dispatcher enforced the shared path-component rule,
+so the local CLI bypassed it: `kvendra secret revoke ../sentinel` (no master
+password required) deleted the vault's `sentinel.blob` and left the vault
+unusable; `add`, `rotate` and `set-allowlist` could write outside `secrets/`
+and `allowlists/`; `get-meta` and `validate` read files outside the vault and
+revealed whether they existed. New regression suite:
+`tests/secret_profile_id_traversal.rs`.
+
+### Fixed — critical
+
+- **profile_id is validated at the storage layer.** `Vault` exposes
+  `checked_profile_{blob,meta,allowlist}_path`, which apply the shared
+  `path_id::is_safe_path_component` rule plus a parent-directory containment
+  check; `put_secret`, `get_secret`, `load_profile_meta`, `save_profile_meta`
+  and `delete_profile` go through them. The error never echoes the id.
+- **`kvendra secret` rejects an invalid id first**, before the password
+  prompt, before reading `--file` and before touching the vault home.
+- The MCP `enforce_allowlist` path also uses the checked builder.
+
+### Changed (visible behaviour)
+
+- `kvendra secret revoke <id>` of a profile that does not exist now fails with
+  `profile not found` instead of printing "revoked".
+- Profile metadata whose `profile_id` differs from its file name is rejected
+  (`profile metadata id mismatch`).
+- Entries in `secrets/` whose name is not a valid profile id are skipped by
+  `secret list` and `secret validate --all` (with a warning).
+
+### Maintenance
+
+- Allow `clippy::double_must_use` on the `#[async_trait]` `SecretResolver`
+  trait: the duplicated `#[must_use]` comes from the macro output and is
+  flagged by clippy 1.99.
+
 ## [0.6.5] — 2026-09-23 — fix(security): remediation of the cold security audit run 1
 
 Security release. Remediates the 9 findings with a ticket from an independent
