@@ -1348,7 +1348,7 @@ async fn enforce_allowlist(
     operation: &str,
     arguments: &Value,
 ) -> KvendraResult<MigrationOutcome> {
-    let path = ctx.vault.profile_allowlist_path(profile_id);
+    let path = ctx.vault.checked_profile_allowlist_path(profile_id)?;
     if !path.exists() {
         // ISSUE-KVD-CLI-B78ED5 finding C4 — FAIL CLOSED. Pre-0.6.4 a profile
         // with a secret but no allowlist YAML on disk was allowed to run any

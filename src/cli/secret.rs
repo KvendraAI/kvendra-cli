@@ -91,6 +91,10 @@ pub struct SetAllowlistArgs {
 }
 
 pub async fn run(cmd: SecretCommand) -> KvendraResult<()> {
+    // ISSUE-KVD-CLI-C7A858 — refuse a hostile profile_id before anything
+    // else: no master-password prompt, no `--file` read, no disk access.
+    validate_cmd_profile_id(&cmd)?;
+
     let home = kvendra_home()?;
     let vault = Vault::new(home.clone());
 
@@ -124,6 +128,25 @@ pub async fn run(cmd: SecretCommand) -> KvendraResult<()> {
         SecretCommand::Revoke { profile_id } => revoke(&vault, &profile_id),
         SecretCommand::Validate(args) => validate_cmd(&vault, args),
         SecretCommand::SetAllowlist(args) => set_allowlist(&vault, &home, args),
+    }
+}
+
+fn validate_cmd_profile_id(cmd: &SecretCommand) -> KvendraResult<()> {
+    let id = match cmd {
+        SecretCommand::Add(a) => Some(a.profile_id.as_str()),
+        SecretCommand::GetMeta { profile_id } | SecretCommand::Revoke { profile_id } => {
+            Some(profile_id.as_str())
+        }
+        SecretCommand::Rotate(a) => Some(a.profile_id.as_str()),
+        SecretCommand::SetAllowlist(a) => Some(a.profile_id.as_str()),
+        SecretCommand::Validate(a) => a.profile_id.as_deref(),
+        SecretCommand::List => None,
+    };
+    match id {
+        Some(id) if !crate::path_id::is_safe_path_component(id) => {
+            Err(crate::vault::invalid_profile_id())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -289,7 +312,7 @@ fn set_allowlist(vault: &Vault, home: &Path, args: SetAllowlistArgs) -> KvendraR
     // if the caller assumed locked-vault semantics from prior releases.
     ensure_unlocked(vault, home, args.password_stdin)?;
     crate::config::create_dir_secure(&vault.allowlists_dir())?;
-    let target = vault.profile_allowlist_path(&args.profile_id);
+    let target = vault.checked_profile_allowlist_path(&args.profile_id)?;
     std::fs::write(&target, &raw)?;
     crate::config::set_file_mode_secure(&target)?;
 
@@ -345,7 +368,15 @@ fn print_validation(vault: &Vault, profile_id: &str) -> bool {
         }
     };
 
-    let allow_path = vault.profile_allowlist_path(profile_id);
+    let allow_path = match vault.checked_profile_allowlist_path(profile_id) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("Status: REJECTED");
+            println!("Issues:");
+            println!("  - {e}");
+            return false;
+        }
+    };
     if !allow_path.exists() {
         println!("Status: REJECTED");
         println!("Issues:");

@@ -138,18 +138,43 @@ impl Vault {
     }
 
     /// Path for a profile's encrypted blob (`<id>.blob` in `secrets/`).
+    ///
+    /// Unchecked: only for ids already validated (e.g. past the MCP
+    /// dispatcher's `profile_id` gate). Untrusted ids go through
+    /// [`Vault::checked_profile_blob_path`].
     pub fn profile_blob_path(&self, profile_id: &str) -> PathBuf {
         self.secrets_dir().join(format!("{profile_id}.blob"))
     }
 
     /// Path for a profile's metadata json (`<id>.json` in `profiles/`).
+    ///
+    /// Unchecked: only for ids already validated. Untrusted ids go through
+    /// [`Vault::checked_profile_meta_path`].
     pub fn profile_meta_path(&self, profile_id: &str) -> PathBuf {
         self.profiles_dir().join(format!("{profile_id}.json"))
     }
 
     /// Path for a profile's allowlist YAML (`<id>.yaml` in `allowlists/`).
+    ///
+    /// Unchecked: only for ids already validated. Untrusted ids go through
+    /// [`Vault::checked_profile_allowlist_path`].
     pub fn profile_allowlist_path(&self, profile_id: &str) -> PathBuf {
         self.allowlists_dir().join(format!("{profile_id}.yaml"))
+    }
+
+    /// Validated variant of [`Vault::profile_blob_path`] (ISSUE-KVD-CLI-C7A858).
+    pub fn checked_profile_blob_path(&self, profile_id: &str) -> KvendraResult<PathBuf> {
+        checked_profile_path(&self.secrets_dir(), profile_id, "blob")
+    }
+
+    /// Validated variant of [`Vault::profile_meta_path`] (ISSUE-KVD-CLI-C7A858).
+    pub fn checked_profile_meta_path(&self, profile_id: &str) -> KvendraResult<PathBuf> {
+        checked_profile_path(&self.profiles_dir(), profile_id, "json")
+    }
+
+    /// Validated variant of [`Vault::profile_allowlist_path`] (ISSUE-KVD-CLI-C7A858).
+    pub fn checked_profile_allowlist_path(&self, profile_id: &str) -> KvendraResult<PathBuf> {
+        checked_profile_path(&self.allowlists_dir(), profile_id, "yaml")
     }
 
     /// List existing profile blobs (filenames without `.blob`).
@@ -164,6 +189,10 @@ impl Vault {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if let Some(stripped) = name.strip_suffix(".blob") {
+                if !crate::path_id::is_safe_path_component(stripped) {
+                    tracing::warn!("skipping secrets/ entry with an unsafe profile_id");
+                    continue;
+                }
                 out.push(stripped.to_string());
             }
         }
@@ -173,27 +202,55 @@ impl Vault {
 
     /// Read a profile's metadata (no plaintext exposure).
     pub fn load_profile_meta(&self, profile_id: &str) -> KvendraResult<Profile> {
-        let path = self.profile_meta_path(profile_id);
+        let path = self.checked_profile_meta_path(profile_id)?;
         if !path.exists() {
             return Err(KvendraError::ProfileNotFound);
         }
         let raw = std::fs::read_to_string(&path)?;
-        serde_json::from_str(&raw).map_err(KvendraError::from)
+        let profile: Profile = serde_json::from_str(&raw).map_err(KvendraError::from)?;
+        if profile.profile_id != profile_id {
+            return Err(KvendraError::Vault("profile metadata id mismatch".into()));
+        }
+        Ok(profile)
     }
 
     pub fn save_profile_meta(&self, profile: &Profile) -> KvendraResult<()> {
+        let path = self.checked_profile_meta_path(&profile.profile_id)?;
         create_dir_secure(&self.profiles_dir())?;
-        let path = self.profile_meta_path(&profile.profile_id);
         let raw = serde_json::to_string_pretty(profile)?;
         std::fs::write(&path, raw)?;
         set_file_mode_secure(&path)?;
         Ok(())
     }
 
+    /// Delete a profile's blob, metadata and allowlist. Missing files are
+    /// skipped; the first other io error is returned. `ProfileNotFound` when
+    /// none of the three existed.
     pub fn delete_profile(&self, profile_id: &str) -> KvendraResult<()> {
-        let _ = std::fs::remove_file(self.profile_blob_path(profile_id));
-        let _ = std::fs::remove_file(self.profile_meta_path(profile_id));
-        let _ = std::fs::remove_file(self.profile_allowlist_path(profile_id));
+        let paths = [
+            self.checked_profile_blob_path(profile_id)?,
+            self.checked_profile_meta_path(profile_id)?,
+            self.checked_profile_allowlist_path(profile_id)?,
+        ];
+        let mut removed_any = false;
+        let mut first_err: Option<std::io::Error> = None;
+        for path in &paths {
+            match std::fs::remove_file(path) {
+                Ok(()) => removed_any = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e.into());
+        }
+        if !removed_any {
+            return Err(KvendraError::ProfileNotFound);
+        }
         Ok(())
     }
 
@@ -385,6 +442,7 @@ impl Vault {
 
     /// Encrypt + persist a secret blob for `profile_id`. Requires unlocked.
     pub fn put_secret(&self, profile_id: &str, plaintext: &[u8]) -> KvendraResult<()> {
+        let blob_path = self.checked_profile_blob_path(profile_id)?;
         create_dir_secure(&self.secrets_dir())?;
         let g = self.session.lock().expect("session mutex poisoned");
         let session = g.as_ref().ok_or(KvendraError::VaultLocked)?;
@@ -400,7 +458,6 @@ impl Vault {
         let ct = aes_seal(key, &nonce, plaintext)?;
         let params = KdfParams::high_cost(vec![]); // shell only
         let blob = Blob::new(params, nonce.to_vec(), ct);
-        let blob_path = self.profile_blob_path(profile_id);
         std::fs::write(&blob_path, blob.to_json()?)?;
         set_file_mode_secure(&blob_path)?;
         Ok(())
@@ -409,7 +466,7 @@ impl Vault {
     /// Read + decrypt the plaintext for `profile_id`. Requires unlocked.
     /// Returned material is wrapped in `SecretPlaintext` (ZeroizeOnDrop).
     pub fn get_secret(&self, profile_id: &str) -> KvendraResult<SecretPlaintext> {
-        let path = self.profile_blob_path(profile_id);
+        let path = self.checked_profile_blob_path(profile_id)?;
         if !path.exists() {
             return Err(KvendraError::ProfileNotFound);
         }
@@ -524,6 +581,28 @@ pub fn compute_config_hmac(key: &[u8], raw_toml_without_hmac: &[u8]) -> String {
     let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC accepts arbitrary key length");
     mac.update(raw_toml_without_hmac);
     hex::encode(mac.finalize().into_bytes())
+}
+
+/// Refusal for a `profile_id` that is not a safe single path component.
+/// Deliberately does NOT echo the offending id (it may carry control bytes
+/// or paths that reveal the caller's layout).
+pub(crate) fn invalid_profile_id() -> KvendraError {
+    KvendraError::InvalidArgs(
+        "invalid profile_id: must be 1-128 chars of [A-Za-z0-9._-], no '..', no leading '.'".into(),
+    )
+}
+
+/// `dir/<id>.<ext>` after validating `id` with THE shared canonicalizer
+/// (PAT-KVD-CLI-C18A74) and asserting containment by `parent() == dir`.
+fn checked_profile_path(dir: &Path, profile_id: &str, ext: &str) -> KvendraResult<PathBuf> {
+    if !crate::path_id::is_safe_path_component(profile_id) {
+        return Err(invalid_profile_id());
+    }
+    let p = dir.join(format!("{profile_id}.{ext}"));
+    if p.parent() != Some(dir) {
+        return Err(invalid_profile_id());
+    }
+    Ok(p)
 }
 
 impl From<KvendraError> for std::io::Error {
@@ -781,6 +860,120 @@ mod tests {
             !v.pending_unlock.load(Ordering::Acquire),
             "unlock_from_derived_key must also clear the pending flag"
         );
+    }
+
+    fn test_profile(id: &str) -> Profile {
+        Profile {
+            profile_id: id.into(),
+            secret_type: "generic".into(),
+            created_at: "2026-10-06".into(),
+            expiration: None,
+            unsafe_raw_token_enabled: false,
+            quarantined: false,
+            allowlist_hmac_hex: None,
+        }
+    }
+
+    /// ISSUE-KVD-CLI-C7A858 — every vault entry point refuses an unsafe
+    /// profile_id with `InvalidArgs` (never an incidental io error) and the
+    /// message never echoes the id.
+    #[test]
+    fn hostile_profile_ids_are_refused_by_every_entry_point() {
+        let (_dir, v) = open_test_vault();
+        v.create_with_params(b"hunter2-test", fast_params())
+            .unwrap();
+        v.unlock(b"hunter2-test", 30).unwrap();
+        let long = "a".repeat(129);
+        for id in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "a..b",
+            "a\0b",
+            "/tmp/abs",
+            long.as_str(),
+        ] {
+            for r in [
+                v.checked_profile_blob_path(id).map(|_| ()),
+                v.checked_profile_meta_path(id).map(|_| ()),
+                v.checked_profile_allowlist_path(id).map(|_| ()),
+                v.put_secret(id, b"x"),
+                v.get_secret(id).map(|_| ()),
+                v.load_profile_meta(id).map(|_| ()),
+                v.save_profile_meta(&test_profile(id)),
+                v.delete_profile(id),
+            ] {
+                match r {
+                    Err(KvendraError::InvalidArgs(msg)) => {
+                        assert!(msg.contains("profile_id"));
+                        if id.len() > 2 {
+                            assert!(!msg.contains(id), "message echoes the id");
+                        }
+                    }
+                    other => panic!("id {id:?} not refused: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checked_paths_stay_inside_their_dir() {
+        let (_dir, v) = open_test_vault();
+        let p = v
+            .checked_profile_blob_path("aws.kvendra.staging-deploy")
+            .unwrap();
+        assert_eq!(p.parent(), Some(v.secrets_dir().as_path()));
+        let p = v.checked_profile_meta_path("p1_test-2").unwrap();
+        assert_eq!(p.parent(), Some(v.profiles_dir().as_path()));
+        let p = v.checked_profile_allowlist_path(&"a".repeat(128)).unwrap();
+        assert_eq!(p.parent(), Some(v.allowlists_dir().as_path()));
+    }
+
+    #[test]
+    fn delete_profile_of_missing_profile_is_not_found() {
+        let (_dir, v) = open_test_vault();
+        assert!(matches!(
+            v.delete_profile("ghost"),
+            Err(KvendraError::ProfileNotFound)
+        ));
+    }
+
+    #[test]
+    fn delete_profile_removes_partial_profile() {
+        let (_dir, v) = open_test_vault();
+        v.save_profile_meta(&test_profile("p")).unwrap();
+        v.delete_profile("p").unwrap();
+        assert!(!v.profile_meta_path("p").exists());
+        assert!(matches!(
+            v.delete_profile("p"),
+            Err(KvendraError::ProfileNotFound)
+        ));
+    }
+
+    #[test]
+    fn load_profile_meta_rejects_id_mismatch() {
+        let (_dir, v) = open_test_vault();
+        v.save_profile_meta(&test_profile("other")).unwrap();
+        std::fs::copy(v.profile_meta_path("other"), v.profile_meta_path("p")).unwrap();
+        assert!(matches!(
+            v.load_profile_meta("p"),
+            Err(KvendraError::Vault(_))
+        ));
+        assert_eq!(v.load_profile_meta("other").unwrap().profile_id, "other");
+    }
+
+    #[test]
+    fn list_profiles_skips_unsafe_names() {
+        let (_dir, v) = open_test_vault();
+        create_dir_secure(&v.secrets_dir()).unwrap();
+        std::fs::write(v.secrets_dir().join("good.blob"), "x").unwrap();
+        std::fs::write(v.secrets_dir().join(".hidden.blob"), "x").unwrap();
+        std::fs::write(v.secrets_dir().join("a..b.blob"), "x").unwrap();
+        assert_eq!(v.list_profiles().unwrap(), vec!["good".to_string()]);
     }
 
     /// REQ-KVD-008 — different sub-keys must yield different HMACs even on
