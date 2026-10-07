@@ -103,6 +103,7 @@ async fn bootstrap(
         session: None,
         workspace_id: None,
         unsafe_usage: Default::default(),
+        lvr: Default::default(),
     });
     (dir, ctx)
 }

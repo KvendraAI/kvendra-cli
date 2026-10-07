@@ -7,6 +7,9 @@
 //!   - `audit.db` (best-effort — bloqueado por WAL si MCP serve está corriendo)
 //!   - `sentinel.blob`
 //!   - `recovery_codes.json`
+//!   - `vars.blob` (local variables, REQ-KVD-11F906 — restored with every
+//!     variable `verified:false`; the rotated copies `vars.blob.1..3` stay
+//!     out)
 //!
 //! Excluidos: `cache/`, `sessions/<workspace>.token`, archivos temporales.
 
@@ -21,6 +24,7 @@ const INCLUDE_TOP_LEVEL: &[&str] = &[
     "audit.db",
     "sentinel.blob",
     "recovery_codes.json",
+    "vars.blob",
 ];
 
 const INCLUDE_DIRS: &[&str] = &["secrets", "allowlists"];

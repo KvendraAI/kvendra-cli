@@ -183,6 +183,7 @@ pub async fn check(
     profile_id: &str,
     operation: &str,
     arguments: &Value,
+    lvr_note: Option<&str>,
 ) -> (ApprovalDecision, policy::ApprovalOutcome) {
     let env_mode = std::env::var("KVENDRA_APPROVAL_MODE")
         .ok()
@@ -281,7 +282,14 @@ pub async fn check(
         profile_id: profile_id.to_string(),
         primitive: primitive.to_string(),
         operation: operation.to_string(),
-        args_summary: format_args_summary(arguments),
+        // REQ-KVD-11F906 O6 — `arguments` are the RESOLVED ones and the note
+        // lists every substituted local variable with its value, untruncated:
+        // the human approves the real destination (this prompt is the human
+        // channel — TTY / OS popup — never MCP).
+        args_summary: match lvr_note {
+            Some(note) => format!("{note} | {}", format_args_summary(arguments)),
+            None => format_args_summary(arguments),
+        },
         destructive,
         mode,
         timeout_seconds,

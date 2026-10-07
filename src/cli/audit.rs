@@ -148,8 +148,17 @@ async fn run_legacy(args: AuditArgs) -> KvendraResult<()> {
     }
 
     let events = list_all(&conn)?;
+    // REQ-KVD-11F906 N1 — rows may carry local values (O6 records the
+    // resolved cwd / profile / host). When the vault is unlocked, the listing
+    // re-symbolizes every known value of `vars.blob` as `{{lvr:<key>}}`, like
+    // the broker's MCP output (literal occurrences only — see vars::filter).
+    let known = local_known_values(&home);
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&events)?);
+        let mut v = serde_json::to_value(&events)?;
+        if let Some(k) = known.as_ref() {
+            k.scrub_value(&mut v);
+        }
+        println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
 
@@ -165,7 +174,7 @@ async fn run_legacy(args: AuditArgs) -> KvendraResult<()> {
             ("error", Some(code), None) => format!("  [{}]", safe(code)),
             _ => String::new(),
         };
-        println!(
+        let line = format!(
             "{:>5} {} {:>15} {:<26} {:<10} {} {}{}",
             ev.id,
             ev.ts_unix_ms,
@@ -176,8 +185,21 @@ async fn run_legacy(args: AuditArgs) -> KvendraResult<()> {
             ev.severity,
             err_tail
         );
+        match known.as_ref() {
+            Some(k) => println!("{}", k.scrub_str(&line).0),
+            None => println!("{line}"),
+        }
     }
     Ok(())
+}
+
+/// Known local values for masking the audit listing (REQ-KVD-11F906 N1).
+/// `None` when the vault is locked for this machine or there are no vars.
+fn local_known_values(home: &std::path::Path) -> Option<crate::vars::filter::KnownValues> {
+    let vault = crate::cli::vars::session_vault(home)?;
+    let doc = crate::vars::load(&vault).ok()?;
+    let known = crate::vars::filter::KnownValues::from_doc(&doc);
+    (!known.is_empty()).then_some(known)
 }
 
 /// The audit HMAC sub-key: from an unlocked in-process vault, else derived

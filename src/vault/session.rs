@@ -32,6 +32,11 @@ pub const HKDF_INFO_ALLOWLIST_HMAC: &[u8] = b"kvendra/allowlist-hmac/v1";
 /// `kvendra/<purpose>/v<N>`.
 pub const HKDF_INFO_CONFIG_HMAC: &[u8] = b"kvendra/config-hmac/v1";
 
+/// HKDF info string for the local-vars encryption sub-key (REQ-KVD-11F906 D1).
+/// `vars.blob` is sealed with this sub-key (never the master key, which seals
+/// the secret blobs) plus its own AAD — double domain separation (AC-LVR-5).
+pub const HKDF_INFO_LOCAL_VARS: &[u8] = b"kvendra/local-vars-key/v1";
+
 /// 32-byte sub-key wrapper, zeroized on drop.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct DerivedSubKey(pub [u8; 32]);
@@ -68,6 +73,7 @@ pub struct SessionKey {
     audit_hmac_key: DerivedSubKey,
     allowlist_hmac_key: DerivedSubKey,
     config_hmac_key: DerivedSubKey,
+    local_vars_key: DerivedSubKey,
     idle_timeout: Duration,
     last_used: Instant,
 }
@@ -82,6 +88,7 @@ impl SessionKey {
         let audit_hmac_key = hkdf_expand(derived.as_bytes(), HKDF_INFO_AUDIT_HMAC);
         let allowlist_hmac_key = hkdf_expand(derived.as_bytes(), HKDF_INFO_ALLOWLIST_HMAC);
         let config_hmac_key = hkdf_expand(derived.as_bytes(), HKDF_INFO_CONFIG_HMAC);
+        let local_vars_key = hkdf_expand(derived.as_bytes(), HKDF_INFO_LOCAL_VARS);
         Self {
             inner: Inner {
                 key: *derived.as_bytes(),
@@ -89,6 +96,7 @@ impl SessionKey {
             audit_hmac_key,
             allowlist_hmac_key,
             config_hmac_key,
+            local_vars_key,
             idle_timeout: Duration::from_secs(u64::from(idle_timeout_minutes) * 60),
             last_used: Instant::now(),
         }
@@ -133,6 +141,14 @@ impl SessionKey {
             return Err(KvendraError::VaultLocked);
         }
         Ok(&self.config_hmac_key)
+    }
+
+    /// Get the derived local-vars encryption sub-key (REQ-KVD-11F906 D1).
+    pub fn local_vars_key(&self) -> KvendraResult<&DerivedSubKey> {
+        if self.is_expired() {
+            return Err(KvendraError::VaultLocked);
+        }
+        Ok(&self.local_vars_key)
     }
 
     pub fn is_expired(&self) -> bool {
@@ -222,8 +238,15 @@ mod tests {
         let a = hkdf_expand(&k, HKDF_INFO_AUDIT_HMAC);
         let b = hkdf_expand(&k, HKDF_INFO_ALLOWLIST_HMAC);
         let c = hkdf_expand(&k, HKDF_INFO_CONFIG_HMAC);
+        // REQ-KVD-11F906 D1 — the local-vars key joins the separation set,
+        // and none of the four sub-keys equals the master key itself.
+        let d = hkdf_expand(&k, HKDF_INFO_LOCAL_VARS);
         assert_ne!(a.as_bytes(), b.as_bytes());
         assert_ne!(a.as_bytes(), c.as_bytes());
         assert_ne!(b.as_bytes(), c.as_bytes());
+        assert_ne!(a.as_bytes(), d.as_bytes());
+        assert_ne!(b.as_bytes(), d.as_bytes());
+        assert_ne!(c.as_bytes(), d.as_bytes());
+        assert_ne!(&k, d.as_bytes());
     }
 }

@@ -37,6 +37,36 @@ pub struct CapabilitiesManifest {
     pub broker_version: String,
     pub schema_version: u32,
     pub primitives: Vec<PrimitiveSpec>,
+    /// Optional feature flags (IF-KVD-SKILLS-108EDC v1.1, additive;
+    /// `schema_version` stays 1 — consumers ignore unknown fields).
+    pub features: Vec<String>,
+    /// Local-variables capability block (REQ-KVD-11F906).
+    pub lvr: LvrCaps,
+}
+
+/// Feature flag advertised when the broker substitutes `{{lvr:key}}`.
+pub const FEATURE_LVR_SUBSTITUTION: &str = "lvr_substitution/v1";
+
+/// `lvr` block of the manifest (IF-KVD-SKILLS-108EDC v1.1).
+#[derive(Debug, Serialize)]
+pub struct LvrCaps {
+    pub format_version: u32,
+    pub types: Vec<String>,
+    pub bounded_positions: Vec<String>,
+}
+
+fn lvr_caps() -> LvrCaps {
+    LvrCaps {
+        format_version: u32::from(crate::vars::VARS_FORMAT_VERSION),
+        types: crate::vars::VarType::ALL
+            .iter()
+            .map(|t| t.as_str().to_string())
+            .collect(),
+        bounded_positions: ["profile_id", "cwd", "argv", "url", "src", "dst", "dist"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -102,6 +132,8 @@ pub fn build_manifest() -> CapabilitiesManifest {
         broker_version: env!("CARGO_PKG_VERSION").to_string(),
         schema_version: SCHEMA_VERSION,
         primitives,
+        features: vec![FEATURE_LVR_SUBSTITUTION.to_string()],
+        lvr: lvr_caps(),
     }
 }
 
@@ -297,5 +329,22 @@ mod tests {
         for p in &m.primitives {
             assert!(p.deprecated_in.is_none());
         }
+    }
+
+    /// REQ-KVD-11F906 — the manifest advertises the local-vars feature and
+    /// its block, additively (schema_version unchanged).
+    #[test]
+    fn manifest_advertises_lvr_substitution() {
+        let m = build_manifest();
+        assert_eq!(m.schema_version, 1);
+        assert!(m.features.iter().any(|f| f == "lvr_substitution/v1"));
+        assert_eq!(m.lvr.format_version, 1);
+        assert_eq!(
+            m.lvr.types,
+            vec!["path", "host", "port", "profile_id", "string"]
+        );
+        assert!(m.lvr.bounded_positions.iter().any(|p| p == "cwd"));
+        let v = serde_json::to_value(&m).unwrap();
+        assert!(v["features"].is_array() && v["lvr"]["bounded_positions"].is_array());
     }
 }

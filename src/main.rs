@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Protect(args) => kvendra::cli::bypass::run_protect(args.workspace_root).await?,
         Commands::GrantPubkey => kvendra::cli::bypass::run_grant_pubkey()?,
         Commands::VerifyGrant => kvendra::cli::bypass::run_verify_grant().await?,
+        Commands::Vars(cmd) => kvendra::cli::vars::run(cmd).await?,
     }
     Ok(())
 }

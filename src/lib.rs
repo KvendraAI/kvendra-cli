@@ -10,6 +10,7 @@
 //! - [`path_id`] — the shared rule for untrusted identifiers used as one
 //!   filesystem path component (`profile_id`, `template_id`).
 //! - [`config`] — `~/.kvendra/config.toml` loader.
+//! - [`vars`] — local variables `{{lvr:key}}` (REQ-KVD-11F906).
 //! - [`error`] — unified `KvendraError` type.
 
 pub mod allowlist;
@@ -31,6 +32,7 @@ pub mod protocol;
 pub mod secret_resolver;
 pub mod session;
 pub mod tui;
+pub mod vars;
 pub mod vault;
 pub mod workspace;
 

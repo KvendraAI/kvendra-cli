@@ -229,11 +229,29 @@ async fn run_pull(args: PullArgs) -> KvendraResult<()> {
     let home = kvendra_home()?;
     let jwt = load_pro_jwt()?;
     let mut password = read_password(args.password_stdin)?;
-    let backup_key = derive_backup_key_from_password(&password)?;
+    let backup_key = match derive_backup_key_from_password(&password) {
+        Ok(k) => k,
+        Err(e) => {
+            password.zeroize();
+            return Err(e);
+        }
+    };
+    // REQ-KVD-11F906 AC-LVR-6 — the password lives until the restored
+    // `vars.blob` is re-sealed below; it is zeroized on every exit path.
+    let result = pull_into_staging(&args, &home, jwt, &backup_key, &password).await;
     password.zeroize();
+    result
+}
 
+async fn pull_into_staging(
+    args: &PullArgs,
+    home: &std::path::Path,
+    jwt: String,
+    backup_key: &[u8; 32],
+    password: &str,
+) -> KvendraResult<()> {
     let client = BackupClient::with_id_token(jwt, load_pro_id_token());
-    let backup_id = match args.id {
+    let backup_id = match args.id.clone() {
         Some(id) => id,
         None => {
             let mut items = client.list(1).await?;
@@ -244,9 +262,12 @@ async fn run_pull(args: PullArgs) -> KvendraResult<()> {
         }
     };
     let ciphertext = client.pull(&backup_id).await?;
-    let tar_bytes = crypto::decrypt_bundle(&backup_key, &ciphertext)?;
+    let tar_bytes = crypto::decrypt_bundle(backup_key, &ciphertext)?;
 
-    let target = args.out.unwrap_or_else(|| home.join("staging_restore"));
+    let target = args
+        .out
+        .clone()
+        .unwrap_or_else(|| home.join("staging_restore"));
     if target.exists() && !args.yes {
         println!(
             "Target dir already exists: {}. Use --yes to proceed.",
@@ -255,6 +276,15 @@ async fn run_pull(args: PullArgs) -> KvendraResult<()> {
         return Err(KvendraError::Vault("restore aborted by user".into()));
     }
     let n = bundle::extract_bundle(&tar_bytes, &target)?;
+    // A restored variable is never trusted until a human re-verifies it on
+    // this machine (`kvendra vars verify`): restore only LOWERS `verified`.
+    let reset = crate::vars::mark_restored_unverified(&target, password.as_bytes())?;
+    if reset > 0 {
+        println!(
+            "{reset} local variable(s) restored as unverified — run `kvendra vars verify --all` \
+             in your terminal after moving the restore into place"
+        );
+    }
     println!(
         "Restored backup {} → {} ({} entries)",
         backup_id,

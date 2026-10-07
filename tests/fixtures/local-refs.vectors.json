@@ -1,0 +1,147 @@
+{
+  "$comment": "Conformance vectors of the namespaced reference grammar {{cfg:key}} / {{lvr:key}} (REQ-KVD-11F906, SPEC DOC-KVD-E49C6E F1). Shared byte-for-byte by core, the dashboard tokenizer and kvendra-cli (copy + sha256 under tests/fixtures/). For each text: the distinct unescaped keys of each namespace, in order of first appearance. Key grammar [a-z0-9][a-z0-9._-]{0,127}; one backslash right before the braces escapes; no nesting.",
+  "refs": [
+    {
+      "name": "escape: an escaped reference is a mention, never a reference",
+      "text": "see \\{{lvr:home}} and {{lvr:ws}}",
+      "cfg": [],
+      "lvr": ["ws"]
+    },
+    {
+      "name": "escape: double backslash still escapes (the backslash right before the braces)",
+      "text": "\\\\{{lvr:a}} \\\\{{cfg:b}}",
+      "cfg": [],
+      "lvr": []
+    },
+    {
+      "name": "escape: per reference, the neighbour is not affected",
+      "text": "\\{{lvr:a}}{{lvr:b}} \\{{cfg:c}}{{cfg:d}}",
+      "cfg": ["d"],
+      "lvr": ["b"]
+    },
+    {
+      "name": "key limit: 128 chars is valid",
+      "text": "{{lvr:abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}} {{cfg:abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}}",
+      "cfg": [
+        "abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "lvr": [
+        "abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ]
+    },
+    {
+      "name": "key limit: 129 chars is not a reference",
+      "text": "{{lvr:abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}} {{cfg:abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}}",
+      "cfg": [],
+      "lvr": []
+    },
+    {
+      "name": "uppercase: key or namespace with uppercase is not a reference",
+      "text": "{{lvr:Home}} {{lvr:HOME}} {{LVR:home}} {{Lvr:x}} {{CFG:x}} {{cfg:X}}",
+      "cfg": [],
+      "lvr": []
+    },
+    {
+      "name": "invalid keys: empty, leading dot/dash/underscore, spaces, placeholder",
+      "text": "{{lvr:}} {{lvr:.a}} {{lvr:-a}} {{lvr:_a}} {{lvr:a b}} {{ lvr:a }} {{lvr :a}} {{lvr:<key>}}",
+      "cfg": [],
+      "lvr": []
+    },
+    {
+      "name": "valid key charset: digits, dot, dash, underscore after the first char",
+      "text": "{{lvr:0}} {{lvr:ws.root-dir_2}}",
+      "cfg": [],
+      "lvr": ["0", "ws.root-dir_2"]
+    },
+    {
+      "name": "other namespaces and single braces are not references",
+      "text": "{{env:a}} {{lvar:a}} {{lv:a}} {lvr:a} {{lvr:a} {lvr:a}}",
+      "cfg": [],
+      "lvr": []
+    },
+    {
+      "name": "nesting: only the inner reference is recognised (same namespace)",
+      "text": "{{lvr:{{lvr:inner}}}}",
+      "cfg": [],
+      "lvr": ["inner"]
+    },
+    {
+      "name": "nesting: across namespaces only the inner one counts",
+      "text": "{{lvr:{{cfg:inner}}}} {{cfg:{{lvr:other}}}}",
+      "cfg": ["inner"],
+      "lvr": ["other"]
+    },
+    {
+      "name": "extra braces around a reference",
+      "text": "{{{lvr:a}}} {{{{cfg:b}}}}",
+      "cfg": ["b"],
+      "lvr": ["a"]
+    },
+    {
+      "name": "adjacency lvr+cfg",
+      "text": "{{lvr:a}}{{cfg:b}}",
+      "cfg": ["b"],
+      "lvr": ["a"]
+    },
+    {
+      "name": "adjacency cfg+lvr with escape on one side",
+      "text": "{{cfg:b}}\\{{lvr:a}}{{lvr:c}}",
+      "cfg": ["b"],
+      "lvr": ["c"]
+    },
+    {
+      "name": "same key in both namespaces is independent",
+      "text": "{{lvr:k}} {{cfg:k}}",
+      "cfg": ["k"],
+      "lvr": ["k"]
+    },
+    {
+      "name": "order of first appearance, deduplicated per namespace",
+      "text": "{{lvr:b}} {{cfg:a}} {{lvr:a}} {{lvr:b}} {{cfg:a}}",
+      "cfg": ["a"],
+      "lvr": ["b", "a"]
+    },
+    {
+      "name": "unicode text around a valid reference",
+      "text": "ruta 📁 ñandú → {{lvr:work}} «ok» 日本 {{cfg:x}}",
+      "cfg": ["x"],
+      "lvr": ["work"]
+    },
+    {
+      "name": "unicode inside the key is not a reference",
+      "text": "{{lvr:wörk}} {{lvr:ñ}} {{lvr:café.x}} {{lvr:日本}} {{cfg:é}}",
+      "cfg": [],
+      "lvr": []
+    },
+    {
+      "name": "fullwidth braces and colon are not references",
+      "text": "｛｛lvr:a｝｝ {{lvr：a}} ｛{lvr:a}} {{lvr:a}｝ ｛｛cfg:b｝｝",
+      "cfg": [],
+      "lvr": []
+    },
+    {
+      "name": "zero-width characters break the reference",
+      "text": "{\u200b{lvr:a}} {{\u200blvr:a}} {{lvr\u200b:a}} {{lvr:\u200ba}} {{lvr:a\u200b}} {{lvr:a}\u200b} {{lvr:a\u200db}} \ufeff{{lvr:z\u2060}} {\u200c{cfg:b}}",
+      "cfg": [],
+      "lvr": []
+    },
+    {
+      "name": "lookalike backslash (fullwidth reverse solidus) does not escape",
+      "text": "＼{{lvr:a}}",
+      "cfg": [],
+      "lvr": ["a"]
+    },
+    {
+      "name": "code spans are not special",
+      "text": "`{{lvr:in.code}}` and ```\n{{lvr:in.block}}\n```",
+      "cfg": [],
+      "lvr": ["in.code", "in.block"]
+    },
+    {
+      "name": "no references at all",
+      "text": "plain text, {{ and }} and lvr: alone",
+      "cfg": [],
+      "lvr": []
+    }
+  ]
+}

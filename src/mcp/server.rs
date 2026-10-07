@@ -94,6 +94,10 @@ pub struct ServerContext {
     /// cap). Lives for the process (session) lifetime; reset on restart, so a
     /// fresh `mcp serve` starts every profile's budget at zero.
     pub unsafe_usage: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    /// Local-variables state (REQ-KVD-11F906): decrypted `vars.blob` cache
+    /// (RAM only, reloaded on change, dropped when the vault locks) and the
+    /// per-key resolution rate limiter.
+    pub lvr: crate::vars::resolve::LvrState,
 }
 
 impl ServerContext {
@@ -333,6 +337,7 @@ pub async fn serve_with_vault(vault: Vault) -> KvendraResult<()> {
         session: session_arc,
         workspace_id,
         unsafe_usage: Default::default(),
+        lvr: Default::default(),
     });
     let mut transport = StdioTransport::new();
 
@@ -652,17 +657,143 @@ fn audit_safe_repr(s: &str) -> String {
     out
 }
 
+/// REQ-KVD-11F906 D5 — the broker's single egress point for local values.
+/// Every `tools/call` response (result, `error.message`, `error.data`) goes
+/// through the local-vars output filter: each known value of `vars.blob` is
+/// re-symbolized as `{{lvr:<key>}}` (AC-LVR-1). The known values are
+/// snapshotted BEFORE the call, so an idle lock during the call cannot skip
+/// the filter.
 async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -> JsonRpcResponse {
     // Self-healing — if our in-RAM SessionKey expired (idle timeout) but
     // the on-disk session blob is still inside its TTL, recover the
     // derived key transparently. Closes PAT-KVD-009 ("Cmd+Q + restart
     // Claude Code is the canonical fix"). See try_self_heal_vault above.
     try_self_heal_vault(&ctx);
+    let known = ctx.lvr.known_values(&ctx.vault);
 
+    let mut resp = tools_call_inner(id, params.clone(), ctx.clone()).await;
+
+    let Some(known) = known.or_else(|| ctx.lvr.known_values(&ctx.vault)) else {
+        return resp;
+    };
+    let mut masked = 0usize;
+    if let Some(result) = resp.result.as_mut() {
+        masked += known.scrub_value(result);
+    }
+    if let Some(err) = resp.error.as_mut() {
+        let (msg, n) = known.scrub_str(&err.message);
+        if n > 0 {
+            err.message = msg;
+            masked += n;
+        }
+        if let Some(data) = err.data.as_mut() {
+            masked += known.scrub_value(data);
+        }
+    }
+    if masked > 0 {
+        record_output_masked(&ctx, &params).await;
+    }
+    resp
+}
+
+/// Dedicated audit row for an output that carried local values (flag
+/// `lvr_output_masked`). The call's own row is already final when the filter
+/// runs, so the masking is recorded as a separate `Ok` row bound to the same
+/// tool, operation and (original) args hash.
+async fn record_output_masked(ctx: &ServerContext, params: &Value) {
+    let Some(w) = ctx.audit_writer() else {
+        return;
+    };
+    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+    let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+    let action = arguments
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let profile_id = arguments
+        .get("profile_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let event = AuditEvent {
+        ts_unix_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 / 1_000_000,
+        profile_id: audit_safe_repr(profile_id),
+        primitive: audit_safe_repr(name),
+        action: audit_safe_repr(action),
+        args_hash_hex: args_hash_hex(&arguments),
+        status: Status::Ok,
+        severity: Severity::Info,
+        flags: FLAG_LVR_OUTPUT_MASKED.to_string(),
+        remote_audit_id: None,
+        error_code: None,
+        error_message: None,
+    };
+    let _ = w.record(event).await;
+}
+
+/// Audit flag of a response the local-vars output filter rewrote.
+pub const FLAG_LVR_OUTPUT_MASKED: &str = "lvr_output_masked";
+/// Audit flag of a call refused by the local-vars layer.
+pub const FLAG_LVR_DENIED: &str = "lvr_denied";
+
+/// JSON-RPC error for a local-variable refusal: `data = {error_type, key,
+/// hint}`, never the value (REQ-KVD-11F906 API contract).
+fn lvr_error_response(id: Option<Value>, code: &'static str, key: &str) -> JsonRpcResponse {
+    let mut data = serde_json::json!({
+        "error_type": code,
+        "key": key,
+        "hint": crate::vars::hint_for(code),
+    });
+    if code == "lvr_vault_locked" {
+        data["help"] = serde_json::json!({
+            "topic": "vault-locked-pending-unlock",
+            "action": "Run `kvendra unlock` in your terminal. The MCP server will auto-recover without restart.",
+        });
+    }
+    let msg = if key.is_empty() {
+        code.to_string()
+    } else {
+        format!("{code}: {key}")
+    };
+    JsonRpcResponse::error_with_data(id, codes::APPLICATION_ERROR, msg, data)
+}
+
+/// O6 — per-substitution audit flags. cwd / profile_id / host-typed sites
+/// record `lvr:<key>=<resolved value>` (local forensics: what directory, which
+/// profile, which host); every other site records `lvr:<key>#<sha256 prefix>`.
+/// Values are validated (no `,` `|` or control bytes), so the flag column
+/// stays unambiguous.
+fn lvr_audit_flags(prep: &crate::vars::resolve::Prepared) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    let mut out = Vec::new();
+    for site in &prep.sites {
+        let Some(value) = prep.resolved.pointer(&site.pointer).and_then(Value::as_str) else {
+            continue;
+        };
+        let flag = if site.pointer == "/profile_id"
+            || site.pointer == "/args/cwd"
+            || site.var_type == crate::vars::VarType::Host
+        {
+            format!("lvr:{}={}", site.key, value)
+        } else {
+            let digest = Sha256::digest(value.as_bytes());
+            format!("lvr:{}#{}", site.key, &hex::encode(digest)[..16])
+        };
+        if !out.contains(&flag) {
+            out.push(flag);
+        }
+    }
+    out
+}
+
+async fn tools_call_inner(
+    id: Option<Value>,
+    params: Value,
+    ctx: Arc<ServerContext>,
+) -> JsonRpcResponse {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
 
-    let profile_id = arguments
+    let mut profile_id = arguments
         .get("profile_id")
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -678,7 +809,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
     // it. Persist an escaped, length-capped form unless it already passes
     // `is_valid_profile_id`; past the gate `profile_id` is path-safe and this
     // is identical to it.
-    let audit_profile_id =
+    let mut audit_profile_id =
         if profile_id.is_empty() || crate::primitives::is_valid_profile_id(&profile_id) {
             profile_id.clone()
         } else {
@@ -763,6 +894,50 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
             data,
         );
     }
+
+    // REQ-KVD-11F906 D3/D4 — substitution of local references. Runs BEFORE
+    // the profile_id gates: an `{{lvr:…}}` in `profile_id` must be resolved
+    // before `is_valid_profile_id` (which rejects `{` and `:`). Nothing
+    // executes on a refusal (AC-LVR-3), and the vault-locked case has no
+    // fallback (RF-CLI-4). The audit keeps the ORIGINAL arguments; the
+    // allowlist, approval display and primitive see the resolved ones.
+    let prep = match crate::vars::resolve::prepare(&ctx.lvr, &ctx.vault, &arguments) {
+        Ok(p) => p,
+        Err(lvr_err) => {
+            flags.push(FLAG_LVR_DENIED.to_string());
+            if crate::vars::is_valid_key(&lvr_err.key) {
+                flags.push(format!("lvr:{}", lvr_err.key));
+            }
+            let err = KvendraError::from(lvr_err.clone());
+            let _ = record_audit(
+                &ctx,
+                &arguments,
+                name,
+                &audit_profile_id,
+                &action,
+                &flags,
+                true,
+                None,
+                Some(&err),
+            )
+            .await;
+            return lvr_error_response(id, lvr_err.code, &lvr_err.key);
+        }
+    };
+    if prep.sites.iter().any(|s| s.pointer == "/profile_id") {
+        profile_id = prep
+            .resolved
+            .get("profile_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        audit_profile_id = if crate::primitives::is_valid_profile_id(&profile_id) {
+            profile_id.clone()
+        } else {
+            audit_safe_repr(&profile_id)
+        };
+    }
+    flags.extend(lvr_audit_flags(&prep));
 
     // ISSUE-KVD-CLI-B78ED5 finding C1 — FAIL CLOSED on an empty profile_id.
     // Every catalog primitive is credential-bound (`tool_requires_vault`), so
@@ -914,9 +1089,48 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
         }
     }
 
+    // REQ-KVD-11F906 D8(b) / O8 — input guard: a free-text field that rides
+    // through the broker (commit message, body, title, notes, reason) must not
+    // carry the LITERAL value of a local variable. Checked on the original
+    // arguments; a reference there is refused later as unbounded.
+    if let Some(known) = ctx.lvr.known_values(&ctx.vault)
+        && let Some(key) = free_text_hit(&known, &arguments)
+    {
+        flags.push(FLAG_LVR_DENIED.to_string());
+        flags.push(format!("lvr:{key}"));
+        let err = KvendraError::LocalVar {
+            code: "lvr_value_in_free_text",
+            key: key.clone(),
+        };
+        let _ = record_audit(
+            &ctx,
+            &arguments,
+            name,
+            &profile_id,
+            &action,
+            &flags,
+            true,
+            None,
+            Some(&err),
+        )
+        .await;
+        return lvr_error_response(id, "lvr_value_in_free_text", &key);
+    }
+
     // Allowlist enforcement (when a profile metadata + allowlist exists).
+    // REQ-KVD-11F906 D4 — evaluated on the RESOLVED arguments (AC-LVR-2),
+    // followed by the bounded-position check of every substitution (D3).
     if !profile_id.is_empty() {
-        match enforce_allowlist(&ctx, &profile_id, name, &action, &arguments).await {
+        match enforce_allowlist(
+            &ctx,
+            &profile_id,
+            name,
+            &action,
+            &prep.resolved,
+            &prep.sites,
+        )
+        .await
+        {
             Ok(MigrationOutcome::Unchanged) | Ok(MigrationOutcome::Migrated) => {}
             Err(KvendraError::AllowlistTampered(pid)) => {
                 flags.push("allowlist_tampered_detected".into());
@@ -943,6 +1157,26 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
                     format!("allowlist for profile '{pid}' has been tampered"),
                     data,
                 );
+            }
+            Err(KvendraError::LocalVar { code, key }) => {
+                flags.push(FLAG_LVR_DENIED.to_string());
+                let err = KvendraError::LocalVar {
+                    code,
+                    key: key.clone(),
+                };
+                let _ = record_audit(
+                    &ctx,
+                    &arguments,
+                    name,
+                    &profile_id,
+                    &action,
+                    &flags,
+                    true,
+                    None,
+                    Some(&err),
+                )
+                .await;
+                return lvr_error_response(id, code, &key);
             }
             Err(e) => {
                 // REQ-KVD-CLI-002 / ISSUE-023+033 — emit the canonical flag
@@ -977,8 +1211,20 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
     // model). Se evalúa entre el enforcement de la allowlist y el record_audit
     // Started: si la allowlist permite y el modo del approval bloquea, NO se
     // emite Started (sólo una row Error con flag estructurada).
-    let (approval_decision, approval_outcome) =
-        approval::check(&ctx, name, &profile_id, &action, &arguments).await;
+    //
+    // REQ-KVD-11F906 O6 — the human approves what will actually run: the
+    // prompt (TTY / OS popup, never MCP) shows the RESOLVED arguments plus the
+    // value of every substituted variable.
+    let lvr_note = approval_lvr_note(&prep);
+    let (approval_decision, approval_outcome) = approval::check(
+        &ctx,
+        name,
+        &profile_id,
+        &action,
+        &prep.resolved,
+        lvr_note.as_deref(),
+    )
+    .await;
     // ISSUE-KVD-CLI-705EF0 — every row past this point records the effective
     // approval mode, its source, and any env divergence from the signed mode.
     flags.extend(approval_outcome.audit_flags().into_iter().map(String::from));
@@ -1171,7 +1417,7 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
     .await
     .unwrap_or_default();
 
-    let outcome = invoke_primitive(name, &arguments, &ctx.vault, secret.as_ref()).await;
+    let outcome = invoke_primitive(name, &prep.resolved, &ctx.vault, secret.as_ref()).await;
     drop(secret); // explicit drop → ZeroizeOnDrop fires.
 
     let (status, severity) = match &outcome {
@@ -1190,7 +1436,10 @@ async fn tools_call(id: Option<Value>, params: Value, ctx: Arc<ServerContext>) -
     let (err_code, err_msg) = match &outcome {
         Err(e) => {
             let (code, msg) = crate::audit::error_code::from_error(e);
-            (Some(code.as_str().to_string()), Some(msg))
+            (
+                Some(code.as_str().to_string()),
+                Some(scrub_audit_message(&ctx, msg)),
+            )
         }
         Ok(_) => (None, None),
     };
@@ -1290,7 +1539,10 @@ async fn record_audit(
     let (error_code, error_message) = match (failed_pre_dispatch, error) {
         (true, Some(e)) => {
             let (code, msg) = crate::audit::error_code::from_error(e);
-            (Some(code.as_str().to_string()), Some(msg))
+            (
+                Some(code.as_str().to_string()),
+                Some(scrub_audit_message(ctx, msg)),
+            )
         }
         _ => (None, None),
     };
@@ -1316,6 +1568,62 @@ async fn record_audit(
         error_message,
     };
     w.record(event).await
+}
+
+/// REQ-KVD-11F906 D5 — the audit `error_message` goes through the same
+/// local-vars filter as the wire (no local value in an audit row's message).
+fn scrub_audit_message(ctx: &ServerContext, msg: String) -> String {
+    match ctx.lvr.known_values(&ctx.vault) {
+        Some(known) => known.scrub_str(&msg).0,
+        None => msg,
+    }
+}
+
+/// Free-text fields guarded by D8(b): inner `args.{message, body, title,
+/// notes, description}` and the top-level `reason` of the escape hatch.
+const FREE_TEXT_FIELDS: &[&str] = &["message", "body", "title", "notes", "description"];
+
+/// First key whose literal value appears in a free-text field, if any.
+fn free_text_hit(known: &crate::vars::filter::KnownValues, arguments: &Value) -> Option<String> {
+    let inner = arguments.get("args");
+    let mut texts: Vec<String> = Vec::new();
+    for f in FREE_TEXT_FIELDS {
+        if let Some(v) = inner.and_then(|a| a.get(*f)) {
+            texts.push(match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            });
+        }
+    }
+    if let Some(r) = arguments.get("reason").and_then(Value::as_str) {
+        texts.push(r.to_string());
+    }
+    texts
+        .iter()
+        .find_map(|t| known.contains_any(t).into_iter().next().map(|(k, _)| k))
+}
+
+/// O6 — human-channel note listing the resolved value of every substituted
+/// variable (shown by the approval prompt; never sent over MCP).
+fn approval_lvr_note(prep: &crate::vars::resolve::Prepared) -> Option<String> {
+    if prep.sites.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for site in &prep.sites {
+        if let Some(v) = prep.resolved.pointer(&site.pointer).and_then(Value::as_str) {
+            let p = format!(
+                "{}={} ({})",
+                site.key,
+                v,
+                site.pointer.trim_start_matches('/')
+            );
+            if !parts.contains(&p) {
+                parts.push(p);
+            }
+        }
+    }
+    Some(format!("local vars: {}", parts.join("; ")))
 }
 
 /// Map a [`KvendraError`] surfaced by `enforce_allowlist` (or any other
@@ -1347,6 +1655,7 @@ async fn enforce_allowlist(
     primitive: &str,
     operation: &str,
     arguments: &Value,
+    lvr_sites: &[crate::vars::resolve::LvrSite],
 ) -> KvendraResult<MigrationOutcome> {
     let path = ctx.vault.checked_profile_allowlist_path(profile_id)?;
     if !path.exists() {
@@ -1421,6 +1730,9 @@ async fn enforce_allowlist(
     }
     allowlist_validate(&spec)?;
     allowlist_check(&spec, primitive, operation, arguments)?;
+    // REQ-KVD-11F906 D3 — every substitution must sit in a field the signed
+    // allowlist bounds (AC-LVR-7).
+    crate::vars::position::check(&spec, primitive, operation, arguments, lvr_sites)?;
     Ok(MigrationOutcome::Unchanged)
 }
 
@@ -1543,6 +1855,7 @@ mod tests {
             session: None,
             workspace_id: None,
             unsafe_usage: Default::default(),
+            lvr: Default::default(),
         };
         (dir, ctx)
     }
@@ -1561,7 +1874,7 @@ mod tests {
             "kvendra.shell",
             "run",
             &serde_json::json!({ "operation": "run", "args": { "binary": "echo", "argv": ["echo", "hi"] } }),
-        )
+            &[],        )
         .await;
         assert!(
             matches!(res, Ok(MigrationOutcome::Unchanged)),
@@ -1586,6 +1899,7 @@ mod tests {
             "kvendra.shell",
             "run",
             &serde_json::json!({ "argv": ["echo", "hi"] }),
+            &[],
         )
         .await;
         match res {
@@ -1618,7 +1932,7 @@ mod tests {
             "kvendra.shell",
             "run",
             &serde_json::json!({ "operation": "run", "args": { "binary": "echo", "argv": ["echo", "hi"] } }),
-        )
+            &[],        )
         .await;
         assert!(
             matches!(res, Err(KvendraError::AllowlistTampered(ref pid)) if pid == "p"),
@@ -1657,6 +1971,7 @@ mod tests {
             session: None,
             workspace_id: None,
             unsafe_usage: Default::default(),
+            lvr: Default::default(),
         };
         let res = enforce_allowlist(
             &ctx,
@@ -1664,7 +1979,7 @@ mod tests {
             "kvendra.shell",
             "run",
             &serde_json::json!({ "operation": "run", "args": { "binary": "echo", "argv": ["echo", "hi"] } }),
-        )
+            &[],        )
         .await;
         assert!(
             matches!(res, Err(KvendraError::MissingAllowlist(ref pid)) if pid == "p"),
@@ -1761,6 +2076,7 @@ mod tests {
             session: None,
             workspace_id: None,
             unsafe_usage: Default::default(),
+            lvr: Default::default(),
         };
 
         super::try_self_heal_vault(&ctx);
@@ -1805,6 +2121,7 @@ mod tests {
             session: None,
             workspace_id: None,
             unsafe_usage: Default::default(),
+            lvr: Default::default(),
         }
     }
 
@@ -1896,6 +2213,7 @@ mod tests {
             session: None,
             workspace_id: None,
             unsafe_usage: Default::default(),
+            lvr: Default::default(),
         };
 
         // Capture tracing events emitted during the self-heal call.
@@ -2004,6 +2322,7 @@ mod tests {
             session: None,
             workspace_id: None,
             unsafe_usage: Default::default(),
+            lvr: Default::default(),
         };
 
         #[derive(Default)]
@@ -2084,6 +2403,7 @@ mod tests {
             session: None,
             workspace_id: None,
             unsafe_usage: Default::default(),
+            lvr: Default::default(),
         });
 
         let resp = super::tools_call(
@@ -2152,6 +2472,7 @@ mod tests {
             session: None,
             workspace_id: None,
             unsafe_usage: Default::default(),
+            lvr: Default::default(),
         });
 
         let resp = super::tools_call(
@@ -2220,6 +2541,7 @@ mod tests {
             session: None,
             workspace_id: None,
             unsafe_usage: Default::default(),
+            lvr: Default::default(),
         });
 
         let resp = super::tools_call(
@@ -2361,6 +2683,7 @@ mod tests {
             session: None,
             workspace_id: None,
             unsafe_usage: Default::default(),
+            lvr: Default::default(),
         };
 
         super::try_self_heal_vault(&ctx);
@@ -2415,6 +2738,7 @@ mod tests {
             session: None,
             workspace_id: None,
             unsafe_usage: Default::default(),
+            lvr: Default::default(),
         };
         assert!(
             ctx.audit_writer().is_none(),
@@ -2471,6 +2795,7 @@ mod tests {
             session: None,
             workspace_id: None,
             unsafe_usage: Default::default(),
+            lvr: Default::default(),
         };
 
         // Trigger self-heal (sync) → writer should be lazy-spawned.

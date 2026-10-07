@@ -53,8 +53,29 @@ pub enum AuditErrorCode {
     InvalidArgs,
     /// The requested primitive is not built into this binary.
     PrimitiveNotImplemented,
+    /// A local-variable (`{{lvr:key}}`) refusal (REQ-KVD-11F906). Carries the
+    /// canonical `LVR_*` string (see [`lvr_audit_code`]).
+    LocalVar(&'static str),
     /// Catch-all for any failure we do not classify more precisely.
     RuntimeError,
+}
+
+/// Map an `lvr_*` / `vars_*` / `cfg_ref_*` error code to its closed
+/// SCREAMING_SNAKE_CASE audit code (REQ-KVD-11F906).
+pub fn lvr_audit_code(code: &str) -> &'static str {
+    match code {
+        "lvr_vault_locked" => "LVR_VAULT_LOCKED",
+        "lvr_undefined" => "LVR_UNDEFINED",
+        "lvr_unverified" => "LVR_UNVERIFIED",
+        "lvr_type_invalid" => "LVR_TYPE_INVALID",
+        "lvr_path_not_canonical" => "LVR_PATH_NOT_CANONICAL",
+        "lvr_position_unbounded" => "LVR_POSITION_UNBOUNDED",
+        "lvr_profile_not_in_vault" => "LVR_PROFILE_NOT_IN_VAULT",
+        "lvr_rate_limited" => "LVR_RATE_LIMITED",
+        "lvr_value_in_free_text" => "LVR_VALUE_IN_FREE_TEXT",
+        "cfg_ref_not_resolvable_by_broker" => "LVR_CFG_REF_NOT_RESOLVABLE",
+        _ => "LVR_ERROR",
+    }
 }
 
 impl AuditErrorCode {
@@ -76,6 +97,7 @@ impl AuditErrorCode {
             AuditErrorCode::RateLimited => "RATE_LIMITED",
             AuditErrorCode::InvalidArgs => "INVALID_ARGS",
             AuditErrorCode::PrimitiveNotImplemented => "PRIMITIVE_NOT_IMPLEMENTED",
+            AuditErrorCode::LocalVar(code) => code,
             AuditErrorCode::RuntimeError => "RUNTIME_ERROR",
         }
     }
@@ -107,6 +129,7 @@ impl AuditErrorCode {
             KvendraError::BrokerUnreachable(_) => AuditErrorCode::NetworkError,
             KvendraError::InvalidArgs(_) => AuditErrorCode::InvalidArgs,
             KvendraError::PrimitiveNotImplemented(_) => AuditErrorCode::PrimitiveNotImplemented,
+            KvendraError::LocalVar { code, .. } => AuditErrorCode::LocalVar(lvr_audit_code(code)),
             KvendraError::Http(msg) | KvendraError::PrimitiveFailed { operation: msg, .. } => {
                 classify_message(msg)
             }
@@ -224,6 +247,17 @@ mod tests {
         let e = KvendraError::Http(big);
         let (_c, msg) = from_error(&e);
         assert!(msg.chars().count() <= MAX_ERROR_MESSAGE_LEN);
+    }
+
+    #[test]
+    fn local_var_maps_to_lvr_code() {
+        let e = KvendraError::LocalVar {
+            code: "lvr_unverified",
+            key: "ws".into(),
+        };
+        let (code, msg) = from_error(&e);
+        assert_eq!(code.as_str(), "LVR_UNVERIFIED");
+        assert_eq!(msg, "lvr_unverified: ws");
     }
 
     #[test]

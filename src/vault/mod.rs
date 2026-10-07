@@ -13,7 +13,7 @@ use crate::error::{KvendraError, KvendraResult};
 use crate::vault::blob::Blob;
 use crate::vault::crypto::{NONCE_LEN, open as aes_open, random_nonce, seal as aes_seal};
 use crate::vault::kdf::{KdfParams, derive, random_salt};
-use crate::vault::session::{SessionKey, VaultStateKind};
+use crate::vault::session::{DerivedSubKey, SessionKey, VaultStateKind};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,6 +130,11 @@ impl Vault {
 
     pub fn audit_db_path(&self) -> PathBuf {
         self.home.join("audit.db")
+    }
+
+    /// Path of the local-vars blob (REQ-KVD-11F906 D1).
+    pub fn vars_blob_path(&self) -> PathBuf {
+        self.home.join("vars.blob")
     }
 
     /// Path of the master-password sentinel blob (used to detect bad password).
@@ -508,6 +513,42 @@ impl Vault {
         let g = self.session.lock().expect("session mutex poisoned");
         let session = g.as_ref().ok_or(KvendraError::VaultLocked)?;
         Ok(session.config_hmac_key()?.to_vec())
+    }
+
+    /// Get the local-vars encryption sub-key (HKDF from session key). Errors if
+    /// locked. REQ-KVD-11F906 D1 — seals `vars.blob`.
+    pub fn local_vars_key(&self) -> KvendraResult<DerivedSubKey> {
+        let g = self.session.lock().expect("session mutex poisoned");
+        let session = g.as_ref().ok_or(KvendraError::VaultLocked)?;
+        Ok(session.local_vars_key()?.clone())
+    }
+
+    /// Re-derive the local-vars sub-key from the master password without
+    /// touching the in-memory session, verifying the password against this
+    /// vault's sentinel first. Symmetric to
+    /// [`Vault::audit_hmac_key_from_password`]; used by the backup restore to
+    /// re-seal a restored `vars.blob` in staging (REQ-KVD-11F906, AC-LVR-6).
+    pub fn local_vars_key_from_password(&self, password: &[u8]) -> KvendraResult<DerivedSubKey> {
+        use crate::vault::session::{HKDF_INFO_LOCAL_VARS, hkdf_expand};
+        let path = self.sentinel_path();
+        if !path.exists() {
+            return Err(KvendraError::Vault(
+                "vault not initialized (run `kvendra init` first)".into(),
+            ));
+        }
+        let raw = std::fs::read_to_string(&path)?;
+        let blob = Blob::from_json(&raw)?;
+        let derived = derive(password, &blob.kdf)?;
+        let mut nonce = [0u8; NONCE_LEN];
+        if blob.nonce.len() != NONCE_LEN {
+            return Err(KvendraError::Vault("sentinel nonce length invalid".into()));
+        }
+        nonce.copy_from_slice(&blob.nonce);
+        let pt = aes_open(derived.as_bytes(), &nonce, &blob.ciphertext)?;
+        if pt != b"kvendra-sentinel-v1" {
+            return Err(KvendraError::InvalidMasterPassword);
+        }
+        Ok(hkdf_expand(derived.as_bytes(), HKDF_INFO_LOCAL_VARS))
     }
 
     /// Re-derive the audit-HMAC sub-key from the master password without

@@ -23,6 +23,7 @@ pub mod recover;
 pub mod secret;
 pub mod session_info;
 pub mod unlock;
+pub mod vars;
 pub mod workspace;
 
 use clap::{Parser, Subcommand};
@@ -100,6 +101,11 @@ pub enum Commands {
     /// Internal: verify a bypass grant from a JSON stdin request. Exit 0 if
     /// the grant applies, 2 (fail-closed) otherwise. Consumed by the hook.
     VerifyGrant,
+    /// Local variables `{{lvr:key}}` (REQ-KVD-11F906): values per machine,
+    /// written only by a human on a real TTY; `list`/`status`/`scan` never
+    /// print values.
+    #[command(subcommand)]
+    Vars(vars::VarsCommand),
 }
 
 #[derive(Debug, clap::Args)]

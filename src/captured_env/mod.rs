@@ -33,4 +33,4 @@ mod tty_windows;
 pub use ancestry::{
     AncestorInfo, KNOWN_MCP_CLIENT_NAMES, detect_mcp_client_ancestors, walk_ancestors,
 };
-pub use tty::{TtyHandle, UnlockRejection, ensure_real_terminal};
+pub use tty::{TtyHandle, UnlockRejection, VALUE_CONSOLE_UNSUPPORTED, ensure_real_terminal};

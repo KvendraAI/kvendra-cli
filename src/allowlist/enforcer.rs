@@ -96,6 +96,26 @@ pub fn check(
     check_args(primitive, operation, constraints, args)
 }
 
+/// The constraints of `(primitive, operation)` in `spec`, or `None` when the
+/// primitive or the operation is not allowlisted. Same lookup `check` does;
+/// exposed for the local-vars position check (REQ-KVD-11F906 D3), which must
+/// see the constraint that bounds each substituted field.
+pub fn operation_constraints<'a>(
+    spec: &'a ProfileSpec,
+    primitive: &str,
+    operation: &str,
+) -> Option<&'a OperationConstraints> {
+    spec.allowlist
+        .primitives
+        .iter()
+        .find(|p| p.name == primitive)?
+        .operations
+        .iter()
+        .flat_map(|m| m.iter())
+        .find(|(name, _)| name.as_str() == operation)
+        .map(|(_, c)| c)
+}
+
 /// Inner-payload accessor.
 ///
 /// The MCP canonical envelope is `{profile_id, operation, args:{...}}`. All
@@ -633,7 +653,7 @@ pub(crate) fn regex_match_url(pattern: &str, candidate: &str) -> bool {
 
 /// Full-string regex match (auto-wraps the pattern with `^...$` if the user
 /// did not). Intended for `tag_pattern` and `cwd_pattern`.
-fn regex_full_match(pattern: &str, candidate: &str) -> bool {
+pub(crate) fn regex_full_match(pattern: &str, candidate: &str) -> bool {
     let normalized = if pattern.starts_with('^') && pattern.ends_with('$') {
         pattern.to_string()
     } else {
@@ -822,7 +842,7 @@ fn normalize_repo_host(s: &str) -> String {
 /// - a special `*` wildcard token that matches any single argv slot.
 ///
 /// The argv must have **the same length** as the template (D2 — strict).
-fn argv_matches_template(argv: &[&str], tpl: &ArgvConstraint) -> bool {
+pub(crate) fn argv_matches_template(argv: &[&str], tpl: &ArgvConstraint) -> bool {
     if argv.len() != tpl.allowed.len() {
         return false;
     }

@@ -184,6 +184,70 @@ impl TtyHandle {
     }
 }
 
+/// Error text when a local-variable value would need a console this build
+/// cannot open as a real terminal (Windows today). Never prints the value.
+pub const VALUE_CONSOLE_UNSUPPORTED: &str =
+    "no soportado en esta plataforma: requiere una consola real";
+
+#[cfg(windows)]
+fn value_console_unsupported() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Unsupported, VALUE_CONSOLE_UNSUPPORTED)
+}
+
+impl TtyHandle {
+    /// Read one line from the controlling terminal WITH echo (REQ-KVD-11F906:
+    /// only ever from the real TTY file — there is no stdin/stderr fallback on
+    /// any platform; on Windows it fails with
+    /// [`VALUE_CONSOLE_UNSUPPORTED`].
+    /// the value of a local variable is not a secret, the human sees what
+    /// they type). The prompt goes to the terminal, never to stdout.
+    pub fn read_line(&self, prompt: &str) -> std::io::Result<String> {
+        #[cfg(unix)]
+        {
+            use std::io::{BufRead, BufReader};
+            let mut writer = self.inner.file.try_clone()?;
+            writer.write_all(prompt.as_bytes())?;
+            writer.flush()?;
+            let reader = self.inner.file.try_clone()?;
+            let mut buf = BufReader::new(reader);
+            let mut line = String::new();
+            buf.read_line(&mut line)?;
+            if line.ends_with('\n') {
+                line.pop();
+            }
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            Ok(line)
+        }
+        #[cfg(windows)]
+        {
+            // Security review blocker (REQ-KVD-11F906): no stdin fallback for
+            // a value — without a real console handle, refuse.
+            let _ = (&self.inner, prompt);
+            Err(value_console_unsupported())
+        }
+    }
+
+    /// Write `text` to the controlling terminal ONLY (never stdout, which an
+    /// agent may have captured). Used by `kvendra vars reveal|verify`.
+    pub fn write_tty(&self, text: &str) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let mut writer = self.inner.file.try_clone()?;
+            writer.write_all(text.as_bytes())?;
+            writer.flush()
+        }
+        #[cfg(windows)]
+        {
+            // Security review blocker (REQ-KVD-11F906): a value is NEVER
+            // written to stderr/stdout as a fallback.
+            let _ = (&self.inner, text);
+            Err(value_console_unsupported())
+        }
+    }
+}
+
 /// Run the 3-layer defense and return a `TtyHandle` on success. The caller
 /// (`cli::unlock`) reads the password from the handle, not from `stdin`.
 pub fn ensure_real_terminal() -> Result<TtyHandle, UnlockRejection> {

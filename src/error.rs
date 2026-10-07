@@ -207,8 +207,23 @@ pub enum KvendraError {
     #[error("session token store error: {0}")]
     SessionStore(String),
 
+    /// Local-variable (`{{lvr:key}}`) refusal or failure (REQ-KVD-11F906).
+    /// `code` is the closed `lvr_*` / `vars_*` / `cfg_ref_*` vocabulary;
+    /// `key` is the variable key (may be empty). The Display is ONLY
+    /// `code[: key]` — never the variable's value.
+    #[error("{code}{}", key_suffix(.key))]
+    LocalVar { code: &'static str, key: String },
+
     #[error("internal error")]
     Internal,
+}
+
+fn key_suffix(key: &str) -> String {
+    if key.is_empty() {
+        String::new()
+    } else {
+        format!(": {key}")
+    }
 }
 
 impl From<reqwest::Error> for KvendraError {
