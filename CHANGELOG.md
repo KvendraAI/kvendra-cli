@@ -7,6 +7,76 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-07 — feat: local variables (`{{lvr:key}}`) + `kvendra secret show-allowlist`
+
+Feature release. Adds local per-machine variables: declared in the KB,
+valued only on the local machine, and substituted by the broker inside its
+primitives without ever returning a value to the MCP caller
+(REQ-KVD-11F906, phase F1). Also adds a read-only way to inspect an
+allowlist without reading the vault directory.
+
+### Scope — what this release does NOT close
+
+This release hardens the new `vars.blob` and the broker substitution path
+only. It does **not** mean the whole vault is hardened:
+
+- **ISSUE-KVD-CLI-571DDB is still open**: secret blobs are still sealed
+  without AAD.
+- **ISSUE-KVD-CLI-3B04DE is still open**: `kvendra secret set-allowlist`
+  still does not require a real TTY.
+- **Residual C3 (documented, accepted)**: a process running as the same uid
+  can roll `vars.blob` back to one of its rotated copies (or to any older
+  blob it kept); the AEAD authenticates content, not freshness. The broker
+  still refuses unverified values and re-validates every value at use time.
+  The broader C3 boundary (unlocked session blob) is unchanged.
+- **The output filter is a guarantee for literal values and only a brake for
+  encoded ones**: it removes literal occurrences of local values from broker
+  results and errors, but a value transformed by the executed command
+  (base64, hex, split, etc.) is not detected.
+- **Windows**: `kvendra vars set`, `reveal` and `verify` are unsupported until
+  a real console path exists.
+- The happy path of `kvendra vars set/reveal/verify` with a real TTY is not
+  covered by the automated suite (it needs an interactive terminal); it is
+  verified manually by the owner.
+
+### Added
+
+- **Local variables `{{lvr:key}}`** (`src/vars/`):
+  - `vars.blob`: AES-256-GCM under a dedicated HKDF sub-key
+    (`kvendra/local-vars-key/v1`) and a fixed AAD (`kvendra/local-vars/v1` +
+    format version), so it is not interchangeable with secret blobs. Atomic
+    `0600` writes with three rotated local copies.
+  - `kvendra vars set|unset|reveal|verify` require a real TTY and the master
+    password prompt (no `--password-stdin`, no `KVENDRA_PASSWORD`).
+    `kvendra vars list|status|scan` never print values.
+- **Broker substitution**: references are resolved before the `profile_id`
+  gates; the allowlist and a new bounded-position check run on the resolved
+  arguments (trivial `cwd_pattern` and interpreter binaries are rejected);
+  per-type validation; per-key rate limit; a single output filter over
+  results and errors; the approval prompt shows the resolved cwd/host/profile
+  to the human only.
+- **Audit**: records the lvr key (plus resolved cwd/profile/host, a hash
+  otherwise); `kvendra audit` re-symbolises local values when the vault is
+  unlocked.
+- **Backup** includes `vars.blob`; a restore marks every value unverified.
+- **Capabilities manifest**: `features: [lvr_substitution/v1]` and an `lvr`
+  block.
+- **`kvendra secret show-allowlist <profile_id>`**: prints a profile's
+  allowlist YAML and its HMAC status (`VALID` / `TAMPERED` / `NO_HMAC` /
+  `UNVERIFIED` when the vault is locked). Reuses the active session, never
+  prompts for a password and never opens the secret blob. A YAML with a valid
+  HMAC copied from another profile reports `TAMPERED`, as the broker
+  enforces. Exit code 1 on `TAMPERED` / `NO_HMAC`. Its output (text and
+  `--json`) goes through the same known-values filter as `kvendra audit` when
+  the vault is unlocked; the HMAC is still computed over the original YAML.
+
+### Tests
+
+- New suites: `tests/lvr_cli.rs`, `tests/lvr_no_leak.rs`,
+  `tests/lvr_substitution.rs`, `tests/lvr_vault.rs`,
+  `tests/secret_show_allowlist.rs`, plus the shared vectors
+  `tests/fixtures/local-refs.vectors.json`.
+
 ## [0.6.6] — 2026-10-06 — fix(security): profile_id path traversal in `kvendra secret` and the vault
 
 Security release. `kvendra secret` subcommands passed `profile_id` straight
