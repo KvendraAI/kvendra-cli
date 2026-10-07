@@ -1,0 +1,3 @@
+# Conformance fixtures are pinned by sha256 (byte-for-byte copies of core):
+# never let git rewrite their line endings on checkout (Windows CRLF).
+tests/fixtures/*.json -text

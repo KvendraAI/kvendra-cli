@@ -27,6 +27,15 @@ fn kvendra(home: &std::path::Path) -> Command {
         .env("HOME", home)
         .env("KVENDRA_HOME", home.join("kvhome"))
         .env("RUST_LOG", "off");
+    // Windows: the session token store binds the wrap key to COMPUTERNAME and
+    // USERNAME (src/session/wrap_key.rs), and SystemRoot is needed by any
+    // Windows process. Pass the test process's own values through.
+    #[cfg(windows)]
+    for var in ["COMPUTERNAME", "USERNAME", "SystemRoot"] {
+        if let Some(v) = std::env::var_os(var) {
+            c.env(var, v);
+        }
+    }
     c
 }
 
@@ -43,11 +52,18 @@ fn human_commands_refuse_without_a_real_tty() {
         &["vars", "verify", "--all"],
     ];
     for args in cases {
+        // On Windows the value commands (set/reveal/verify) refuse up front
+        // as unsupported, before the TTY guard; `unset` still hits the guard.
+        let expected = if cfg!(windows) && args[1] != "unset" {
+            "vars_unsupported_platform"
+        } else {
+            "vars_rejected_"
+        };
         // Captured stdio (assert_cmd pipes stdin/stdout) → refused.
         let out = kvendra(dir.path()).args(*args).output().unwrap();
         assert!(!out.status.success(), "{args:?} must fail");
         let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains("vars_rejected_"), "{args:?}: {err}");
+        assert!(err.contains(expected), "{args:?}: {err}");
         // KVENDRA_PASSWORD changes nothing.
         let out = kvendra(dir.path())
             .args(*args)
@@ -55,7 +71,7 @@ fn human_commands_refuse_without_a_real_tty() {
             .output()
             .unwrap();
         assert!(!out.status.success());
-        assert!(String::from_utf8_lossy(&out.stderr).contains("vars_rejected_"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains(expected));
     }
     // There is no --password-stdin flag (clap rejects it).
     let out = kvendra(dir.path())
