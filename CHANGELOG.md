@@ -70,6 +70,14 @@ only. It does **not** mean the whole vault is hardened:
   `--json`) goes through the same known-values filter as `kvendra audit` when
   the vault is unlocked; the HMAC is still computed over the original YAML.
 
+### Fixed
+
+- **Windows path validation for `path`-typed local variables**: the verbatim
+  disk prefix (`\\?\`) returned by `canonicalize()` is stripped (verbatim UNC
+  paths stay rejected), and `\` plus the drive-letter `:` are accepted only
+  where a Windows path needs them (NTFS alternate data streams stay blocked).
+  Unix is unchanged.
+
 ### Tests
 
 - New suites: `tests/lvr_cli.rs`, `tests/lvr_no_leak.rs`,
