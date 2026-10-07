@@ -163,6 +163,12 @@ async fn no_local_value_in_any_response_across_the_8_primitives() {
 }
 
 /// The positive path really executes and its output is re-symbolized (O4).
+///
+/// Not on Windows: the runner's `pwd` (Git Bash / MSYS) prints the cwd as
+/// `/c/Users/...`, an alternate encoding of the stored `C:\Users\...` value.
+/// The output filter guarantees literal occurrences only (Security N2), and
+/// `kvendra vars set` is unsupported on Windows anyway.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn bounded_cwd_executes_and_output_is_resymbolized() {
     let f = fixture(YAML).await;
