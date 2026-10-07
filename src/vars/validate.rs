@@ -7,15 +7,71 @@
 //! `` ;|&$`<>(){}[]*?!'"\ ``, no `{{`, and bounded length (4096 for paths,
 //! 1024 otherwise). The broker never invokes a shell (every primitive spawns
 //! through `spawn::hardened_command`), so these rules are defence in depth.
+//!
+//! Windows: `std::fs::canonicalize` returns verbatim paths (`\\?\C:\...`),
+//! whose `\` and `?` tripped the metacharacter rule, so every real path was
+//! refused with `lvr_type_invalid` (CI `test (windows-latest)`). Paths are now
+//! canonicalized through [`canonical`] (drops the `\\?\` prefix of a plain
+//! drive path only) and, on Windows only, a path value may contain `\` (the
+//! native separator) and `:` only as the drive designator `X:`.
 
 use super::VarType;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 const MAX_PATH_LEN: usize = 4096;
 const MAX_OTHER_LEN: usize = 1024;
 const SHELL_META: &[char] = &[
     ';', '|', '&', '$', '`', '<', '>', '(', ')', '{', '}', '[', ']', '*', '?', '!', '\'', '"', '\\',
 ];
+
+/// Windows only: `\` is the native path separator, so it is legitimate in a
+/// `Path` value (every other type, and every other platform, keeps refusing
+/// it).
+#[cfg(windows)]
+fn path_sep_ok(t: VarType, c: char) -> bool {
+    t == VarType::Path && c == '\\'
+}
+
+#[cfg(not(windows))]
+fn path_sep_ok(_t: VarType, _c: char) -> bool {
+    false
+}
+
+/// `std::fs::canonicalize`, minus the Windows verbatim prefix. On Windows the
+/// std canonicalizer always yields `\\?\C:\...`; the prefix is stripped ONLY
+/// for a drive path (`\\?\X:\`), where the verbatim and plain forms name the
+/// same file. Verbatim UNC (`\\?\UNC\...`) and other verbatim forms are kept
+/// as-is, so they still carry `?` and stay refused (conservative). No-op on
+/// other platforms.
+fn canonical(p: &Path) -> std::io::Result<PathBuf> {
+    let c = std::fs::canonicalize(p)?;
+    #[cfg(windows)]
+    {
+        // Single let-chain (edition 2024): avoids clippy::collapsible_if.
+        if let Some(rest) = c.to_str().and_then(|s| s.strip_prefix(r"\\?\"))
+            && let [d, b':', b'\\', ..] = rest.as_bytes()
+            && d.is_ascii_alphabetic()
+        {
+            return Ok(PathBuf::from(rest));
+        }
+    }
+    Ok(c)
+}
+
+/// Windows only: `:` is allowed solely as the drive designator (`X:` at the
+/// start); anywhere else it would name an NTFS alternate data stream.
+#[cfg(windows)]
+fn colon_ok(v: &str) -> bool {
+    let b = v.as_bytes();
+    b.iter()
+        .enumerate()
+        .all(|(i, &ch)| ch != b':' || (i == 1 && b[0].is_ascii_alphabetic()))
+}
+
+#[cfg(not(windows))]
+fn colon_ok(_v: &str) -> bool {
+    true
+}
 
 /// Validate `v` for `t`. Returns the normalized value, or the `lvr_*` code.
 pub fn validate(t: VarType, v: &str) -> Result<String, &'static str> {
@@ -29,7 +85,8 @@ pub fn validate(t: VarType, v: &str) -> Result<String, &'static str> {
         || v.contains("{{")
         || v.chars()
             .any(|c| c == '\0' || c.is_whitespace() || c.is_control())
-        || v.chars().any(|c| SHELL_META.contains(&c))
+        || v.chars()
+            .any(|c| SHELL_META.contains(&c) && !path_sep_ok(t, c))
     {
         return Err("lvr_type_invalid");
     }
@@ -62,7 +119,7 @@ pub fn validate(t: VarType, v: &str) -> Result<String, &'static str> {
 /// symlink escape; the value is stored canonical).
 fn validate_path(v: &str) -> Result<String, &'static str> {
     let p = Path::new(v);
-    if !p.is_absolute() || v.contains(',') {
+    if !p.is_absolute() || v.contains(',') || !colon_ok(v) {
         return Err("lvr_type_invalid");
     }
     if p.components()
@@ -70,7 +127,7 @@ fn validate_path(v: &str) -> Result<String, &'static str> {
     {
         return Err("lvr_path_not_canonical");
     }
-    match std::fs::canonicalize(p) {
+    match canonical(p) {
         Ok(c) if c.as_os_str() == p.as_os_str() => Ok(v.to_string()),
         Ok(_) => Err("lvr_path_not_canonical"),
         Err(_) => Err("lvr_path_not_canonical"),
@@ -83,6 +140,7 @@ fn validate_path(v: &str) -> Result<String, &'static str> {
 pub fn final_path_is_canonical(v: &str) -> bool {
     let p = Path::new(v);
     if !p.is_absolute()
+        || !colon_ok(v)
         || p.components()
             .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
     {
@@ -91,7 +149,7 @@ pub fn final_path_is_canonical(v: &str) -> bool {
     let mut cur = Some(p);
     while let Some(c) = cur {
         if c.exists() {
-            return std::fs::canonicalize(c).is_ok_and(|canon| canon.as_path() == c);
+            return canonical(c).is_ok_and(|canon| canon.as_path() == c);
         }
         cur = c.parent();
     }
@@ -191,32 +249,58 @@ mod tests {
 
     #[test]
     fn paths() {
+        // Real tempdir paths in the platform's native form (on Windows the
+        // canonical form without the `\\?\` prefix — see `canonical`).
         let d = tempfile::tempdir().unwrap();
-        let canon = d.path().canonicalize().unwrap();
+        let canon = canonical(d.path()).unwrap();
         let real = canon.join("kvd-sentinel-real");
         std::fs::create_dir(&real).unwrap();
         let s = real.to_str().unwrap();
         assert_eq!(validate(VarType::Path, s).unwrap(), s);
+        let up = real.join("..").join("x");
         assert_eq!(
-            validate(VarType::Path, &format!("{s}/../x")),
+            validate(VarType::Path, up.to_str().unwrap()),
             Err("lvr_path_not_canonical")
         );
         assert!(validate(VarType::Path, "relative/x").is_err());
-        assert!(validate(VarType::Path, &format!("{s}/missing")).is_err());
+        let missing = real.join("missing");
+        assert!(validate(VarType::Path, missing.to_str().unwrap()).is_err());
+        // Metacharacters stay refused in a path on every platform.
+        for bad in ["a;b", "a|b", "a$b", "a?b", "a*b"] {
+            let p = real.join(bad);
+            assert_eq!(
+                validate(VarType::Path, p.to_str().unwrap()),
+                Err("lvr_type_invalid"),
+                "{bad}"
+            );
+        }
         #[cfg(unix)]
         {
+            // `\` is not a separator on unix: still a refused metacharacter.
+            let p = format!("{s}/a\\b");
+            assert_eq!(validate(VarType::Path, &p), Err("lvr_type_invalid"));
             let link = canon.join("kvd-sentinel-link");
             std::os::unix::fs::symlink(&real, &link).unwrap();
             assert_eq!(
                 validate(VarType::Path, link.to_str().unwrap()),
                 Err("lvr_path_not_canonical")
             );
-            assert!(!final_path_is_canonical(&format!(
-                "{}/new",
-                link.to_str().unwrap()
-            )));
+            assert!(!final_path_is_canonical(link.join("new").to_str().unwrap()));
         }
-        assert!(final_path_is_canonical(&format!("{s}/not-yet/created")));
-        assert!(!final_path_is_canonical(&format!("{s}/../x")));
+        #[cfg(windows)]
+        {
+            // Native separator accepted, verbatim form refused, `:` only as
+            // the drive designator, `\` still refused outside Path.
+            assert!(!s.starts_with(r"\\?\"), "{s}");
+            assert!(validate(VarType::Path, &format!(r"\\?\{s}")).is_err());
+            let ads = format!("{s}:stream");
+            assert_eq!(validate(VarType::Path, &ads), Err("lvr_type_invalid"));
+            assert!(!final_path_is_canonical(&ads));
+            assert!(validate(VarType::String, r"a\b").is_err());
+        }
+        assert!(final_path_is_canonical(
+            real.join("not-yet").join("created").to_str().unwrap()
+        ));
+        assert!(!final_path_is_canonical(up.to_str().unwrap()));
     }
 }
