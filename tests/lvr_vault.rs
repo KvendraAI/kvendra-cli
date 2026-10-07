@@ -74,7 +74,7 @@ allowlist:
       operations:
         - exec:
             binaries: ["pwd"]
-            cwd_pattern: "^{WS}(/.*)?$"
+            cwd_pattern: "^{WS_RE}(/.*)?$"
             accept_destructive: true
 "#;
 

@@ -78,7 +78,14 @@ pub async fn fixture(yaml: &str) -> Fixture {
         allowlist_hmac_hex: None,
     })
     .unwrap();
-    let yaml = yaml.replace("{WS}", &ws.to_string_lossy());
+    // `{WS_RE}` goes inside a regex (cwd_pattern), `{WS}` is a literal; both sit
+    // in double-quoted YAML scalars, where a Windows `\` would be read as an
+    // escape — so regex-escape first (only for `{WS_RE}`), then YAML-escape.
+    let ws_s = ws.to_string_lossy();
+    let yaml_esc = |v: &str| v.replace('\\', "\\\\");
+    let yaml = yaml
+        .replace("{WS_RE}", &yaml_esc(&regex::escape(&ws_s)))
+        .replace("{WS}", &yaml_esc(&ws_s));
     std::fs::write(v.profile_allowlist_path("p"), &yaml).unwrap();
     let key = v.allowlist_hmac_key().unwrap();
     let mut profile = v.load_profile_meta("p").unwrap();

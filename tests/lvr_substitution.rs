@@ -19,7 +19,7 @@ allowlist:
       operations:
         - exec:
             binaries: ["touch", "ls", "sh", "pwd", "git"]
-            cwd_pattern: "^{WS}(/.*)?$"
+            cwd_pattern: "^{WS_RE}(/.*)?$"
             accept_destructive: true
         - ls_tpl:
             binaries: ["ls"]
@@ -41,7 +41,7 @@ allowlist:
     - name: kvendra.git
       operations:
         - commit:
-            cwd_pattern: "^{WS}(/.*)?$"
+            cwd_pattern: "^{WS_RE}(/.*)?$"
             accept_destructive: true
     - name: kvendra.http
       operations:

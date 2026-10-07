@@ -18,12 +18,12 @@ allowlist:
       operations:
         - exec:
             binaries: ["pwd", "ls", "sh", "kvd-sentinel-missing-binary"]
-            cwd_pattern: "^{WS}(/.*)?$"
+            cwd_pattern: "^{WS_RE}(/.*)?$"
             accept_destructive: true
     - name: kvendra.git
       operations:
         - commit:
-            cwd_pattern: "^{WS}(/.*)?$"
+            cwd_pattern: "^{WS_RE}(/.*)?$"
             accept_destructive: true
     - name: kvendra.github
       operations:
@@ -203,7 +203,7 @@ allowlist:
       operations:
         - exec:
             binaries: ["pwd"]
-            cwd_pattern: "^{WS}/tmp-a$"
+            cwd_pattern: "^{WS_RE}/tmp-a$"
             accept_destructive: true
 "#;
     let f = fixture(yaml).await;
