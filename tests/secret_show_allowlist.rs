@@ -27,6 +27,15 @@ fn kvendra(root: &Path) -> Command {
         .env("HOME", root)
         .env("KVENDRA_HOME", root.join("kvhome"))
         .env("RUST_LOG", "off");
+    // Windows: the session token store binds the wrap key to COMPUTERNAME and
+    // USERNAME (src/session/wrap_key.rs), and SystemRoot is needed by any
+    // Windows process. Pass the test process's own values through.
+    #[cfg(windows)]
+    for var in ["COMPUTERNAME", "USERNAME", "SystemRoot"] {
+        if let Some(v) = std::env::var_os(var) {
+            c.env(var, v);
+        }
+    }
     c
 }
 
