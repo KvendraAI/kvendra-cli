@@ -8,6 +8,7 @@
 //!   - `revoke <profile_id>`
 //!   - `validate <profile_id> | --all`
 //!   - `set-allowlist <profile_id> --file PATH`
+//!   - `show-allowlist <profile_id> [--json]` (YAML + HMAC state, no password)
 
 use crate::allowlist::dsl::OperationConstraints;
 use crate::allowlist::{ProfileSpec, catalog, validate_for_signing};
@@ -35,6 +36,17 @@ pub enum SecretCommand {
     Validate(ValidateArgs),
     /// Set the YAML allowlist for a profile.
     SetAllowlist(SetAllowlistArgs),
+    /// Print a profile's allowlist YAML and whether its HMAC verifies.
+    /// Never asks for the master password, never reads the secret blob.
+    ShowAllowlist(ShowAllowlistArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ShowAllowlistArgs {
+    pub profile_id: String,
+    /// Emit `{"profile_id","hmac","yaml"}` as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -128,6 +140,7 @@ pub async fn run(cmd: SecretCommand) -> KvendraResult<()> {
         SecretCommand::Revoke { profile_id } => revoke(&vault, &profile_id),
         SecretCommand::Validate(args) => validate_cmd(&vault, args),
         SecretCommand::SetAllowlist(args) => set_allowlist(&vault, &home, args),
+        SecretCommand::ShowAllowlist(args) => show_allowlist(&vault, &home, args),
     }
 }
 
@@ -139,6 +152,7 @@ fn validate_cmd_profile_id(cmd: &SecretCommand) -> KvendraResult<()> {
         }
         SecretCommand::Rotate(a) => Some(a.profile_id.as_str()),
         SecretCommand::SetAllowlist(a) => Some(a.profile_id.as_str()),
+        SecretCommand::ShowAllowlist(a) => Some(a.profile_id.as_str()),
         SecretCommand::Validate(a) => a.profile_id.as_deref(),
         SecretCommand::List => None,
     };
@@ -325,6 +339,111 @@ fn set_allowlist(vault: &Vault, home: &Path, args: SetAllowlistArgs) -> KvendraR
     vault.save_profile_meta(&profile)?;
 
     println!("Allowlist for '{}' set (HMAC persisted).", args.profile_id);
+    Ok(())
+}
+
+/// HMAC state of an allowlist as reported by `secret show-allowlist`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowlistHmacState {
+    /// Stored HMAC matches the YAML bytes (and the YAML is bound to this id).
+    Valid,
+    /// Stored HMAC differs, or the YAML declares another `profile_id`.
+    Tampered,
+    /// YAML present but no HMAC stored: the broker refuses it (fail closed).
+    NoHmac,
+    /// Vault locked (no active session): the HMAC could not be checked.
+    Unverified,
+}
+
+impl AllowlistHmacState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Valid => "VALID",
+            Self::Tampered => "TAMPERED",
+            Self::NoHmac => "NO_HMAC",
+            Self::Unverified => "UNVERIFIED",
+        }
+    }
+}
+
+/// Pure core of `show-allowlist`: the HMAC state given an optional sub-key.
+/// `key = None` means the vault is locked → `Unverified` (never a prompt).
+pub fn allowlist_hmac_state(
+    key: Option<&[u8]>,
+    stored_hmac_hex: Option<&str>,
+    profile_id: &str,
+    raw_yaml: &str,
+) -> AllowlistHmacState {
+    let Some(key) = key else {
+        return AllowlistHmacState::Unverified;
+    };
+    let Some(stored) = stored_hmac_hex else {
+        return AllowlistHmacState::NoHmac;
+    };
+    if crate::vault::compute_allowlist_hmac(key, raw_yaml.as_bytes()) != stored {
+        return AllowlistHmacState::Tampered;
+    }
+    // Pentest S1b parity with the enforcer: the HMAC authenticates content,
+    // not WHICH profile; a valid YAML copied from another profile is not VALID.
+    match serde_yaml_ng::from_str::<ProfileSpec>(raw_yaml) {
+        Ok(spec) if spec.profile_id == profile_id => AllowlistHmacState::Valid,
+        _ => AllowlistHmacState::Tampered,
+    }
+}
+
+/// `kvendra secret show-allowlist <profile_id> [--json]`.
+///
+/// Seguridad 2026-10-07: alternativa legítima a leer el vault desde Bash.
+/// The hooks block `cat ~/.kvendra/...`; this subcommand is the supported way
+/// for an agent (or the owner) to SEE an allowlist. The allowlist YAML is not
+/// a secret. The HMAC check reuses the active session blob exactly like
+/// `vars list` (`session::local::load` + `unlock_from_derived_key`): it NEVER
+/// asks for the master password and NEVER opens `secrets/<id>.blob`. With the
+/// vault locked the YAML is still printed, marked as not verified.
+///
+/// Exit code: `0` for VALID / UNVERIFIED, `1` for TAMPERED / NO_HMAC (the
+/// broker would refuse the allowlist).
+fn show_allowlist(vault: &Vault, home: &Path, args: ShowAllowlistArgs) -> KvendraResult<()> {
+    let id = args.profile_id.as_str();
+    let path = vault.checked_profile_allowlist_path(id)?;
+    if !path.exists() {
+        return Err(KvendraError::AllowlistParse(format!(
+            "no allowlist for '{id}' — use `kvendra secret set-allowlist {id} --file <path>`"
+        )));
+    }
+    let raw = std::fs::read_to_string(&path)?;
+    let meta = vault.load_profile_meta(id)?;
+    let session = crate::cli::vars::session_vault(home);
+    let key = session.as_ref().and_then(|v| v.allowlist_hmac_key().ok());
+    let state = allowlist_hmac_state(key.as_deref(), meta.allowlist_hmac_hex.as_deref(), id, &raw);
+    if let Some(v) = session {
+        v.lock();
+    }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({ "profile_id": id, "hmac": state.as_str(), "yaml": raw })
+        );
+    } else {
+        println!("Profile: {id}");
+        match state {
+            AllowlistHmacState::Unverified => {
+                println!("HMAC: no verificado (vault bloqueado)");
+            }
+            s => println!("HMAC: {}", s.as_str()),
+        }
+        println!("---");
+        print!("{raw}");
+        if !raw.ends_with('\n') {
+            println!();
+        }
+    }
+    if matches!(
+        state,
+        AllowlistHmacState::Tampered | AllowlistHmacState::NoHmac
+    ) {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
