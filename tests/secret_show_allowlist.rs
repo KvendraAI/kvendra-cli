@@ -231,3 +231,68 @@ fn hmac_state_core() {
         S::Tampered
     );
 }
+
+const SENTINEL_CWD: &str = "/kvd-sentinel-home/work-7f3a9c";
+
+/// Re-sign profile `p` with a YAML whose `cwd_pattern` holds the sentinel,
+/// and store the sentinel as local variable `ws` in `vars.blob`.
+fn sentinel_allowlist(root: &Path) -> String {
+    let yaml = format!("{YAML}            cwd_pattern: \"^{SENTINEL_CWD}(/.*)?$\"\n");
+    let v = Vault::new(root.join("kvhome"));
+    v.unlock(PASSWORD.as_bytes(), 30).unwrap();
+    std::fs::write(v.profile_allowlist_path("p"), &yaml).unwrap();
+    let key = v.allowlist_hmac_key().unwrap();
+    save_meta(
+        &v,
+        "p",
+        Some(kvendra::vault::compute_allowlist_hmac(
+            &key,
+            yaml.as_bytes(),
+        )),
+    );
+    kvendra::vars::set_var(&v, "ws", kvendra::vars::VarType::String, SENTINEL_CWD, true).unwrap();
+    yaml
+}
+
+/// Seguridad 0.7.0 — the output goes through the same known-values filter as
+/// `kvendra audit`: with the vault unlocked the local value is re-symbolized
+/// as `{{lvr:ws}}`, while the HMAC (computed on the original bytes) stays
+/// VALID.
+#[test]
+fn output_resymbolizes_local_values_hmac_on_original() {
+    let (_d, root) = sandbox(true);
+    sentinel_allowlist(&root);
+    for json in [false, true] {
+        let mut args = vec!["secret", "show-allowlist", "p"];
+        if json {
+            args.push("--json");
+        }
+        let out = kvendra(&root).args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(!s.contains(SENTINEL_CWD), "json={json} leaked: {s}");
+        assert!(s.contains("{{lvr:ws}}"), "json={json}: {s}");
+        if json {
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(v["hmac"], "VALID");
+        } else {
+            assert!(s.contains("HMAC: VALID"), "{s}");
+        }
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(SENTINEL_CWD));
+    }
+}
+
+/// Vault locked → printed as is (same behaviour as `kvendra audit`).
+#[test]
+fn locked_vault_output_is_not_resymbolized() {
+    let (_d, root) = sandbox(false);
+    let yaml = sentinel_allowlist(&root);
+    let out = kvendra(&root)
+        .args(["secret", "show-allowlist", "p", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["hmac"], "UNVERIFIED");
+    assert_eq!(v["yaml"], yaml);
+}

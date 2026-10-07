@@ -419,24 +419,32 @@ fn show_allowlist(vault: &Vault, home: &Path, args: ShowAllowlistArgs) -> Kvendr
     if let Some(v) = session {
         v.lock();
     }
+    // Seguridad 2026-10-07 (0.7.0): the OUTPUT goes through the same
+    // known-values filter of `vars.blob` as `kvendra audit` — a local value
+    // (e.g. a path in a `cwd_pattern`) is re-symbolized as `{{lvr:<key>}}`
+    // with the vault unlocked; with the vault locked it is printed as is,
+    // like audit. The HMAC above was computed on the ORIGINAL bytes; only
+    // the printed copy is filtered.
+    let known = crate::cli::audit::local_known_values(home);
     if args.json {
-        println!(
-            "{}",
-            serde_json::json!({ "profile_id": id, "hmac": state.as_str(), "yaml": raw })
-        );
+        let mut body = serde_json::json!({ "profile_id": id, "hmac": state.as_str(), "yaml": raw });
+        if let Some(k) = known.as_ref() {
+            k.scrub_value(&mut body);
+        }
+        println!("{body}");
     } else {
-        println!("Profile: {id}");
-        match state {
-            AllowlistHmacState::Unverified => {
-                println!("HMAC: no verificado (vault bloqueado)");
-            }
-            s => println!("HMAC: {}", s.as_str()),
+        let status = match state {
+            AllowlistHmacState::Unverified => "no verificado (vault bloqueado)",
+            s => s.as_str(),
+        };
+        let mut text = format!("Profile: {id}\nHMAC: {status}\n---\n{raw}");
+        if !text.ends_with('\n') {
+            text.push('\n');
         }
-        println!("---");
-        print!("{raw}");
-        if !raw.ends_with('\n') {
-            println!();
+        if let Some(k) = known.as_ref() {
+            text = k.scrub_str(&text).0;
         }
+        print!("{text}");
     }
     if matches!(
         state,

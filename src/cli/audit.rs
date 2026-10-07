@@ -195,7 +195,10 @@ async fn run_legacy(args: AuditArgs) -> KvendraResult<()> {
 
 /// Known local values for masking the audit listing (REQ-KVD-11F906 N1).
 /// `None` when the vault is locked for this machine or there are no vars.
-fn local_known_values(home: &std::path::Path) -> Option<crate::vars::filter::KnownValues> {
+/// Also used by `secret show-allowlist` (same filter, no duplicated logic).
+pub(crate) fn local_known_values(
+    home: &std::path::Path,
+) -> Option<crate::vars::filter::KnownValues> {
     let vault = crate::cli::vars::session_vault(home)?;
     let doc = crate::vars::load(&vault).ok()?;
     let known = crate::vars::filter::KnownValues::from_doc(&doc);
