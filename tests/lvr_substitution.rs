@@ -128,7 +128,17 @@ async fn escaped_reference_passes_literally() {
     )
     .await;
     assert_ne!(error_type(&resp).as_deref(), Some("lvr_position_unbounded"));
-    assert!(resp.to_string().contains("\\\\{{lvr:ws}}"), "{resp}");
+    // The mention was NOT substituted: the workspace path never shows up as the
+    // argument `ls` was asked to list.
+    assert!(!resp.to_string().contains("kvd-sentinel-ws'"), "{resp}");
+    if cfg!(windows) {
+        // On Windows the command line is flattened by CreateProcess and the
+        // runner's MSYS `ls` re-parses it (backslash and brace handling), so its
+        // echo of the literal is mangled; the broker still passed it verbatim.
+        assert!(resp.to_string().contains("lvr:ws"), "{resp}");
+    } else {
+        assert!(resp.to_string().contains("\\\\{{lvr:ws}}"), "{resp}");
+    }
 }
 
 #[tokio::test]
