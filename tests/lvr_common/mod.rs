@@ -59,7 +59,7 @@ impl Fixture {
 /// verified), `host` (host, verified), `raw` (string, UNverified).
 pub async fn fixture(yaml: &str) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let root = kvendra::vars::validate::canonical(dir.path()).unwrap();
     let home = root.join("home");
     let ws = root.join("kvd-sentinel-ws");
     std::fs::create_dir_all(&ws).unwrap();

@@ -43,7 +43,7 @@ fn path_sep_ok(_t: VarType, _c: char) -> bool {
 /// same file. Verbatim UNC (`\\?\UNC\...`) and other verbatim forms are kept
 /// as-is, so they still carry `?` and stay refused (conservative). No-op on
 /// other platforms.
-fn canonical(p: &Path) -> std::io::Result<PathBuf> {
+pub fn canonical(p: &Path) -> std::io::Result<PathBuf> {
     let c = std::fs::canonicalize(p)?;
     #[cfg(windows)]
     {

@@ -90,7 +90,7 @@ fn human_commands_refuse_without_a_real_tty() {
 /// `kvendra unlock` (KVENDRA_PASSWORD path) so the session-only commands work.
 fn home_with_session(with_vars: bool) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let root = kvendra::vars::validate::canonical(dir.path()).unwrap();
     let kvhome = root.join("kvhome");
     kvendra::config::ensure_layout(&kvhome).unwrap();
     let v = Vault::new(kvhome.clone());
@@ -214,7 +214,7 @@ fn scan_is_rate_limited_across_invocations() {
 #[test]
 fn scan_with_locked_vault_says_skipped_never_clean() {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let root = kvendra::vars::validate::canonical(dir.path()).unwrap();
     kvendra::config::ensure_layout(&root.join("kvhome")).unwrap();
     let out = kvendra(&root)
         .args(["vars", "scan", "--stdin", "--json"])
