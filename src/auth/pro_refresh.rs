@@ -331,7 +331,7 @@ mod tests {
         seed(dir.path(), exp, Some("rt-1"));
         let new_exp = (Utc::now() + ChronoDuration::hours(1)).timestamp();
         let (new_at, new_id) = (make_jwt(new_exp, "new-at"), make_jwt(new_exp, "new-id"));
-        // Cognito does not rotate the refresh_token: field absent.
+        // The IdP does not rotate the refresh_token: field absent.
         let body = serde_json::json!({
             "access_token": new_at, "id_token": new_id,
             "expires_in": 3600, "token_type": "Bearer"
