@@ -43,6 +43,9 @@ pub async fn run(args: LogoutArgs) -> KvendraResult<()> {
             // stale email/issuer claims behind after a session clear.
             let id_token_path = home.join("sessions/pro.id_token");
             let _ = std::fs::remove_file(&id_token_path);
+            // The long-lived refresh_token is cleared too, so a logout leaves
+            // no credential able to mint new Pro tokens.
+            let _ = std::fs::remove_file(home.join("sessions/pro.refresh_token"));
             crate::cli::lock::run().await
         }
     }

@@ -11,14 +11,18 @@
 //!    by `kvendra backup {push,pull,list,restore,prune}`.
 
 use crate::auth::discovery::{auth_base_from_env, discovery_url_from_env};
-use crate::auth::oidc::{client_id_from_env, login_workspace};
-use crate::config::{kvendra_home, set_file_mode_secure};
+use crate::auth::oidc::{TokenSet, client_id_from_env, login_workspace};
+use crate::auth::pro_refresh::{
+    PRO_LOCK_ID, pro_access_path, pro_client_id_path, pro_id_token_path, pro_refresh_token_path,
+    write_secret_atomic,
+};
+use crate::config::kvendra_home;
 use crate::error::{KvendraError, KvendraResult};
 use crate::session::SessionState;
 use chrono::Utc;
 use clap::Args;
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Args)]
 pub struct LoginArgs {
@@ -102,8 +106,9 @@ async fn workspace_login(workspace_id: &str) -> KvendraResult<()> {
 /// at `~/.kvendra/sessions/pro.token` (plain text, mode 0600). `kvendra
 /// backup` reads that file directly via [`backup::load_pro_jwt`].
 ///
-/// M2.5 D8 trade-off: no refresh-token background daemon. The owner re-runs
-/// `kvendra login --pro` when the JWT expires (30d window typical).
+/// The `refresh_token` is persisted at `~/.kvendra/sessions/pro.refresh_token`
+/// (mode 0600); `kvendra backup` and `kvendra notifs` refresh the access and
+/// id tokens before each call via [`crate::auth::pro_refresh`].
 async fn pro_login() -> KvendraResult<()> {
     let home = kvendra_home()?;
     let discovery_url = discovery_url_from_env()?;
@@ -117,13 +122,7 @@ async fn pro_login() -> KvendraResult<()> {
     let token_set = login_workspace("pro", &discovery_url, &client_id).await?;
     eprintln!("Authorization code exchanged successfully.");
 
-    let sessions_dir = home.join("sessions");
-    std::fs::create_dir_all(&sessions_dir)
-        .map_err(|e| KvendraError::SessionStore(format!("mkdir sessions: {e}")))?;
-    let path = sessions_dir.join("pro.token");
-    std::fs::write(&path, token_set.access_token.as_bytes())
-        .map_err(|e| KvendraError::SessionStore(format!("write pro.token: {e}")))?;
-    set_file_mode_secure(&path)?;
+    let path = persist_pro_tokens(&home, &client_id, &token_set)?;
     eprintln!(
         "Pro session JWT persisted at {} (mode 0600).",
         path.display()
@@ -135,10 +134,6 @@ async fn pro_login() -> KvendraResult<()> {
     // endpoints continue to use `pro.token` (access_token) as the bearer.
     // Fix for ISSUE-KVD-CLI-940018 — `session info` rendered `email: None`
     // because it decoded the access_token instead of the id_token.
-    let id_token_path = sessions_dir.join("pro.id_token");
-    std::fs::write(&id_token_path, token_set.id_token.as_bytes())
-        .map_err(|e| KvendraError::SessionStore(format!("write pro.id_token: {e}")))?;
-    set_file_mode_secure(&id_token_path)?;
 
     // Structured log for UX-quality observability (ISSUE-KVD-CLI-9AE300).
     // Claims are untrusted at this point — the IdP signed them and the broker
@@ -159,12 +154,31 @@ async fn pro_login() -> KvendraResult<()> {
         expires_at = %expires_at,
         "Pro tier login completed"
     );
-
-    eprintln!(
-        "Note: refresh background is not active for --pro in M2.5; re-run\n\
-         `kvendra login --pro` if `kvendra backup` returns 401."
-    );
     Ok(())
+}
+
+/// Persist the Pro session files (`pro.client_id`, `pro.refresh_token`,
+/// `pro.token`, `pro.id_token`) atomically with mode 0600, under the same
+/// `pro` lock as the refresh path. Returns the access-token path. A
+/// response without `refresh_token` removes any stale one so the refresh
+/// path never pairs it with the new tokens.
+fn persist_pro_tokens(
+    home: &Path,
+    client_id: &str,
+    token_set: &TokenSet,
+) -> KvendraResult<PathBuf> {
+    let _guard = SessionState::acquire_lock(home, PRO_LOCK_ID)?;
+    write_secret_atomic(&pro_client_id_path(home), client_id.as_bytes())?;
+    let refresh_path = pro_refresh_token_path(home);
+    if token_set.refresh_token.is_empty() {
+        let _ = std::fs::remove_file(&refresh_path);
+    } else {
+        write_secret_atomic(&refresh_path, token_set.refresh_token.as_bytes())?;
+    }
+    let path = pro_access_path(home);
+    write_secret_atomic(&path, token_set.access_token.as_bytes())?;
+    write_secret_atomic(&pro_id_token_path(home), token_set.id_token.as_bytes())?;
+    Ok(path)
 }
 
 async fn initial_allowlist_sync(home: &Path, workspace_id: &str, jwt: &str) {
@@ -288,6 +302,34 @@ mod tests {
         assert!(decode_jwt_payload("totally-broken").is_none());
         // Two parts with invalid base64 in the payload also returns None.
         assert!(decode_jwt_payload("aaa.!!!.ccc").is_none());
+    }
+
+    #[test]
+    fn persist_pro_tokens_writes_session_files_mode_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = TokenSet {
+            access_token: "at".into(),
+            id_token: "idt".into(),
+            refresh_token: "rt".into(),
+            expires_in: 3600,
+            token_type: "Bearer".into(),
+        };
+        let p = persist_pro_tokens(dir.path(), "cid-v2", &ts).unwrap();
+        assert_eq!(p, pro_access_path(dir.path()));
+        for (path, want) in [
+            (pro_access_path(dir.path()), "at"),
+            (pro_id_token_path(dir.path()), "idt"),
+            (pro_refresh_token_path(dir.path()), "rt"),
+            (pro_client_id_path(dir.path()), "cid-v2"),
+        ] {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), want);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{}", path.display());
+            }
+        }
     }
 
     #[test]

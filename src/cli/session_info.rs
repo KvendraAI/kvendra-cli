@@ -54,6 +54,9 @@ struct ProSessionView {
     expires_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     seconds_until_expiry: Option<i64>,
+    /// `pro.refresh_token` present: backup/notifs refresh the tokens before
+    /// each call. Sessions from older logins have no refresh_token.
+    refresh_available: bool,
     blob_path: PathBuf,
 }
 
@@ -257,6 +260,7 @@ fn read_pro_view(home: &Path) -> Option<ProSessionView> {
         issuer: claims.iss,
         expires_at,
         seconds_until_expiry,
+        refresh_available: crate::auth::pro_refresh::has_pro_refresh_token(home),
         // User-visible "Token:" path points to the access_token because that
         // is the file consumed by `kvendra backup *` (bearer JWT).
         blob_path: access_path,
@@ -336,6 +340,11 @@ fn print_pro_section(pro: Option<&ProSessionView>) {
         }
         if let Some(i) = &p.issuer {
             println!("  Issuer:  {i}");
+        }
+        if p.refresh_available {
+            println!("  Refresh: available (tokens renew automatically)");
+        } else {
+            println!("  Refresh: not available (re-run `kvendra login --pro` to enable it)");
         }
         println!("  Token:   {}", p.blob_path.display());
         println!();
@@ -456,6 +465,17 @@ mod tests {
             "expected ~24h, got {secs}"
         );
         assert!(view.blob_path.ends_with("sessions/pro.token"));
+    }
+
+    #[test]
+    fn read_pro_view_reports_refresh_availability() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("pro.token"), b"not-a-jwt").unwrap();
+        assert!(!read_pro_view(home.path()).unwrap().refresh_available);
+        std::fs::write(sessions.join("pro.refresh_token"), b"rt").unwrap();
+        assert!(read_pro_view(home.path()).unwrap().refresh_available);
     }
 
     /// Negative: no pro.token → `None`. Keeps the "Free tier" rendering

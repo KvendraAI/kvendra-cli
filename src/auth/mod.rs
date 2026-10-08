@@ -8,6 +8,7 @@
 
 pub mod discovery;
 pub mod oidc;
+pub mod pro_refresh;
 pub mod refresh;
 
 pub use discovery::{OidcConfig, discover};

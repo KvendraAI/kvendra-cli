@@ -83,7 +83,7 @@ Refresh token expires at: 2026-06-12T05:30:00Z
 Last token refresh: 2026-05-13T15:25:00Z
 Last allowlist sync: 2026-05-13T16:00:00Z
 Issuer: https://auth.kvendra.cloud
-Audience (client_id): 5ab5mhjhv0l6akhiqndvt636b
+Audience (client_id): 62v1boam85gtks4te5lojdkafe
 Broker URL: https://api.kvendra.cloud
 Auth URL: https://auth.kvendra.cloud
 ```

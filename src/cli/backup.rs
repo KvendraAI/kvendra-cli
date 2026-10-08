@@ -1,8 +1,8 @@
 //! `kvendra backup {push,pull,list,restore,prune}` — REQ-KVD-CLI-005.
 //!
 //! Authentication: requires `kvendra login --pro` token at
-//! `~/.kvendra/sessions/pro.token`. Plain JWT bearer (M2 MVP — refresh token
-//! flow deferred to M2.5).
+//! `~/.kvendra/sessions/pro.token`. Before each call the access and id
+//! tokens are refreshed if they expire soon (`auth::pro_refresh`).
 
 use crate::backup::client::BackupClient;
 use crate::backup::manifest::BackupManifest;
@@ -115,6 +115,17 @@ fn load_pro_id_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Refresh the Pro tokens if they expire soon, then build the client from
+/// the (possibly rewritten) token files.
+async fn pro_client() -> KvendraResult<BackupClient> {
+    let home = kvendra_home()?;
+    crate::auth::pro_refresh::refresh_pro_before_call(&home).await?;
+    Ok(BackupClient::with_id_token(
+        load_pro_jwt()?,
+        load_pro_id_token(),
+    ))
+}
+
 fn read_password(password_stdin: bool) -> KvendraResult<String> {
     if password_stdin {
         let mut buf = String::new();
@@ -160,7 +171,7 @@ fn derive_backup_key_from_password(password: &str) -> KvendraResult<[u8; 32]> {
 
 async fn run_push(args: PushArgs) -> KvendraResult<()> {
     let home = kvendra_home()?;
-    let jwt = load_pro_jwt()?;
+    load_pro_jwt()?;
     let mut password = read_password(args.password_stdin)?;
     let backup_key = derive_backup_key_from_password(&password)?;
     password.zeroize();
@@ -184,7 +195,7 @@ async fn run_push(args: PushArgs) -> KvendraResult<()> {
     let parent_etag = read_cached_etag(&home).ok();
     let manifest = BackupManifest::new(checksum, parent_etag, size, args.label.clone());
 
-    let client = BackupClient::with_id_token(jwt, load_pro_id_token());
+    let client = pro_client().await?;
     let result = client.push(&manifest, ciphertext.clone(), args.force).await;
     ciphertext.zeroize();
 
@@ -201,8 +212,7 @@ async fn run_push(args: PushArgs) -> KvendraResult<()> {
 }
 
 async fn run_list(args: ListArgs) -> KvendraResult<()> {
-    let jwt = load_pro_jwt()?;
-    let client = BackupClient::with_id_token(jwt, load_pro_id_token());
+    let client = pro_client().await?;
     let items = client.list(args.limit).await?;
     if items.is_empty() {
         println!("(no backups yet — run `kvendra backup push`)");
@@ -227,7 +237,7 @@ async fn run_list(args: ListArgs) -> KvendraResult<()> {
 
 async fn run_pull(args: PullArgs) -> KvendraResult<()> {
     let home = kvendra_home()?;
-    let jwt = load_pro_jwt()?;
+    load_pro_jwt()?;
     let mut password = read_password(args.password_stdin)?;
     let backup_key = match derive_backup_key_from_password(&password) {
         Ok(k) => k,
@@ -238,7 +248,7 @@ async fn run_pull(args: PullArgs) -> KvendraResult<()> {
     };
     // REQ-KVD-11F906 AC-LVR-6 — the password lives until the restored
     // `vars.blob` is re-sealed below; it is zeroized on every exit path.
-    let result = pull_into_staging(&args, &home, jwt, &backup_key, &password).await;
+    let result = pull_into_staging(&args, &home, &backup_key, &password).await;
     password.zeroize();
     result
 }
@@ -246,11 +256,10 @@ async fn run_pull(args: PullArgs) -> KvendraResult<()> {
 async fn pull_into_staging(
     args: &PullArgs,
     home: &std::path::Path,
-    jwt: String,
     backup_key: &[u8; 32],
     password: &str,
 ) -> KvendraResult<()> {
-    let client = BackupClient::with_id_token(jwt, load_pro_id_token());
+    let client = pro_client().await?;
     let backup_id = match args.id.clone() {
         Some(id) => id,
         None => {
@@ -305,12 +314,12 @@ async fn run_restore(args: RestoreArgs) -> KvendraResult<()> {
 }
 
 async fn run_prune(args: PruneArgs) -> KvendraResult<()> {
-    let jwt = load_pro_jwt()?;
+    load_pro_jwt()?;
     if !args.yes {
         println!("Delete backup {}? Use --yes to confirm.", args.backup_id);
         return Err(KvendraError::Vault("prune aborted by user".into()));
     }
-    let client = BackupClient::with_id_token(jwt, load_pro_id_token());
+    let client = pro_client().await?;
     client.delete(&args.backup_id).await?;
     println!("Deleted backup {}", args.backup_id);
     Ok(())

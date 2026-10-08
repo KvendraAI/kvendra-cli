@@ -43,7 +43,7 @@ pub async fn run(cmd: NotifsCommand) -> KvendraResult<()> {
 }
 
 async fn settings_get() -> KvendraResult<()> {
-    let jwt = load_any_jwt()?;
+    let jwt = load_any_jwt().await?;
     let client = http_client()?;
     let url = format!("{}/v1/users/me/notifications", api_base());
     let resp = client
@@ -64,7 +64,7 @@ async fn settings_get() -> KvendraResult<()> {
 }
 
 async fn settings_put(args: PutArgs) -> KvendraResult<()> {
-    let jwt = load_any_jwt()?;
+    let jwt = load_any_jwt().await?;
     let body = match args.json {
         Some(s) => s,
         None => {
@@ -126,11 +126,15 @@ fn remap_err(e: reqwest::Error) -> KvendraError {
     }
 }
 
-/// Try a workspace session first; if none, fall back to `pro.token`.
-pub fn load_any_jwt() -> KvendraResult<String> {
+/// Try a workspace session first; if none, fall back to `pro.token`
+/// (refreshed first if it expires soon).
+pub async fn load_any_jwt() -> KvendraResult<String> {
     let home = kvendra_home()?;
     if let Some(jwt) = load_first_workspace_jwt(&home)? {
         return Ok(jwt);
+    }
+    if home.join("sessions").join("pro.token").exists() {
+        crate::auth::pro_refresh::refresh_pro_before_call(&home).await?;
     }
     load_pro_jwt(&home)
 }

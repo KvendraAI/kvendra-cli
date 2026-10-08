@@ -26,10 +26,10 @@ pub const PORT_RANGE_LOW: u16 = 54321;
 /// Highest loopback port the CLI tries when binding the OIDC callback receiver.
 pub const PORT_RANGE_HIGH: u16 = 54330;
 
-/// Default OIDC `client_id` for staging. Override via env
+/// Default OIDC `client_id` (`kvendra-cli-public-v2`). Override via env
 /// `KVENDRA_CLIENT_ID`. The constant is provider-agnostic by name (it is
 /// the canonical OIDC public client id, not a vendor-specific identifier).
-pub const DEFAULT_CLIENT_ID: &str = "5ab5mhjhv0l6akhiqndvt636b";
+pub const DEFAULT_CLIENT_ID: &str = "62v1boam85gtks4te5lojdkafe";
 
 /// PKCE proof carriers (RFC 7636).
 pub struct PkceFlow {
@@ -62,13 +62,33 @@ impl PkceFlow {
 }
 
 /// OAuth2 token bundle returned by the token endpoint.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TokenSet {
     pub access_token: String,
     pub id_token: String,
     pub refresh_token: String,
     pub expires_in: u64,
     pub token_type: String,
+}
+
+/// Manual `Debug` so the tokens never reach logs or panic messages.
+impl std::fmt::Debug for TokenSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redact(t: &str) -> &'static str {
+            if t.is_empty() {
+                "<empty>"
+            } else {
+                "<redacted>"
+            }
+        }
+        f.debug_struct("TokenSet")
+            .field("access_token", &redact(&self.access_token))
+            .field("id_token", &redact(&self.id_token))
+            .field("refresh_token", &redact(&self.refresh_token))
+            .field("expires_in", &self.expires_in)
+            .field("token_type", &self.token_type)
+            .finish()
+    }
 }
 
 /// Read the OIDC client id from env, falling back to [`DEFAULT_CLIENT_ID`].
@@ -341,11 +361,32 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Best-effort sniff for the canonical IdP "invalid_grant" reply. Used by
-/// the refresh path to remap a refresh-failure into
-/// [`KvendraError::WorkspaceSessionExpired`].
+/// `true` only when the IdP definitively rejected the refresh request:
+/// HTTP 400/401 whose JSON body carries `error` ∈ {`invalid_grant`,
+/// `invalid_client`, `unauthorized_client`} (RFC 6749 §5.2). Anything else
+/// (429, 408, other 4xx, 5xx, unreadable body, network) is transient.
+/// `msg` is the `OidcFlow` text built by `parse_token_response`
+/// (`HTTP <status>: <body>`).
 pub fn is_invalid_grant(msg: &str) -> bool {
-    msg.contains("invalid_grant") || msg.contains("HTTP 400") || msg.contains("HTTP 401")
+    let Some(rest) = msg.strip_prefix("HTTP ") else {
+        return false;
+    };
+    if !(rest.starts_with("400") || rest.starts_with("401")) {
+        return false;
+    }
+    let Some((_, body)) = rest.split_once(": ") else {
+        return false;
+    };
+    #[derive(serde::Deserialize)]
+    struct OAuthError {
+        error: String,
+    }
+    serde_json::from_str::<OAuthError>(body.trim()).is_ok_and(|e| {
+        matches!(
+            e.error.as_str(),
+            "invalid_grant" | "invalid_client" | "unauthorized_client"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -393,8 +434,45 @@ mod tests {
 
     #[test]
     fn invalid_grant_detection() {
-        assert!(is_invalid_grant(r#"{"error":"invalid_grant"}"#));
-        assert!(is_invalid_grant("HTTP 400: bad"));
-        assert!(!is_invalid_grant("HTTP 500: server error"));
+        for code in ["invalid_grant", "invalid_client", "unauthorized_client"] {
+            for status in ["400 Bad Request", "401 Unauthorized"] {
+                let msg = format!(r#"HTTP {status}: {{"error":"{code}"}}"#);
+                assert!(is_invalid_grant(&msg), "{msg}");
+            }
+        }
+        for msg in [
+            r#"HTTP 400 Bad Request: {"error":"invalid_request"}"#,
+            r#"HTTP 400 Bad Request: {"error":"invalid_scope"}"#,
+            "HTTP 400 Bad Request: not json",
+            "HTTP 400 Bad Request: ",
+            r#"HTTP 403 Forbidden: {"error":"invalid_grant"}"#,
+            r#"HTTP 408 Request Timeout: {"error":"invalid_grant"}"#,
+            r#"HTTP 429 Too Many Requests: {"error":"invalid_grant"}"#,
+            r#"HTTP 500 Internal Server Error: {"error":"invalid_grant"}"#,
+            r#"HTTP 503 Service Unavailable: {"error":"server_error"}"#,
+            r#"refresh: error sending request: {"error":"invalid_grant"}"#,
+            r#"{"error":"invalid_grant"}"#,
+        ] {
+            assert!(!is_invalid_grant(msg), "must be transient: {msg}");
+        }
+    }
+
+    #[test]
+    fn token_set_debug_redacts_tokens() {
+        let ts = TokenSet {
+            access_token: "AT-SECRET".into(),
+            id_token: "ID-SECRET".into(),
+            refresh_token: "RT-SECRET".into(),
+            expires_in: 3600,
+            token_type: "Bearer".into(),
+        };
+        let dbg = format!("{ts:?}");
+        assert!(!dbg.contains("SECRET"), "{dbg}");
+        assert!(dbg.contains("<redacted>") && dbg.contains("3600"), "{dbg}");
+    }
+
+    #[test]
+    fn default_client_id_is_cli_public_v2() {
+        assert_eq!(DEFAULT_CLIENT_ID, "62v1boam85gtks4te5lojdkafe");
     }
 }

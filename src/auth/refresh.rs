@@ -34,7 +34,7 @@ pub const DEFAULT_REFRESH_LEAD: ChronoDuration = ChronoDuration::minutes(5);
 /// Read the configured lead time from `KVENDRA_JWT_REFRESH_LEAD_SECONDS`,
 /// falling back to [`DEFAULT_REFRESH_LEAD`]. Required by SPEC §V17 for
 /// E2E tests against shortened TTLs.
-fn refresh_lead() -> ChronoDuration {
+pub(crate) fn refresh_lead() -> ChronoDuration {
     std::env::var("KVENDRA_JWT_REFRESH_LEAD_SECONDS")
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
@@ -68,7 +68,14 @@ pub async fn refresh_if_needed(
 
     let discovery_url = discovery_url_from_env()?;
     let oidc = discover(&discovery_url).await?;
-    let client_id = client_id_from_env();
+    // Refresh with the client the session was created with (stored as
+    // `audience` at login), so a new DEFAULT_CLIENT_ID does not break live
+    // sessions. Fall back to env/default when it is missing.
+    let client_id = if snapshot.audience.is_empty() {
+        client_id_from_env()
+    } else {
+        snapshot.audience.clone()
+    };
 
     let new_tokens = match exchange_refresh_token(&oidc, &client_id, &snapshot.refresh_token).await
     {

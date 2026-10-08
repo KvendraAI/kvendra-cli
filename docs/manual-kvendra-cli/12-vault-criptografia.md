@@ -24,6 +24,9 @@ Este capítulo describe los primitives criptográficos, el layout en disco, el d
 │   ├── active.blob              mode 0600  blob de sesión machine-bound (wrap key kvendra/session-wrap/v1)
 │   ├── active.blob.hmac         mode 0600  sidecar HMAC del blob de sesión
 │   ├── pro.token                mode 0600  bearer JWT Pro tier (kvendra login --pro)
+│   ├── pro.id_token             mode 0600  id_token Pro tier (X-Id-Token + claims de session info)
+│   ├── pro.refresh_token        mode 0600  refresh_token Pro tier (renueva pro.token y pro.id_token)
+│   ├── pro.client_id            mode 0600  client OIDC usado en el login Pro (el refresh usa el mismo)
 │   ├── <workspace_id>.token     mode 0600  sesión OIDC de workspace
 │   └── <workspace>.bypass       mode 0600  grant break-glass firmado ed25519 (cap. 23)
 └── audit.db                     mode 0600  SQLite WAL, HMAC chain

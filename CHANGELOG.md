@@ -7,6 +7,44 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+### Added
+
+- **Token refresh for `kvendra login --pro`** (CLI-1, DOC-KVD-ENTERPRISE-D7F24E):
+  `login --pro` now also stores the refresh token in
+  `sessions/pro.refresh_token` (mode 0600, atomic write, never logged).
+  `kvendra backup` and `kvendra notifs` refresh the access and id tokens
+  before each call when they expire within 5 minutes
+  (`KVENDRA_JWT_REFRESH_LEAD_SECONDS`), under the same cross-process lock as
+  the workspace refresh, and persist both new tokens (a rotated refresh
+  token is written first). If the IdP rejects the refresh token, only
+  `pro.refresh_token` is removed; the current tokens are used until they
+  expire, and then the CLI asks for `kvendra login --pro` again. Sessions
+  from older logins (no refresh token) keep working until they expire, then
+  get the same message.
+- `kvendra session info` shows whether refresh is available for the Pro
+  session. `kvendra logout` also removes `pro.refresh_token`.
+
+### Changed
+
+- **Default OIDC client is now `kvendra-cli-public-v2`**
+  (ISSUE-KVD-CLI-689B22). `KVENDRA_CLIENT_ID` still overrides it. Refresh
+  now uses the client the session was created with (`pro.client_id` for
+  Pro, the stored `audience` for workspace sessions), so existing sessions
+  keep refreshing after the default changes. Pro sessions from older
+  versions (no `pro.client_id`) have no refresh token anyway.
+- Refresh rejection is now classified strictly: only HTTP 400/401 with
+  `error` = `invalid_grant`, `invalid_client` or `unauthorized_client` ends
+  the session. 429, 408, other 4xx, 5xx, unreadable bodies and network
+  errors are transient (the workspace session is no longer deleted on them).
+- Session secrets are written through a random, exclusive, no-follow temp
+  file with mode 0600, then fsync + rename + directory fsync.
+- `TokenSet` no longer prints tokens in its `Debug` output.
+- Removed the "refresh background is not active for --pro" notice.
+
+**Notice:** once the server moves the CLI client to 1 h tokens, older CLI
+versions will need `kvendra login --pro` again every hour. Upgrade to this
+version to keep `--pro` sessions alive.
+
 ## [0.7.0] — 2026-10-07 — feat: local variables (`{{lvr:key}}`) + `kvendra secret show-allowlist`
 
 Feature release. Adds local per-machine variables: declared in the KB,
