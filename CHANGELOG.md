@@ -7,6 +7,15 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-08 — feat: silent refresh for `kvendra login --pro` + default client `kvendra-cli-public-v2`
+
+Feature release. `kvendra login --pro` sessions now refresh themselves
+silently, so `kvendra backup` and `kvendra notifs` keep working when the
+server moves the CLI client to short-lived tokens. The default OIDC client
+becomes `kvendra-cli-public-v2` (ISSUE-KVD-CLI-689B22), and
+`kvendra backup list --limit N` now honours the limit on the client side
+(ISSUE-KVD-CLI-2F1687, CLI part).
+
 ### Added
 
 - **Token refresh for `kvendra login --pro`** (CLI-1, DOC-KVD-ENTERPRISE-D7F24E):
