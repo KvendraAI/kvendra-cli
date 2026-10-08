@@ -26,6 +26,11 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ### Changed
 
+- **`kvendra backup list --limit N` shows at most N versions, newest first**
+  (ISSUE-KVD-CLI-2F1687). The server currently ignores `?limit=`, so the CLI
+  now sorts by version and truncates the list itself. `--limit 0` is
+  rejected. The LABEL column stays empty until the server stores and
+  returns the label sent by `kvendra backup push --label`.
 - **Default OIDC client is now `kvendra-cli-public-v2`**
   (ISSUE-KVD-CLI-689B22). `KVENDRA_CLIENT_ID` still overrides it. Refresh
   now uses the client the session was created with (`pro.client_id` for

@@ -329,3 +329,18 @@ fn config_mcp_password_enable_rejects_on_non_macos() {
         "expected macOS-only / unavailable message, got: {stderr}"
     );
 }
+
+#[test]
+fn backup_list_rejects_zero_limit() {
+    // ISSUE-KVD-CLI-2F1687 — `--limit` must be >= 1. Fails at argument
+    // parsing, before any session read or network call.
+    let tmp = tempfile::tempdir().unwrap();
+    Command::cargo_bin("kvendra")
+        .unwrap()
+        .env("KVENDRA_HOME", tmp.path())
+        .env("KVENDRA_BACKUP_URL", "http://127.0.0.1:9")
+        .args(["backup", "list", "--limit", "0"])
+        .assert()
+        .failure()
+        .stderr(contains("--limit"));
+}

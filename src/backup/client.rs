@@ -109,7 +109,7 @@ impl BackupClient {
             .json()
             .await
             .map_err(|e| KvendraError::Serialization(format!("list resp: {e}")))?;
-        Ok(body.items)
+        Ok(newest_first_capped(body.items, limit))
     }
 
     pub async fn pull(&self, backup_id: &str) -> KvendraResult<Vec<u8>> {
@@ -187,6 +187,55 @@ impl BackupClient {
     }
 }
 
+/// Order newest first and keep at most `limit` items.
+///
+/// The server may ignore `?limit=` and `&order=` (ISSUE-KVD-CLI-2F1687), so
+/// the CLI enforces both itself. `version` is a per-user monotonic counter.
+fn newest_first_capped(mut items: Vec<BackupVersionMeta>, limit: u32) -> Vec<BackupVersionMeta> {
+    items.sort_by_key(|m| std::cmp::Reverse(m.version));
+    items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    items
+}
+
 fn map_http_error(status: u16, op: &str, body: String) -> KvendraError {
     KvendraError::Vault(format!("BackendError on {op}: status={status} body={body}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(version: u64) -> BackupVersionMeta {
+        BackupVersionMeta {
+            backup_id: format!("ID{version}"),
+            version,
+            etag: format!("\"e{version}\""),
+            created_at: String::new(),
+            size_bytes: 0,
+            kvendra_cli_version: None,
+            label: None,
+        }
+    }
+
+    fn versions(items: &[BackupVersionMeta]) -> Vec<u64> {
+        items.iter().map(|m| m.version).collect()
+    }
+
+    #[test]
+    fn caps_to_limit_when_server_returns_more() {
+        let items = vec![meta(4), meta(3), meta(2), meta(1)];
+        assert_eq!(versions(&newest_first_capped(items, 2)), vec![4, 3]);
+    }
+
+    #[test]
+    fn keeps_newest_when_server_returns_ascending() {
+        let items = vec![meta(1), meta(2), meta(3), meta(4)];
+        assert_eq!(versions(&newest_first_capped(items, 2)), vec![4, 3]);
+    }
+
+    #[test]
+    fn limit_above_count_returns_all() {
+        let items = vec![meta(2), meta(1)];
+        assert_eq!(versions(&newest_first_capped(items, 10)), vec![2, 1]);
+    }
 }

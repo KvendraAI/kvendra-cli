@@ -42,7 +42,8 @@ pub struct PushArgs {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
-    #[arg(long, default_value = "10")]
+    /// Maximum number of versions to show (newest first).
+    #[arg(long, default_value = "10", value_parser = clap::value_parser!(u32).range(1..))]
     pub limit: u32,
 }
 
