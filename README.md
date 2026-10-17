@@ -29,13 +29,11 @@ plaintext, but a process that has fully taken over your user account while the
 vault is unlocked can read what you can. Raising protection past that (hardware
 keys, remote broker) is on the roadmap and will be opt-in.
 
-## Do I need the CLI? No — it is optional
+## Do I need the CLI?
 
-**Kvendra does not require the CLI.** Pro accounts and self-hosted / Enterprise
-deployments work fully without installing it — nothing blocks or degrades if you
-never run `kvendra`. The CLI is an optional power tool for people who want a
-local MCP capability broker and a client-side credential vault on their own
-machine. Install it if that helps your workflow; skip it if it doesn't.
+**Optional on Pro:** without it, the skills that only use the knowledge base work
+as usual. **Required on Team.** When installed, the skills run git, cloud and
+package operations through it, with your credentials kept in a local vault.
 
 ## What's in the box
 
