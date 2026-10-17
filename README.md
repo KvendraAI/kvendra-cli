@@ -78,7 +78,7 @@ https://github.com/KvendraAI/kvendra-cli/releases/latest):
   → "Run anyway".
 - **Linux**: `chmod +x kvendra && ./kvendra --version`.
 
-### What's included (0.6.4)
+### What's included (0.8.0)
 
 - ✓ Capability-based MCP broker (7 primitives + escape hatch)
 - ✓ Zero-knowledge vault (Argon2id + AES-256-GCM)
@@ -87,13 +87,16 @@ https://github.com/KvendraAI/kvendra-cli/releases/latest):
 - ✓ Transport separation (CLI=TTY, MCP=approval)
 - ✓ Catalog destructive ops with consent gate
 - ✓ Broker capabilities manifest (`kvendra capabilities`) + break-glass bypass
-- ✓ 430+ tests plus an adversarial security suite, multi-OS CI (Ubuntu / macOS / Windows)
+- ✓ Local variables (`{{lvr:key}}`) for per-machine values, resolved by the broker
+- ✓ `kvendra secret show-allowlist` to inspect a profile's signed allowlist
+- ✓ Silent token refresh for `kvendra login --pro`
+- ✓ Hundreds of tests plus an adversarial security suite, multi-OS CI (Ubuntu / macOS / Windows)
 
 ### Not yet shipped (on the roadmap)
 
 - **Hardware-backed keys** (Secure Enclave / TPM / FIDO2), **ephemeral scoped
   credentials**, **server-assisted unlock** and a **remote broker** — the
-  layered vault-hardening roadmap (`ROAD-KVD-CLI-393064`). All opt-in; the
+  layered vault-hardening roadmap. All opt-in; the
   default stays software-only (`master_password_cache = "ram-only"` with a
   consent modal on each destructive op). See
   [what protects you and what does not](docs/security/protection-levels.md).
@@ -167,7 +170,7 @@ gates the *next* `mcp serve` start.
 ### Anti-captured-env defense
 
 `kvendra unlock` refuses to run inside an MCP client subprocess. Three
-layers (PAT-KVD-CLI-008), evaluated in order:
+layers, evaluated in order:
 
 1. **`/dev/tty` (POSIX) / `CONIN$` (Windows)** — direct open. A captured
    subprocess has no controlling terminal, so this fails with `ENXIO`
@@ -202,7 +205,7 @@ When the broker runs under MCP transport (spawned by Claude Code, Cursor,
 Cline, ...), every destructive op (write / push / destroy in the catalog)
 goes through a consent gate before dispatch. The gate uses an OS-mediated
 modal dialog on **macOS** (`osascript display dialog`) — no `/dev/tty`
-interaction, mitigating the TTY-hijack pattern documented in `PAT-KVD-007`.
+interaction, mitigating the TTY-hijack pattern.
 On **Linux / Windows** presence-gated approval is not yet available, so
 interactive confirmation fails closed; run with `KVENDRA_APPROVAL_MODE=silent`
 there (documented residual H3).
@@ -210,14 +213,13 @@ there (documented residual H3).
 The default `master_password_cache = "ram-only"` keeps the master
 password in process memory only after `kvendra unlock` (or the
 `KVENDRA_MCP_PASSWORD` env var path used by IDE/Desktop clients today).
-No silent automated bypass of the consent gate is possible — see
-`PAT-KVD-CLI-001` in the project KB for the full reasoning and audit-log
-evidence.
+The consent gate is designed so that no automated path can bypass it
+silently.
 
 **Touch ID-protected MCP password storage** (every read gated by the OS
 biometric prompt) requires a signed binary (Apple Developer ID) and is still
-**on the roadmap**. 0.6.4 ships unsigned and uses the consent-modal path on
-macOS.
+**on the roadmap**. Current releases (0.8.0) ship unsigned and use the
+consent-modal path on macOS.
 
 For the security model, see [`docs/security.md`](docs/security.md), and for
 plain-language expectations read [what protects you and what does
