@@ -99,10 +99,14 @@ async fn backup_carries_vars_and_restore_leaves_them_unverified() {
     // Restore into staging → every variable verified:false, origin:restore.
     let staging = f.root.join("staging_restore");
     kvendra::backup::bundle::extract_bundle(&tar_bytes, &staging).unwrap();
-    let n = vars::mark_restored_unverified(&staging, PASSWORD).unwrap();
+    let mk = kvendra::vault::Vault::new(f.home.clone())
+        .master_key_from_password(PASSWORD)
+        .unwrap();
+    let n = vars::mark_restored_unverified(&staging, &mk).unwrap();
     assert!(n >= 4);
-    // A wrong password does not re-seal.
-    assert!(vars::mark_restored_unverified(&staging, b"kvd-sentinel-wrong").is_err());
+    // A key that is not this vault's does not re-seal.
+    let wrong = kvendra::vault::envelope::MasterKey::generate();
+    assert!(vars::mark_restored_unverified(&staging, &wrong).is_err());
 
     let staged = kvendra::vault::Vault::new(staging.clone());
     let key = staged.local_vars_key_from_password(PASSWORD).unwrap();

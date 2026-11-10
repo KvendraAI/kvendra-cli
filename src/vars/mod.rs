@@ -394,16 +394,28 @@ pub fn mark_verified(vault: &Vault, key: &str) -> KvendraResult<()> {
 }
 
 /// Backup restore (AC-LVR-6): re-seal the `vars.blob` restored into
-/// `staging_home` with every variable `verified:false, origin:restore`. The
-/// key is derived from `password` against the STAGING sentinel. No-op when the
-/// staging dir has no `vars.blob`. Returns the number of variables reset.
-pub fn mark_restored_unverified(staging_home: &Path, password: &[u8]) -> KvendraResult<usize> {
+/// `staging_home` with every variable `verified:false, origin:restore`.
+/// `mk` is the local vault key; it must open the STAGING sentinel (v1: its
+/// constant; v2: its `check` — after `backup::restore` reconciled it) or the
+/// call fails without writing. No-op when the staging dir has no
+/// `vars.blob`. Returns the number of variables reset.
+pub fn mark_restored_unverified(
+    staging_home: &Path,
+    mk: &crate::vault::envelope::MasterKey,
+) -> KvendraResult<usize> {
+    use crate::vault::session::{HKDF_INFO_LOCAL_VARS, hkdf_expand};
     let staging = Vault::new(staging_home.to_path_buf());
     let path = staging.vars_blob_path();
     if !path.exists() {
         return Ok(0);
     }
-    let key = staging.local_vars_key_from_password(password)?;
+    if !staging
+        .read_sentinel()?
+        .verifies_master_key(mk.as_bytes())?
+    {
+        return Err(KvendraError::InvalidMasterPassword);
+    }
+    let key = hkdf_expand(mk.as_bytes(), HKDF_INFO_LOCAL_VARS);
     let mut doc = load_with_key(&path, key.as_bytes())?;
     let now = now_rfc3339();
     for var in doc.vars.values_mut() {
