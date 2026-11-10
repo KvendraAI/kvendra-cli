@@ -2,35 +2,29 @@
 
 ## Descripción
 
-Estado real del producto Kvendra CLI a fecha `2026-09-15` y previsión de las siguientes versiones. Las roadmaps formales viven en el Kvendra KB. Este capítulo es una vista narrada de qué hay hoy, qué llega y qué queda explícitamente fuera por ahora.
+Estado real del producto Kvendra CLI a fecha `2026-11-10` y previsión de las siguientes versiones. Las roadmaps formales viven en el Kvendra KB. Este capítulo es una vista narrada de qué hay hoy, qué llega y qué queda explícitamente fuera por ahora.
 
-> **Nota:** la roadmap forward de `0.6.x` en adelante es un único hilo: **el endurecimiento del vault por capas**, formalizado en `ROAD-KVD-CLI-393064` (ejecuta `ADR-KVD-CLI-64CD49`). Todo lo que llega es **opt-in**; el nivel por defecto se queda en `basic` para no bloquear a nadie al arrancar (ver `../security/protection-levels.md`).
+> **Nota:** la roadmap forward es un único hilo: **el endurecimiento del vault por capas**, formalizado en `ROAD-KVD-CLI-393064` (ejecuta `ADR-KVD-CLI-64CD49`). Todo lo que llega es **opt-in**; el nivel por defecto se queda en `basic` para no bloquear a nadie al arrancar (ver `../security/protection-levels.md`).
 
-## Versión actual: `0.6.4`
+## Versión actual: `0.9.0`
 
-**Tag**: `v0.6.4` en `KvendraAI/kvendra-cli`. Es una release de **security hardening** tras una auditoría estática externa (**Salva Ferrer**, avtn.es) sobre `0.6.3` + pentest interno. La base criptográfica (Argon2id, AES-256-GCM, firma ed25519 de grants, OAuth PKCE) se confirmó sólida; los defectos explotables eran **caminos fail-open de la capa de autorización**, todos cerrados fail-closed en `0.6.4`. Detalle en `../security/advisory-cli-0.6.4.md` y en el [capítulo 18](./18-threat-model.md).
+**Tag**: `v0.9.0` en `KvendraAI/kvendra-cli`, publicada en crates.io el `2026-11-10`. Es una release de **funcionalidad con cambio de formato en disco**: los vaults nuevos usan el formato v2 (jerarquía de claves *envelope*, `ADR-KVD-CLI-4810AF`) y la frase de 12 palabras que enseña `kvendra init` queda ligada al vault. Detalle en `CHANGELOG.md` y en el [capítulo 10](./10-recuperacion.md).
 
-Lo que `0.6.4` entrega, resumido:
+Lo que `0.9.0` entrega, resumido:
 
-> **Vault local zero-knowledge** Nivel 2 con Argon2id (64 MiB / t3 / p1) + AES-256-GCM.
+> **Recuperación real de la password olvidada**: `kvendra recover` con la frase de 12 palabras, en vaults creados con `0.9.0` o posterior y en la misma máquina.
 >
-> **MCP capability broker** stdio con JSON-RPC 2.0, enforcement **fail-closed**.
+> **`kvendra passwd`**: cambio de password conociendo la actual.
 >
-> **7 primitives canónicas + 1 escape hatch documentado** (`kvendra.unsafe.raw_token`, con cuota por sesión).
+> **Envelope**: la clave del vault es aleatoria y va envuelta por la password (`sentinel.blob` v2) y por la frase (`recovery.blob` v1); cambiar la password no toca secretos, allowlists, grants ni backups.
 >
-> **Allowlist DSL declarativo** runtime-enforced con resolución real del payload interno.
+> **`kvendra init` transaccional**, con un banner que dice qué hace cada cosa: la frase recupera ESTE vault; los 8 códigos solo autorizan `kvendra config rebind-home`.
 >
-> **Audit log SQLite WAL HMAC-chain** (schema v3: `error_code` + `error_message`) con verificación cross-process.
->
-> **Detection layer** con patterns canónicos y severidades por workspace.
->
-> **Break-glass** firmado ed25519 (`bypass`/`protect`/`grant-pubkey`/`verify-grant`) — ver [capítulo 23](./23-break-glass.md).
->
-> **Modo workspace / Pro tier**: OIDC PKCE, `kvendra backup` (cloud) y `kvendra capabilities`.
->
-> **TUI** dashboard + audit watch.
+> **Compatibilidad**: los vaults `0.8.x` (v1) siguen abriendo igual pero no tienen recuperación por frase ni migración; no hay downgrade de un vault v2 a `0.8.x`. Restaurar en una máquina nueva con backup + frase aún no está soportado.
 
-## Cadena de releases shipped (`0.1.0` → `0.6.4`)
+Sobre eso sigue lo que ya había: vault local zero-knowledge, MCP capability broker con enforcement **fail-closed** (8 primitives canónicas, una de ellas el escape hatch `kvendra.unsafe.raw_token`), allowlist DSL, audit log SQLite HMAC-chain, detection layer, break-glass firmado ed25519 ([capítulo 23](./23-break-glass.md)), variables locales (`lvr`), modo workspace / Pro tier y TUI.
+
+## Cadena de releases shipped (`0.1.0` → `0.9.0`)
 
 | Versión | Highlights |
 |---------|-----------|
@@ -40,6 +34,11 @@ Lo que `0.6.4` entrega, resumido:
 | `0.6.0` | **Break-glass** (`REQ-KVD-SKILLS-41032D`): 4 subcomandos del binario que relajan, firmado y con TTL, el enforcement del hook `kvendra-skills`. Firma ed25519 (`ed25519-dalek 2`), grant canonicalizado con JCS (`serde_jcs`). |
 | `0.6.2` | **Audit v3**: columnas `error_code` (taxonomía cerrada) + `error_message` (sanitizado), ambas commit al HMAC chain. Migración idempotente lazy on-startup. |
 | `0.6.4` | **Security hardening** tras auditoría externa + pentest: familia de bugs fail-open de la capa de autorización cerrada fail-closed (C1/C2/C4/H2/H4/H5…), integridad de `config.toml`/allowlist ahora **rechazo** ante tamper, `unlock --extend` re-autentica, `npm publish --ignore-scripts`, línea JSON-RPC malformada ya no mata el serve loop. |
+| `0.6.5` | **Security release**: remediación de la auditoría en frío run 1 (2 altos, 7 medios); decisor y ejecutor comparten el mismo operando. |
+| `0.6.6` | **Security release**: path traversal del `profile_id` en `kvendra secret` y en el vault. |
+| `0.7.0` | **Variables locales** por máquina (`{{lvr:key}}`), sustituidas por el broker dentro de sus primitives, y `kvendra secret show-allowlist`. |
+| `0.8.0` | Refresco silencioso de la sesión `kvendra login --pro`, cliente OIDC por defecto `kvendra-cli-public-v2` y `kvendra backup list --limit`. |
+| `0.9.0` | **Recuperación por frase real** (`kvendra recover`), **`kvendra passwd`**, formato de vault v2 (envelope) e `init` transaccional (`REQ-KVD-CLI-CFB449`). |
 
 Para el historial `pre-0.1.0` (alphas) ver `CHANGELOG.md` en el root del repo.
 
@@ -99,14 +98,14 @@ Endurecimientos que no necesitan release mayor ni infra nueva:
 
 ## Política de versionado
 
-- **`0.6.x`** patches: bug fixes y security patches. Pueden introducir **behaviour changes de seguridad** documentados (p. ej. `0.6.4` pasó a rechazar `config.toml`/allowlist sin firma). No cambian el shape de `tools/list` ni del allowlist YAML sin aviso.
-- **`0.x.0`** menor: nuevas capacidades opt-in (cross-platform, Pro tier, capabilities, break-glass). Cambios aditivos.
+- **`0.x.y`** patches: bug fixes y security patches. Pueden introducir **behaviour changes de seguridad** documentados (p. ej. `0.6.4` pasó a rechazar `config.toml`/allowlist sin firma). No cambian el shape de `tools/list` ni del allowlist YAML sin aviso.
+- **`0.x.0`** menor: nuevas capacidades (cross-platform, Pro tier, capabilities, break-glass, variables locales, recuperación por frase). Pueden cambiar el formato en disco; si lo hacen, el CHANGELOG lo dice y aclara si hay migración o downgrade (en `0.9.0`: ni una ni otro).
 - **`x.0.0`** mayor: posible breaking. Se documenta migration path.
 
 ## Política de soporte
 
-- **Versión actual stable** (`0.6.x`) — soporte completo. Tras actualizar a `0.6.4`, cada perfil credential-bound **debe** tener un allowlist firmado (`kvendra secret validate --all`).
-- **`0.1.x`–`0.5.x`** — best-effort; se anima a actualizar a `0.6.4` por los fixes de seguridad.
+- **Versión actual stable** (`0.9.x`) — soporte completo. Cada perfil credential-bound **debe** tener un allowlist firmado (`kvendra secret validate --all`, obligatorio desde `0.6.4`).
+- **`0.1.x`–`0.8.x`** — best-effort; se anima a actualizar a `0.9.0` por los fixes de seguridad de `0.6.5`/`0.6.6` y por la recuperación por frase (que solo tienen los vaults creados con `0.9.0`).
 - **Pre-stable (`0.0.x`)** — sin soporte; eran placeholders de namespace.
 
 ## Entrada al proyecto para colaboradores
