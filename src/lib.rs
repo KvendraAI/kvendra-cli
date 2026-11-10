@@ -23,6 +23,7 @@ pub mod cli;
 pub mod config;
 pub mod detection;
 pub mod error;
+pub mod fault;
 pub mod grant;
 pub mod keychain_acl;
 pub mod mcp;

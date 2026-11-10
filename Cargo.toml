@@ -45,7 +45,7 @@ rand = "0.8"
 # unlock, so a symmetric key visible to the verifier could forge grants.
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 # Recovery
-bip39 = { version = "2", features = ["rand"] }
+bip39 = { version = "2", features = ["rand", "zeroize"] }
 # Storage
 rusqlite = { version = "0.31", features = ["bundled"] }
 # OS keychain (opt-in)
@@ -98,6 +98,11 @@ libc = "0.2"
 [features]
 default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm"]
+# Fault injection for the recovery / passwd / init commit paths
+# (REQ-KVD-CLI-CFB449 AC-REC-5). NEVER enabled by `cargo publish` builds:
+# without it `fault::maybe_fail` is an inlined no-op and the env vars are
+# ignored.
+test-hooks = []
 
 [dev-dependencies]
 assert_cmd = "2"

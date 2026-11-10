@@ -18,8 +18,31 @@ pub enum KvendraError {
     #[error("vault is locked")]
     VaultLocked,
 
-    #[error("recovery failed")]
-    RecoveryFailed,
+    /// The phrase is not a well-formed 12-word English BIP-39 phrase. The
+    /// reason carries a position or a count, never a word.
+    #[error("the phrase is not a valid BIP-39 recovery phrase: {reason}")]
+    RecoveryPhraseInvalid { reason: PhraseInvalidReason },
+
+    /// Well-formed BIP-39 phrase that does not open this vault's
+    /// `recovery.blob` (AEAD tag mismatch).
+    #[error(
+        "the phrase is a valid BIP-39 phrase but it does not belong to this vault. Nothing was changed."
+    )]
+    RecoveryPhraseMismatch,
+
+    /// Vault without `recovery.blob` (created before 0.9 or sentinel v1).
+    #[error(
+        "This vault was created before Kvendra 0.9, so its recovery phrase was never bound to it \
+         and cannot be verified. Nothing was changed. If you forgot the master password, the way \
+         out is a new vault: move ~/.kvendra aside, run `kvendra init`, and add your secrets again \
+         (they are re-issuable credentials)."
+    )]
+    RecoveryUnavailable,
+
+    /// Recovery material present but unusable (unknown version, vault_id
+    /// that does not match the sentinel, recovered key failing `check`).
+    #[error("recovery material is corrupt or does not match this vault: {0}. Nothing was changed.")]
+    RecoveryMaterialCorrupt(String),
 
     #[error("recovery code does not match any known slot")]
     RecoveryCodeInvalid,
@@ -216,6 +239,32 @@ pub enum KvendraError {
 
     #[error("internal error")]
     Internal,
+}
+
+/// Why a recovery phrase is not a valid BIP-39 phrase (REQ-KVD-CLI-CFB449
+/// AC-REC-3). Deliberately word-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhraseInvalidReason {
+    /// 1-based position of a word that is not in the English wordlist.
+    UnknownWord { position: usize },
+    /// The phrase does not have exactly 12 words.
+    WordCount { got: usize },
+    /// Every word is valid but the BIP-39 checksum does not match.
+    Checksum,
+}
+
+impl std::fmt::Display for PhraseInvalidReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PhraseInvalidReason::UnknownWord { position } => {
+                write!(f, "word #{position} is not in the BIP-39 English wordlist")
+            }
+            PhraseInvalidReason::WordCount { got } => write!(f, "expected 12 words, got {got}"),
+            PhraseInvalidReason::Checksum => {
+                f.write_str("the checksum does not match (a word is wrong or out of order)")
+            }
+        }
+    }
 }
 
 fn key_suffix(key: &str) -> String {

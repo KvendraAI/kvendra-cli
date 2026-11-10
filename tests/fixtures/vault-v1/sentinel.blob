@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "kdf": {
+    "m_cost_kib": 19456,
+    "t_cost": 2,
+    "p_cost": 1,
+    "salt": [
+      107,
+      118,
+      100,
+      45,
+      102,
+      105,
+      120,
+      116,
+      117,
+      114,
+      101,
+      45,
+      118,
+      49,
+      45,
+      115
+    ]
+  },
+  "nonce": "AohgwSpfd96PnqrS",
+  "ciphertext": "cuFR+7bn9q6pXtQsZHPXhgU8cYsziasqhyaMLA02vjW0rDM="
+}

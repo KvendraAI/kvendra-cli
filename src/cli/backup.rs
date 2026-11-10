@@ -153,21 +153,18 @@ fn read_password(password_stdin: bool) -> KvendraResult<String> {
 fn derive_backup_key_from_password(password: &str) -> KvendraResult<[u8; 32]> {
     let home = kvendra_home()?;
     let vault = crate::vault::Vault::new(home);
-    let mut session_key = vault.audit_hmac_key_from_password(password.as_bytes())?;
-    // session_key is the derived audit-hmac sub-key. We need the master key
-    // itself. The Vault exposes audit_hmac_key_from_password which already
-    // does Argon2id + HKDF for audit. For backup we must derive a *different*
-    // sub-key from the same master. The simplest correct approach: re-derive
-    // the master directly via the same path used by Vault::derive_master.
-    //
-    // M2 MVP shortcut: chain HKDF over the audit-hmac subkey itself (so the
-    // backup key is uniquely separated from audit and we never touch the
-    // master plaintext in this layer). This is cryptographically sound
-    // (additional HKDF stage with a distinct info) and keeps the existing
-    // master-derivation code path untouched.
-    let key = crypto::derive_backup_key(&session_key);
-    session_key.zeroize();
-    Ok(key)
+    let mk = vault.master_key_from_password(password.as_bytes())?;
+    Ok(backup_key_from_master_key(&mk))
+}
+
+/// Backup cipher key = HKDF(backup-info) over the audit-HMAC sub-key of the
+/// vault key. Same chain as 0.8.0 (frozen by a v1 fixture vector), so
+/// backups made before 0.9 keep decrypting; with the envelope it hangs from
+/// MK, so a password change (recover / passwd) does not orphan backups.
+pub(crate) fn backup_key_from_master_key(mk: &crate::vault::envelope::MasterKey) -> [u8; 32] {
+    use crate::vault::session::{HKDF_INFO_AUDIT_HMAC, hkdf_expand};
+    let audit_sub = hkdf_expand(mk.as_bytes(), HKDF_INFO_AUDIT_HMAC);
+    crypto::derive_backup_key(audit_sub.as_bytes())
 }
 
 async fn run_push(args: PushArgs) -> KvendraResult<()> {

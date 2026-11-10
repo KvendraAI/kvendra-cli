@@ -1,7 +1,9 @@
 //! Recovery — 12 BIP-39 mnemonic + 8 numeric one-time codes (ADR-KVD-011).
 //!
-//! - 12-word BIP-39 mnemonic: 132 bits entropy (English wordlist), checksum
-//!   integrated. Lives ONLY with the user; never persisted in the vault.
+//! - 12-word BIP-39 mnemonic: 128 bits entropy (English wordlist), checksum
+//!   integrated. Lives ONLY with the user; since 0.9 it wraps the vault key
+//!   in `recovery.blob` (see [`crate::vault::envelope`]) — nothing derived
+//!   from it is persisted apart from that ciphertext.
 //! - 8 numeric codes (format `XXXX-XXXX-XX`, 10 digits): hashed with
 //!   Argon2id and stored in `~/.kvendra/recovery_codes.json` as
 //!   `{ hash, used_at, used_for }` (single-use).
@@ -10,7 +12,7 @@ use crate::error::{KvendraError, KvendraResult};
 use crate::vault::kdf::{KdfParams, derive};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use bip39::{Language, Mnemonic};
+use bip39::Mnemonic;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -18,16 +20,15 @@ use subtle::ConstantTimeEq;
 /// Number of one-time numeric codes generated at setup.
 pub const RECOVERY_CODES_COUNT: usize = 8;
 
-/// Generate a 12-word English BIP-39 mnemonic from secure RNG.
+/// Generate a 12-word English BIP-39 mnemonic (128 bits from the OS CSPRNG).
 pub fn generate_mnemonic() -> KvendraResult<Mnemonic> {
-    Mnemonic::generate_in(Language::English, 12)
-        .map_err(|e| KvendraError::Vault(format!("bip39 generate: {e}")))
+    crate::vault::envelope::generate_mnemonic()
 }
 
-/// Parse a user-provided mnemonic phrase, validating checksum.
+/// Parse a user-provided mnemonic phrase (normalized, exactly 12 words,
+/// checksum verified). Malformed → `RecoveryPhraseInvalid { reason }`.
 pub fn parse_mnemonic(phrase: &str) -> KvendraResult<Mnemonic> {
-    Mnemonic::parse_in_normalized(Language::English, phrase)
-        .map_err(|_| KvendraError::RecoveryFailed)
+    crate::vault::envelope::parse_phrase(phrase)
 }
 
 /// Generate `RECOVERY_CODES_COUNT` numeric codes formatted `XXXX-XXXX-XX`.
