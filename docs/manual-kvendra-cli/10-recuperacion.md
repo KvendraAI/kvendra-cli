@@ -91,7 +91,9 @@ Cada entrada del keychain (`kvendra/derived-key/v1`, `kvendra/mcp-password/v1`) 
 | **No existe** | No hay entrada | Nada (si no hay ninguna: `No kvendra keychain entries were found.`) |
 | **Dejada** | Es de otro vault, o no tiene dueño (escrita antes de 0.9) | `… was left untouched: …` y, si no tiene dueño, el comando `disable` que la quita |
 
-Una entrada dejada no abre este vault (el sentinel nuevo exige la password nueva), pero puede guardar la password **antigua**. Si el backend del keychain falla al leer el dueño de `mcp-password/v1`, el comando aborta sin cambiar nada; para `derived-key/v1` (solo un flag de presencia) sigue y lo avisa.
+Una entrada dejada no abre este vault (el sentinel nuevo exige la password nueva), pero puede guardar la password **antigua**. Los dueños de todas las entradas se leen **antes** de borrar nada: si el backend del keychain falla al leer el dueño de `mcp-password/v1`, el comando aborta sin cambiar nada (solo puede aparecer el fichero de lock vacío `.rekey.lock`); para `derived-key/v1` (solo un flag de presencia) sigue y lo avisa. Si lo que falla es **borrar** `mcp-password/v1`, también aborta y la password no cambia, pero el blob de sesión (y `derived-key/v1`, si tocaba borrarla) ya pueden haberse quitado: se regeneran en el siguiente `kvendra unlock`.
+
+En Linux y Windows no hay entradas con ACL de presencia, pero sí puede quedar una `kvendra/mcp-password/v1` creada con `keyring` por versiones alpha.3 o anteriores (service `kvendra`, account `kvendra/mcp-password/v1`): se detecta y se borra igual (sin dueño, se deja y el mensaje indica `kvendra config mcp-password disable`, que ya la elimina en esas plataformas).
 
 Después: `kvendra unlock` con la password nueva y reinicia los `kvendra mcp serve` que tuvieras abiertos.
 

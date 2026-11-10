@@ -105,8 +105,12 @@ bound to the vault, and `kvendra recover` works for real on those vaults.
   `passwd` reports each entry as removed, absent (no warning) or left
   (with the `disable` command that removes it) instead of a fixed "the
   keychain cache was cleared". A backend error reading the owner of
-  `mcp-password/v1` aborts the change; `derived-key/v1` (presence flag
-  only) is best effort with a notice.
+  `mcp-password/v1` aborts the change before anything is deleted (all
+  owner tags are read first); `derived-key/v1` (presence flag only) is
+  best effort with a notice. On Linux/Windows a legacy
+  `kvendra/mcp-password/v1` written with `keyring` by alpha.3 or earlier
+  is now detected and removable (`recover`, `passwd`,
+  `config mcp-password disable`).
 - A stale `sentinel.blob.pre-recover` removed by a later `recover` /
   `passwd` is audited as `recover_cleanup` too.
 - A `sentinel.blob.init-tmp` left by an init that crashed right after

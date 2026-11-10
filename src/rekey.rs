@@ -60,7 +60,11 @@ pub trait CredentialCaches: Send + Sync {
     /// `vault_id` (hex) recorded for `label`; `Ok(None)` = no owner tag.
     /// A backend error is an `Err` (fail-closed for mcp-password, B4).
     fn owner(&self, label: &str) -> KvendraResult<Option<String>>;
-    /// Whether the entry itself exists (never reads its secret).
+    /// Whether the entry itself exists. Never returns the secret, but how it
+    /// checks depends on the backend: macOS presence-gated items use an
+    /// attributes-only query (the ACL'd value is not read); plain `keyring`
+    /// entries (derived-key/v1 everywhere, legacy mcp-password/v1 off macOS)
+    /// have no such query, so the value is read and dropped at once.
     fn exists(&self, label: &str) -> KvendraResult<bool>;
     /// Record `vault_id_hex` as the owner of `label`.
     fn set_owner(&self, label: &str, vault_id_hex: &str) -> KvendraResult<()>;
@@ -510,28 +514,102 @@ pub fn success_message(action: RekeyAction, report: &RekeyReport) -> String {
     out
 }
 
+/// What the commit will do with one keychain entry, decided BEFORE any
+/// deletion (round 3 B2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CachePlan {
+    /// Owner tag is this vault: remove it.
+    Delete,
+    /// Nothing there.
+    Absent,
+    /// Leave it (another vault, no owner, or derived-key backend error).
+    Keep(KeptReason),
+}
+
+/// Read-only phase: owner tags and existence of every keychain entry. A
+/// backend error on `mcp-password/v1` (which holds the OLD password) aborts
+/// here, before anything has been deleted (B4 + round 3 B2); for
+/// `derived-key/v1` it becomes `Keep(BackendError)`.
+pub fn plan_cache_invalidation(
+    vault_id_hex: &str,
+    caches: &dyn CredentialCaches,
+) -> KvendraResult<Vec<(&'static str, CachePlan)>> {
+    let mut plan = Vec::new();
+    for label in [KEYCHAIN_DERIVED_KEY_LABEL, KEYCHAIN_MCP_PASSWORD_LABEL] {
+        let p = match plan_entry(label, vault_id_hex, caches) {
+            Ok(p) => p,
+            Err(e) if label == KEYCHAIN_MCP_PASSWORD_LABEL => return Err(e),
+            Err(e) => {
+                tracing::warn!(target: "kvendra::rekey", "{label}: {e}");
+                CachePlan::Keep(KeptReason::BackendError(e.to_string()))
+            }
+        };
+        plan.push((label, p));
+    }
+    Ok(plan)
+}
+
+fn plan_entry(
+    label: &str,
+    vault_id_hex: &str,
+    caches: &dyn CredentialCaches,
+) -> KvendraResult<CachePlan> {
+    Ok(match caches.owner(label)? {
+        Some(owner) if owner == vault_id_hex => CachePlan::Delete,
+        Some(_) if caches.exists(label)? => CachePlan::Keep(KeptReason::OtherVault),
+        None if caches.exists(label)? => CachePlan::Keep(KeptReason::NoOwner),
+        _ => CachePlan::Absent,
+    })
+}
+
 /// Invalidate every cache holding MK or the old password. Idempotent.
 /// Keychain entries are removed only when their owner tag is `vault_id_hex`
-/// (per-vault, M3); each entry ends Removed, Absent or Kept (M1). A backend
-/// error on `mcp-password/v1` (which holds the OLD password) aborts (B4).
+/// (per-vault, M3); each entry ends Removed, Absent or Kept (M1). All owner
+/// tags are read first ([`plan_cache_invalidation`]): a backend error there
+/// aborts before anything is deleted. A failure to DELETE mcp-password/v1
+/// still aborts, but the session blob (and derived-key/v1, if it was due)
+/// may already be gone — both regenerate on the next unlock.
 pub fn invalidate_caches(
     home: &Path,
     vault_id_hex: &str,
+    caches: &dyn CredentialCaches,
+) -> KvendraResult<RekeyReport> {
+    let plan = plan_cache_invalidation(vault_id_hex, caches)?;
+    apply_cache_invalidation(home, plan, caches)
+}
+
+/// Destructive phase: session blob, planned keychain deletions, wrapper.
+pub fn apply_cache_invalidation(
+    home: &Path,
+    plan: Vec<(&'static str, CachePlan)>,
     caches: &dyn CredentialCaches,
 ) -> KvendraResult<RekeyReport> {
     let mut report = RekeyReport {
         session_removed: crate::session::local::delete(home)?,
         ..Default::default()
     };
-    for label in [KEYCHAIN_DERIVED_KEY_LABEL, KEYCHAIN_MCP_PASSWORD_LABEL] {
-        let critical = label == KEYCHAIN_MCP_PASSWORD_LABEL;
-        let outcome = match invalidate_entry(label, vault_id_hex, caches) {
-            Ok(o) => o,
-            Err(e) if critical => return Err(e),
-            Err(e) => {
-                tracing::warn!(target: "kvendra::rekey", "{label}: {e}");
-                CacheOutcome::Kept(KeptReason::BackendError(e.to_string()))
-            }
+    for (label, p) in plan {
+        let outcome = match p {
+            CachePlan::Absent => CacheOutcome::Absent,
+            CachePlan::Keep(r) => CacheOutcome::Kept(r),
+            CachePlan::Delete => match caches.delete_entry(label) {
+                Ok(removed) => {
+                    if let Err(e) = caches.delete_owner(label) {
+                        tracing::warn!(target: "kvendra::rekey", "{label} owner tag not removed: {e}");
+                    }
+                    if removed {
+                        CacheOutcome::Removed
+                    } else {
+                        CacheOutcome::Absent
+                    }
+                }
+                // mcp-password/v1 holds the OLD password: abort.
+                Err(e) if label == KEYCHAIN_MCP_PASSWORD_LABEL => return Err(e),
+                Err(e) => {
+                    tracing::warn!(target: "kvendra::rekey", "{label}: {e}");
+                    CacheOutcome::Kept(KeptReason::BackendError(e.to_string()))
+                }
+            },
         };
         report.keychain.push((label, outcome));
     }
@@ -542,36 +620,6 @@ pub fn invalidate_caches(
         Err(e) => return Err(e.into()),
     }
     Ok(report)
-}
-
-fn invalidate_entry(
-    label: &str,
-    vault_id_hex: &str,
-    caches: &dyn CredentialCaches,
-) -> KvendraResult<CacheOutcome> {
-    match caches.owner(label)? {
-        Some(owner) if owner == vault_id_hex => {
-            let removed = caches.delete_entry(label)?;
-            if let Err(e) = caches.delete_owner(label) {
-                tracing::warn!(target: "kvendra::rekey", "{label} owner tag not removed: {e}");
-            }
-            Ok(if removed {
-                CacheOutcome::Removed
-            } else {
-                CacheOutcome::Absent
-            })
-        }
-        Some(_) => Ok(if caches.exists(label)? {
-            CacheOutcome::Kept(KeptReason::OtherVault)
-        } else {
-            CacheOutcome::Absent
-        }),
-        None => Ok(if caches.exists(label)? {
-            CacheOutcome::Kept(KeptReason::NoOwner)
-        } else {
-            CacheOutcome::Absent
-        }),
-    }
 }
 
 /// Publish `new_sentinel` (which must wrap `mk`) as the vault's sentinel.
@@ -610,6 +658,10 @@ pub async fn commit_new_password(
                 .into(),
         ));
     }
+    // Read-only first (round 3 B2): every keychain owner tag is read before
+    // anything is deleted, so an owner-read failure aborts with no change.
+    let plan = plan_cache_invalidation(&vault_id_hex, caches)?;
+
     // A stale pre-recover copy from an earlier crash: the caller proved `mk`
     // against the CURRENT sentinel, so it can go — but that earlier password
     // change may have no audit row of its own (crash after the rename), so
@@ -630,7 +682,7 @@ pub async fn commit_new_password(
     let _ = std::fs::remove_file(&tmp);
 
     maybe_fail("rekey.before_invalidate")?;
-    let report = invalidate_caches(&home, &vault_id_hex, caches)?;
+    let report = apply_cache_invalidation(&home, plan, caches)?;
     maybe_fail("rekey.after_invalidate")?;
 
     let original = std::fs::read(&sentinel)?;

@@ -560,7 +560,11 @@ async fn report_and_message_for_kept_entries() {
 async fn owner_read_failure_is_fail_closed_for_mcp_password_only() {
     use kvendra::rekey::{CacheOutcome, KeptReason};
     let f = setup().await;
-    let before = hashes_except(&f.home, &[PREAUTH]);
+    // A stale pre-recover copy too: it must survive the aborted commit.
+    let v = f.vault();
+    std::fs::copy(v.sentinel_path(), kvendra::rekey::pre_recover_path(&v)).unwrap();
+    let before = hashes(&f.home);
+    let keychain_before = hashes(&f.keychain);
     let phrase = f.phrase.clone();
     let err = recover_with_phrase(
         &f.vault(),
@@ -575,15 +579,18 @@ async fn owner_read_failure_is_fail_closed_for_mcp_password_only() {
     .await
     .unwrap_err();
     assert!(matches!(err, KvendraError::Keychain(_)), "{err:?}");
+    // Round 3 B2 — owners are read before deleting anything: every file of
+    // the vault (session blob, pre-recover copy, wrapper, audit.db) and the
+    // fake keychain are byte-identical; only the empty lock file appears.
+    assert_eq!(before, hashes_except(&f.home, &[".rekey.lock"]));
+    assert_eq!(keychain_before, hashes(&f.keychain));
+    assert!(
+        !audit_rows(&f.home)
+            .iter()
+            .any(|r| r.action == "recover_cleanup")
+    );
     assert_eq!(opening_password(&f.home), OLD_PW);
-    assert!(f.caches().entry_path(KEYCHAIN_MCP_PASSWORD_LABEL).exists());
-    // Only caches that never hold a key may have gone (session blob).
-    let after = hashes_except(&f.home, &[PREAUTH, "sessions/", ".rekey.lock"]);
-    let before: std::collections::BTreeMap<_, _> = before
-        .into_iter()
-        .filter(|(k, _)| !k.starts_with("sessions/"))
-        .collect();
-    assert_eq!(before, after);
+    std::fs::remove_file(kvendra::rekey::pre_recover_path(&v)).unwrap();
 
     let r = recover_report(
         &f,
@@ -653,4 +660,30 @@ async fn init_tmp_leftover_is_removed_or_quarantined() {
         b"kvd-different-bytes"
     );
     assert_eq!(opening_password(&f.home), OLD_PW);
+}
+
+/// Round 3 B1 — a legacy mcp-password/v1 written by alpha.3 (plain keyring
+/// entry, no owner tag) is reported as left in place, with the command that
+/// removes it, never as "No kvendra keychain entries were found".
+#[tokio::test]
+async fn legacy_untagged_mcp_password_is_reported_with_disable_command() {
+    use kvendra::rekey::{CacheOutcome, KeptReason, RekeyAction, success_message};
+    let f = setup().await;
+    let c = f.caches();
+    c.delete_owner(KEYCHAIN_MCP_PASSWORD_LABEL).unwrap();
+    let r = recover_report(&f, &c).await;
+    assert_eq!(
+        r.keychain[1],
+        (
+            KEYCHAIN_MCP_PASSWORD_LABEL,
+            CacheOutcome::Kept(KeptReason::NoOwner)
+        )
+    );
+    let msg = success_message(RekeyAction::Recover, &r);
+    assert!(
+        msg.contains("`kvendra config mcp-password disable`"),
+        "{msg}"
+    );
+    assert!(!msg.contains("No kvendra keychain entries were found"));
+    assert!(c.entry_path(KEYCHAIN_MCP_PASSWORD_LABEL).exists());
 }
