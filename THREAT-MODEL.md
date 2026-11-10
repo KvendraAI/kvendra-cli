@@ -19,28 +19,35 @@ change.
 
 > **Honest boundary (corrected v0.6.4, external audit finding C3).** The
 > promise above holds **while the vault is LOCKED**. While the vault is
-> UNLOCKED, `~/.kvendra/sessions/active.blob` stores the Argon2id-derived key
+> UNLOCKED, `~/.kvendra/sessions/active.blob` stores the vault key
 > encrypted under a *machine-bound* wrap key that is derived from **public**
 > inputs (hostname + uid + the canonical `~/.kvendra` path) and a hardcoded
 > sentinel IKM (`ADR-KVD-029`). A process running **as your uid** can therefore
-> read that blob (mode 0600) and recover the derived key **without your master
+> read that blob (mode 0600) and recover the vault key **without your master
 > password**, for the lifetime of the session. This is the deliberate
 > trade-off that lets `kvendra mcp serve` run without re-prompting; it does NOT
 > break the at-rest guarantee (a locked vault exposes nothing), but it means an
-> unlocked session's derived key is only as protected as your user account.
+> unlocked session's vault key is only as protected as your user account.
 > The real fix is hardware-backed wrapping (Secure Enclave / TPM / FIDO2),
 > deferred post-MVP — see O1 and "Future mitigation" below.
 
 Concretely:
 - No code path in the `kvendra` binary writes the master password, the
-  Argon2id-derived key, or any decrypted secret to disk.
-- The derived key lives only in process RAM during an unlocked session
+  vault key in clear, or any decrypted secret to disk.
+- The vault key lives only in process RAM during an unlocked session
   and is `zeroize`-cleared on `kvendra lock`, on idle timeout, or on
   process termination.
 - Every blob in `~/.kvendra/secrets/*.blob` is AES-256-GCM ciphertext
-  authenticated with a 96-bit random nonce and a 128-bit GCM tag, with
-  the key derived per-blob from the master password via Argon2id with
-  cost parameters targeting ≥ 1 second per attempt on modern hardware.
+  authenticated with a 96-bit random nonce and a 128-bit GCM tag, under
+  the vault key.
+- Since 0.9.0 the vault key is 32 random bytes that are never derived
+  from the password. It is stored only wrapped: in `sentinel.blob` (v2)
+  under a key derived from the master password with Argon2id (cost
+  parameters targeting ≥ 1 second per attempt on modern hardware), and in
+  `recovery.blob` (v1) under a key derived from the 12-word recovery
+  phrase (BIP-39 seed + HKDF-SHA256 salted with the public `vault_id`).
+  Vaults created before 0.9.0 keep the 0.8.x layout (sentinel v1: the
+  vault key *is* the Argon2id output) and have no `recovery.blob`.
 
 ## Scope
 
@@ -57,7 +64,7 @@ Out of scope (handled in later phases):
 - Hardware-backed key wrapping (Secure Enclave, TPM 2.0, FIDO2).
 - Cross-machine policy enforcement and centralized identity.
 
-## Threat vectors covered (V1–V8)
+## Threat vectors covered (V1–V9)
 
 ### V1 — Passive observer of the public repository
 
@@ -75,8 +82,9 @@ Out of scope (handled in later phases):
 |---|---|
 | Attacker | Backup leak, disk snapshot, unprivileged malware. |
 | Capabilities | Reads ciphertext blobs and the audit log. |
-| Plaintext exposed | None without the master password **while the vault is
-  locked**. See the caveat below for the unlocked-session blob. |
+| Plaintext exposed | None without the master password or the recovery
+  phrase **while the vault is locked**. See the caveat below for the
+  unlocked-session blob. |
 | Mitigation | Argon2id (m_cost = 64 MiB, t_cost = 3, p_cost = 1) +
   AES-256-GCM client-side (AC-VAULT-2, AC-VAULT-4).
 
@@ -85,7 +93,7 @@ Out of scope (handled in later phases):
 > your uid **without** the master password (its wrap key comes from public,
 > machine-bound inputs — `ADR-KVD-029`). So V2's "none without the master
 > password" applies to the secret blobs and the at-rest state; it does NOT
-> apply to the derived key while a session is live. An attacker who already has
+> apply to the vault key while a session is live. An attacker who already has
 > code execution as your user during an unlocked session is close to the O1
 > boundary (RAM dump) anyway. Locking the vault (`kvendra lock`, idle timeout,
 > or process exit) removes the blob's usefulness immediately.
@@ -96,7 +104,7 @@ Out of scope (handled in later phases):
 |---|---|
 | Attacker | Employee with infrastructure access. |
 | Capabilities | Total access to Kvendra-side cloud storage. |
-| Plaintext exposed | None — the derived key never leaves the user's
+| Plaintext exposed | None — the vault key never leaves the user's
   machine. |
 | Mitigation | Client-side encryption before any upload; the wire only
   carries the same opaque blobs that V2 already cannot decrypt.
@@ -154,8 +162,35 @@ Out of scope (handled in later phases):
 | Capabilities | Full Argon2id compute on their hardware. |
 | Plaintext exposed | None unless the master password itself is weak. |
 | Mitigation | Argon2id high-cost params (m_cost = 64 MiB, t_cost = 3)
-  push the per-attempt cost ≥ 1 second. Users with elevated threat
-  models can opt into stronger params via `kvendra config set`.
+  push the per-attempt cost ≥ 1 second. The parameters are stored in
+  `sentinel.blob` and bound into the wrap's AAD; values outside fixed
+  bounds are refused before anything is derived. There is no
+  `kvendra config set` to raise them today.
+
+### V9 — Theft of the recovery phrase
+
+| Field | Detail |
+|---|---|
+| Attacker | Has the 12-word phrase (photo, paper, password manager) and a copy of the vault files (`~/.kvendra/`, a disk snapshot). |
+| Capabilities | Opens `recovery.blob` offline and obtains the vault key. With `kvendra recover` on that copy they set a password of their choosing. |
+| Plaintext exposed | Every secret in that copy of the vault. |
+| Mitigation | None cryptographic: **the phrase is a secret of the same weight as the master password**. It is shown once at `kvendra init`, never stored in clear, and must be kept offline. Brute-forcing the phrase itself is not practical (128 bits of entropy). The phrase without the vault files is useless (the wrapping key is salted with the vault's `vault_id`). |
+
+### Changing the password does not revoke old copies
+
+`kvendra recover` and `kvendra passwd` re-wrap the SAME vault key under a
+new password: only `sentinel.blob` is replaced. Any older copy of
+`sentinel.blob` (inside a `kvendra backup` bundle pushed earlier, a disk
+snapshot, a Time Machine copy) still opens with the password that was in
+force when it was made, and it yields the same vault key, which decrypts
+the secrets of that copy and of any later copy. Likewise a copy of
+`recovery.blob` keeps opening with the phrase for as long as the vault
+exists.
+
+So `kvendra recover` is for a **forgotten** password, not a **stolen**
+one. If you suspect the password or the phrase leaked, create a new vault
+(move the vault home aside, run `kvendra init`) and rotate the credentials
+it held in each service. The success messages of both commands say so.
 
 ## Threat vectors explicitly accepted (O1–O6)
 
@@ -166,7 +201,7 @@ limits is engaging in security theatre.
 
 ### O1 — RAM dump during unlocked session
 
-While the vault is unlocked, the derived key lives in the `kvendra mcp
+While the vault is unlocked, the vault key lives in the `kvendra mcp
 serve` process's memory. An attacker with `root` and `ptrace` (or
 physical access) can dump that RAM. The optional OS-keychain integration
 (ADR-KVD-012) expands this surface to the OS keychain itself, which is
@@ -176,7 +211,10 @@ Note: when scripting unattended flows, the master password may transit
 through environment variables (`KVENDRA_PASSWORD` for `unlock` and
 `audit --verify`, `KVENDRA_INIT_PASSWORD` for `init`,
 `KVENDRA_NEW_PASSWORD` + `KVENDRA_RECOVERY_MNEMONIC` for `recover`,
-`KVENDRA_MCP_PASSWORD` for `mcp serve`). Environment variables are
+`KVENDRA_PASSWORD` + `KVENDRA_NEW_PASSWORD` for `passwd`,
+`KVENDRA_MCP_PASSWORD` for `mcp serve`). The recovery phrase is as
+sensitive as the master password: these variables are for tests and CI
+with throwaway vaults, never for a real phrase. Environment variables are
 visible to the process tree and to `/proc/<pid>/environ` on Linux —
 prefer the `--password-stdin` flag where available (currently
 `audit --verify`) and clear the variable as soon as the process spawns.
@@ -204,8 +242,12 @@ on multi-tenant hardware you do not trust.
 If a user is coerced, they will hand over the key. No cryptographic
 scheme defends against this.
 
-Mitigation: recovery codes (AC-VAULT-5) let the user reset access, and
-they can stop using the affected profile.
+Mitigation: none in the tool. Afterwards the user rotates the
+credentials held in the vault in each service and creates a new vault.
+Neither the 8 numeric recovery codes (they only authorise
+`kvendra config rebind-home`) nor `kvendra recover` (it keeps the same
+vault key, see "Changing the password does not revoke old copies") cut
+off someone who already has the password or the phrase.
 
 ### O5 — Compromise of an external service (GitHub, npm, AWS …)
 
@@ -265,7 +307,9 @@ future ROAD item.
 | Memory clearing | `zeroize` | `zeroize` | `ZeroizeOnDrop` on derived keys |
 | Constant-time ops | `subtle` | `subtle` | Compares for recovery codes |
 | Audit chain | HMAC-SHA-256 | `hmac` + `sha2` | Hashes `(id, ts, profile_id, primitive, action, args_hash, status, severity, flags, prev_hmac)` |
-| Recovery phrase | BIP-39 12 words | `bip39` | English wordlist, 132 bits entropy + checksum |
+| Recovery phrase | BIP-39 12 words | `bip39` | English wordlist, 128 bits entropy + 4-bit checksum |
+| Recovery wrap | BIP-39 seed (empty passphrase) + HKDF-SHA256 | `bip39` + `hkdf` | salt = `vault_id`, info = `kvendra/recovery-wrap/v1`; AES-256-GCM, AAD = `kvendra-recovery ‖ 0x00 ‖ version ‖ vault_id` |
+| Password wrap | Argon2id + AES-256-GCM | `argon2` + `aes-gcm` | AAD = `kvendra/sentinel-wrap/v2 ‖ 0x00 ‖ vault_id ‖ m_cost ‖ t_cost ‖ p_cost ‖ salt`; key check under AAD `kvendra/mk-check/v2 ‖ 0x00 ‖ vault_id` |
 
 ## Audit mechanism
 

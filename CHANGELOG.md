@@ -7,6 +7,145 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-11-10 — feat: forgotten-password recovery with the 12-word phrase + `kvendra passwd`
+
+Feature release (REQ-KVD-CLI-CFB449, ADR-KVD-CLI-4810AF). New vaults use an
+envelope key hierarchy, the 12-word phrase shown by `kvendra init` is now
+bound to the vault, and `kvendra recover` works for real on those vaults.
+**New on-disk format; read "Compatibility" before upgrading.**
+
+### Added
+
+- **Envelope key hierarchy** (ISSUE-KVD-CLI-4D253B). The vault key (MK) is
+  32 random bytes, never derived from the password, stored only wrapped.
+  Everything that hung from the key before (secret blobs, local variables,
+  HKDF sub-keys, signed allowlists/config, grants, backups, audit chain)
+  now hangs from MK, so a password change no longer touches any of it.
+- **`sentinel.blob` v2**: MK wrapped with AES-256-GCM under
+  `Argon2id(password, salt)` (64 MiB, t=3, p=1), plus `check`, an AEAD of a
+  constant under MK used to verify a candidate MK without the password. The
+  AAD binds the format label, `vault_id` and the Argon2id parameters;
+  parameters outside fixed bounds are refused before deriving anything.
+  The parser reads `version` first and fails closed on unknown versions.
+- **`recovery.blob` v1**: MK wrapped under
+  `HKDF-SHA256(salt = vault_id, IKM = BIP-39 seed of the phrase, info =
+  "kvendra/recovery-wrap/v1")`, AAD = format label, version and `vault_id`.
+  The phrase itself is never stored.
+- **`kvendra recover` is real** (ISSUE-KVD-CLI-5917B9). Phrase → new
+  password: checks that recovery is available before asking for the
+  phrase, validates the phrase (word count, wordlist, checksum; errors name
+  a position or a count, never a word), opens `recovery.blob`, verifies the
+  key against the sentinel, asks for the new password (≥ 8, confirmed) and
+  re-wraps MK. Distinct errors: `RecoveryUnavailable`,
+  `RecoveryPhraseInvalid`, `RecoveryPhraseMismatch`,
+  `RecoveryBlobMissing`, `RecoveryMaterialCorrupt` (replace the old
+  `RecoveryFailed`). Every one says "Nothing was changed".
+- **`kvendra passwd`** (ISSUE-KVD-CLI-80887F): change the master password
+  knowing the current one. Real terminal required (anti-captured-env, same
+  as `unlock`); `KVENDRA_PASSWORD` + `KVENDRA_NEW_PASSWORD` for tests/CI.
+- **Atomic password commit** shared by `recover` and `passwd` (`rekey`):
+  invalidate the session blob, this vault's keychain entries and the
+  legacy MCP wrapper →
+  copy to `sentinel.blob.pre-recover` → write `sentinel.blob.recover-tmp`
+  → rename (publication point) + dir fsync → verify the new password yields
+  the same MK → audit row (`recover_ok` / `passwd_ok`) → remove the copy.
+  Any failure restores the previous sentinel; a crash leaves a vault that
+  opens with the old password or the new one. Leftovers are cleaned by the
+  next `unlock` / `mcp serve` / `recover` / `passwd` (`recover_cleanup`).
+- **`audit.preauth.jsonl`**: rejected `recover` / `passwd` attempts happen
+  before any key exists, so they are appended there (0600, ≤ 1000 lines,
+  closed vocabulary, no secret) and imported into the HMAC chain at the next
+  successful unlock, flagged `preauth_unauthenticated`.
+- **Cargo feature `test-hooks`** (off by default, never in a published
+  build): fault injection (`KVENDRA_TEST_FAIL_AT`, `KVENDRA_TEST_CRASH_AT`)
+  and a fast-KDF switch for the crash-consistency test matrix. Without it
+  the hooks are inlined no-ops and the variables are ignored. CI also runs
+  the suite with default features.
+
+### Changed
+
+- **`kvendra init` is transactional** (ISSUE-KVD-CLI-E73A9E): all material
+  is built in memory, nothing touches the home before the confirmation
+  code; files are written as `recovery_codes.json` → `recovery.blob` →
+  `audit.db` → `config.toml` → `sentinel.blob` (tmp + fsync + rename, the
+  commit point); a failure before the rename removes what this run wrote.
+  Files left by an aborted earlier init are moved to
+  `.init-orphans-<ts>/`, never deleted. A `--save-to` file is removed if
+  init aborts. The banner now says what each item does: the phrase
+  recovers a forgotten password on the machine that holds the vault; the
+  8 codes only authorise `kvendra config rebind-home`.
+- **`kvendra backup` bundles include `recovery.blob`** (ISSUE-KVD-CLI-043B2B).
+  The backup key is derived from MK through the same HKDF chain as 0.8.0,
+  so 0.8.x backups still decrypt and a password change does not orphan
+  backups.
+
+### Fixed
+
+- **Restore no longer brings back an old password**
+  (ISSUE-KVD-CLI-043B2B). `kvendra backup pull` / `restore` open the bundle
+  with the CURRENT password; for a v2 bundle of this vault the staging
+  `sentinel.blob` is replaced by the local one, so a backup made before a
+  `recover` does not resurrect the forgotten password. A v2 bundle of
+  another vault is refused and no half-built staging is left behind.
+- Documentation: the threat model no longer says recovery codes reset
+  access, and `recover` is no longer described as disabled.
+- **`init --save-to` is safe to point anywhere**: the file is created
+  exclusively, never through a symlink (`O_NOFOLLOW`), with mode 0600 from
+  its creation (no 0644 window); an existing path is refused untouched,
+  and the file is removed if anything after its creation fails.
+- **Concurrent `kvendra init` runs on one home can no longer mix two
+  vaults**: a per-home lock serialises them and `sentinel.blob` is
+  published without overwriting (the loser aborts and rolls back).
+- **Keychain entries are per vault**: `recover` / `passwd` remove
+  `kvendra/mcp-password/v1` and `kvendra/derived-key/v1` only when they are
+  bound to THIS vault (an owner tag holding its `vault_id`, written by
+  `config mcp-password enable` / `migrate-to-keychain-acl` and by `unlock`
+  with the keychain cache). Entries of another vault, or untagged ones from
+  before 0.9, are left untouched. The final message of `recover` /
+  `passwd` reports each entry as removed, absent (no warning) or left
+  (with the `disable` command that removes it) instead of a fixed "the
+  keychain cache was cleared". A backend error reading the owner of
+  `mcp-password/v1` aborts the change before anything is deleted (all
+  owner tags are read first); `derived-key/v1` (presence flag only) is
+  best effort with a notice. On Linux/Windows a legacy
+  `kvendra/mcp-password/v1` written with `keyring` by alpha.3 or earlier
+  is now detected and removable (`recover`, `passwd`,
+  `config mcp-password disable`).
+- A stale `sentinel.blob.pre-recover` removed by a later `recover` /
+  `passwd` is audited as `recover_cleanup` too.
+- A `sentinel.blob.init-tmp` left by an init that crashed right after
+  publishing is removed at the next start when it matches `sentinel.blob`,
+  or moved to `.init-orphans-<ts>/` when it does not.
+- `recover` and `passwd` share a per-vault lock: a second one refuses
+  without changes instead of racing the first one's commit.
+- A 0.9 vault whose `recovery.blob` is missing gets its own message
+  (`RecoveryBlobMissing`) instead of "created before 0.9".
+- `--help` no longer prints the value of `KVENDRA_PASSWORD`,
+  `KVENDRA_INIT_PASSWORD`, `KVENDRA_MCP_PASSWORD` or the other secret env
+  vars.
+- `audit.db.backup.*` (pre-migration copies) are created 0600 and never
+  overwrite an earlier copy.
+- Hardening: Argon2id bounds also apply to 0.8.0 (v1) sentinels before
+  deriving; the pre-auth log import is capped (1000 lines / 256 KiB) and
+  idempotent after a crash; more secret buffers are zeroized.
+
+### Compatibility
+
+- **No migration.** Vaults created with 0.8.x or earlier (sentinel v1) keep
+  opening unchanged, but have no phrase recovery: `recover` and `passwd`
+  refuse on them without changing anything. The way out of a forgotten
+  password there is a new vault.
+- **No downgrade.** A vault created with 0.9.0 (sentinel v2) cannot be
+  opened by a 0.8.x binary.
+- **Recovery is for a forgotten password, not a stolen one.** A password
+  change keeps the same MK: older copies of `sentinel.blob` (earlier
+  backups, disk snapshots) still open with the old password. For a
+  suspected leak, create a new vault and rotate its credentials. See
+  `THREAT-MODEL.md` (V9).
+- **Not yet supported:** restoring onto a brand-new machine from a backup
+  plus the phrase (`backup pull` needs the current password and this
+  vault's files on the machine).
+
 ## [0.8.0] — 2026-10-08 — feat: silent refresh for `kvendra login --pro` + default client `kvendra-cli-public-v2`
 
 Feature release. `kvendra login --pro` sessions now refresh themselves

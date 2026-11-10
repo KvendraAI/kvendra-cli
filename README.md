@@ -76,7 +76,7 @@ https://github.com/KvendraAI/kvendra-cli/releases/latest):
   → "Run anyway".
 - **Linux**: `chmod +x kvendra && ./kvendra --version`.
 
-### What's included (0.8.0)
+### What's included (0.9.0)
 
 - ✓ Capability-based MCP broker (7 primitives + escape hatch)
 - ✓ Zero-knowledge vault (Argon2id + AES-256-GCM)
@@ -88,6 +88,9 @@ https://github.com/KvendraAI/kvendra-cli/releases/latest):
 - ✓ Local variables (`{{lvr:key}}`) for per-machine values, resolved by the broker
 - ✓ `kvendra secret show-allowlist` to inspect a profile's signed allowlist
 - ✓ Silent token refresh for `kvendra login --pro`
+- ✓ Forgotten-password recovery with the 12-word phrase (`kvendra recover`) and
+  password change (`kvendra passwd`) — vaults created with 0.9.0 or later only
+  (see [protection levels](docs/security/protection-levels.md))
 - ✓ Hundreds of tests plus an adversarial security suite, multi-OS CI (Ubuntu / macOS / Windows)
 
 ### Not yet shipped (on the roadmap)
@@ -119,8 +122,9 @@ recognised. Use the table:
 | `kvendra init` | `KVENDRA_INIT_PASSWORD` | Master password for fresh vault |
 | `kvendra init` | `KVENDRA_INIT_CONFIRM_CODE` | Pre-confirmation numeric code |
 | `kvendra unlock` | `KVENDRA_PASSWORD` | Master password to unlock the session |
-| `kvendra recover` | `KVENDRA_RECOVERY_MNEMONIC` | 12-word BIP-39 phrase |
-| `kvendra recover` | `KVENDRA_NEW_PASSWORD` | Replacement master password |
+| `kvendra recover` | `KVENDRA_RECOVERY_MNEMONIC` | 12-word recovery phrase (testing/CI only) |
+| `kvendra recover` | `KVENDRA_NEW_PASSWORD` | New master password (testing/CI only) |
+| `kvendra passwd` | `KVENDRA_PASSWORD` + `KVENDRA_NEW_PASSWORD` | Current and new master password (testing/CI only; both are required, otherwise a real terminal is) |
 | `kvendra mcp serve` | `KVENDRA_MCP_PASSWORD` | Master password for embedded unlock |
 | `kvendra audit --verify` | `KVENDRA_PASSWORD` | Master password for cross-process verify |
 | any subcommand | `KVENDRA_HOME` | Override `~/.kvendra/` for testing/sandboxing |
@@ -128,11 +132,16 @@ recognised. Use the table:
 `kvendra audit --verify` also accepts `--password-stdin` (recommended for
 scripts: pipe the password on stdin, no env var pollution).
 
+The recovery phrase and the master password are secrets of the same weight:
+never put the real ones in a CI environment. `kvendra recover` only works on
+vaults created with Kvendra 0.9.0 or later (they carry `recovery.blob`); on an
+older vault it refuses without changing anything.
+
 ## Cross-platform session model
 
 `kvendra unlock` runs **in your own terminal** (iTerm, Terminal.app,
 gnome-terminal, Windows Terminal — never inside an MCP client like Claude
-Code or Cursor). It derives the master key via Argon2id and writes a
+Code or Cursor). It unwraps the vault key with your password (Argon2id) and writes a
 session blob to `~/.kvendra/sessions/active.blob` encrypted with a
 machine-bound wrap key + HMAC sidecar + TTL. Every subsequent
 `kvendra mcp serve` subprocess reads the blob to install the derived

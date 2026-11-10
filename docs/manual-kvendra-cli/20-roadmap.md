@@ -93,7 +93,9 @@ Endurecimientos que no necesitan release mayor ni infra nueva:
 
 ## Estado de recuperación (`kvendra recover`)
 
-> **Advertencia (0.6.4):** la recuperación por mnemónica BIP-39 (`kvendra recover`) está **temporalmente deshabilitada / fail-closed** mientras se construye una implementación segura mnemonic-bound. El comando existe pero rechaza. Hasta entonces, **el camino de recuperación recomendado es un `kvendra backup` cifrado** — guárdalo, y conserva también tu mnemónica por escrito para cuando la recuperación vuelva. Ver `../security/protection-levels.md` y el [capítulo 10](./10-recuperacion.md).
+> **Estado (0.9.0):** `kvendra recover` funciona en vaults creados con `0.9.0` o posterior: la frase de 12 palabras envuelve la clave de vault en `recovery.blob` y fija una password nueva con un commit atómico. `kvendra passwd` cambia la password sabiendo la actual. En vaults anteriores ambos se niegan sin cambiar nada (no hay migración) y no hay downgrade de un vault v2 a `0.8.x`.
+>
+> **Pendiente:** restaurar en una máquina nueva solo con `kvendra backup` + frase (hoy `backup pull` necesita el `sentinel.blob` del vault en la máquina). Ver `../security/protection-levels.md` y el [capítulo 10](./10-recuperacion.md).
 
 ## Política de versionado
 

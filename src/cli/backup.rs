@@ -153,21 +153,18 @@ fn read_password(password_stdin: bool) -> KvendraResult<String> {
 fn derive_backup_key_from_password(password: &str) -> KvendraResult<[u8; 32]> {
     let home = kvendra_home()?;
     let vault = crate::vault::Vault::new(home);
-    let mut session_key = vault.audit_hmac_key_from_password(password.as_bytes())?;
-    // session_key is the derived audit-hmac sub-key. We need the master key
-    // itself. The Vault exposes audit_hmac_key_from_password which already
-    // does Argon2id + HKDF for audit. For backup we must derive a *different*
-    // sub-key from the same master. The simplest correct approach: re-derive
-    // the master directly via the same path used by Vault::derive_master.
-    //
-    // M2 MVP shortcut: chain HKDF over the audit-hmac subkey itself (so the
-    // backup key is uniquely separated from audit and we never touch the
-    // master plaintext in this layer). This is cryptographically sound
-    // (additional HKDF stage with a distinct info) and keeps the existing
-    // master-derivation code path untouched.
-    let key = crypto::derive_backup_key(&session_key);
-    session_key.zeroize();
-    Ok(key)
+    let mk = vault.master_key_from_password(password.as_bytes())?;
+    Ok(backup_key_from_master_key(&mk))
+}
+
+/// Backup cipher key = HKDF(backup-info) over the audit-HMAC sub-key of the
+/// vault key. Same chain as 0.8.0 (frozen by a v1 fixture vector), so
+/// backups made before 0.9 keep decrypting; with the envelope it hangs from
+/// MK, so a password change (recover / passwd) does not orphan backups.
+pub fn backup_key_from_master_key(mk: &crate::vault::envelope::MasterKey) -> [u8; 32] {
+    use crate::vault::session::{HKDF_INFO_AUDIT_HMAC, hkdf_expand};
+    let audit_sub = hkdf_expand(mk.as_bytes(), HKDF_INFO_AUDIT_HMAC);
+    crypto::derive_backup_key(audit_sub.as_bytes())
 }
 
 async fn run_push(args: PushArgs) -> KvendraResult<()> {
@@ -240,26 +237,20 @@ async fn run_pull(args: PullArgs) -> KvendraResult<()> {
     let home = kvendra_home()?;
     load_pro_jwt()?;
     let mut password = read_password(args.password_stdin)?;
-    let backup_key = match derive_backup_key_from_password(&password) {
-        Ok(k) => k,
-        Err(e) => {
-            password.zeroize();
-            return Err(e);
-        }
-    };
-    // REQ-KVD-11F906 AC-LVR-6 — the password lives until the restored
-    // `vars.blob` is re-sealed below; it is zeroized on every exit path.
-    let result = pull_into_staging(&args, &home, &backup_key, &password).await;
+    let local = crate::vault::Vault::new(home.clone());
+    let mk = local.master_key_from_password(password.as_bytes());
     password.zeroize();
-    result
+    let mk = mk?;
+    pull_into_staging(&args, &home, &local, &mk).await
 }
 
 async fn pull_into_staging(
     args: &PullArgs,
     home: &std::path::Path,
-    backup_key: &[u8; 32],
-    password: &str,
+    local: &crate::vault::Vault,
+    mk: &crate::vault::envelope::MasterKey,
 ) -> KvendraResult<()> {
+    let backup_key = backup_key_from_master_key(mk);
     let client = pro_client().await?;
     let backup_id = match args.id.clone() {
         Some(id) => id,
@@ -272,34 +263,44 @@ async fn pull_into_staging(
         }
     };
     let ciphertext = client.pull(&backup_id).await?;
-    let tar_bytes = crypto::decrypt_bundle(backup_key, &ciphertext)?;
+    let mut tar_bytes = crypto::decrypt_bundle(&backup_key, &ciphertext)?;
 
     let target = args
         .out
         .clone()
         .unwrap_or_else(|| home.join("staging_restore"));
     if target.exists() && !args.yes {
+        tar_bytes.zeroize();
         println!(
             "Target dir already exists: {}. Use --yes to proceed.",
             target.display()
         );
         return Err(KvendraError::Vault("restore aborted by user".into()));
     }
-    let n = bundle::extract_bundle(&tar_bytes, &target)?;
-    // A restored variable is never trusted until a human re-verifies it on
-    // this machine (`kvendra vars verify`): restore only LOWERS `verified`.
-    let reset = crate::vars::mark_restored_unverified(&target, password.as_bytes())?;
-    if reset > 0 {
+    // F4 (ISSUE-KVD-CLI-043B2B): the staging sentinel is reconciled with the
+    // local one (current password) and a restored variable is never trusted
+    // until a human re-verifies it (`kvendra vars verify`).
+    let report = crate::backup::restore::restore_into_staging(local, mk, &tar_bytes, &target);
+    tar_bytes.zeroize();
+    let report = report?;
+    if report.vars_reset > 0 {
         println!(
-            "{reset} local variable(s) restored as unverified — run `kvendra vars verify --all` \
-             in your terminal after moving the restore into place"
+            "{} local variable(s) restored as unverified — run `kvendra vars verify --all` \
+             in your terminal after moving the restore into place",
+            report.vars_reset
+        );
+    }
+    if report.sentinel_replaced {
+        println!(
+            "The restored sentinel.blob was replaced by this vault's current one: the restore \
+             opens with your CURRENT master password."
         );
     }
     println!(
         "Restored backup {} → {} ({} entries)",
         backup_id,
         target.display(),
-        n
+        report.entries
     );
     Ok(())
 }

@@ -49,6 +49,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features --workspace --locked
+      # Default features (no `test-hooks`): the fault-injection hooks must be
+      # a no-op and the suite must pass without them (REQ-KVD-CLI-CFB449).
+      - run: cargo test --workspace --locked
       - run: cargo build --release --locked
 
   msrv:

@@ -70,7 +70,7 @@ Tres palabras del [glosario canónico](./README.md) merecen mención explícita 
 
 Capability-based security no es magia. El modelo Kvendra explícita lo que protege y lo que no en el [threat model](./18-threat-model.md). En particular:
 
-- Mientras la sesión está *unlocked*, la derived key vive en RAM. Un atacante con root + ptrace puede dumpearla. Esto es el **vector O1**, aceptado como trade-off de la categoría de producto. La mitigación post-MVP es hardware-backed wrapping (Secure Enclave / TPM / Yubikey).
+- Mientras la sesión está *unlocked*, la clave de vault vive en RAM. Un atacante con root + ptrace puede dumpearla. Esto es el **vector O1**, aceptado como trade-off de la categoría de producto. La mitigación post-MVP es hardware-backed wrapping (Secure Enclave / TPM / Yubikey).
 - Si el agente usa el escape hatch `kvendra.unsafe.raw_token`, el plaintext **sí** llega al contexto del agente — por diseño, para casos edge no cubiertos. Cada uso queda audit-flagged.
 - El detection layer flagea o bloquea tokens detectados en input/output, pero no es un sustituto del workflow correcto: si pegas un token nuevo en el chat, lo más sensato es darlo de alta como profile (`kvendra secret add`) y rotar el original (`kvendra secret rotate`).
 

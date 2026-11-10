@@ -29,7 +29,7 @@ Audiencia interna del equipo Kvendra. **Versión documentada: `0.6.4`** (crates.
 7. [Allowlist DSL](./07-allowlist-dsl.md) — YAML por profile, defaults restrictivos, ejemplos por servicio.
 8. [Audit log](./08-audit-log.md) — `kvendra audit` (TUI / `--json` / `--verify`), HMAC chain, troubleshooting.
 9. [TUI dashboard](./09-tui-dashboard.md) — `kvendra dashboard`, `kvendra audit --watch`.
-10. [Recuperación](./10-recuperacion.md) — olvido de master password, recovery codes, regeneración.
+10. [Recuperación](./10-recuperacion.md) — password olvidada (`kvendra recover`), cambio de password (`kvendra passwd`), backup, recovery codes.
 
 ### Parte II — Técnica
 

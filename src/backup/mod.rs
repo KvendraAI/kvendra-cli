@@ -11,6 +11,7 @@ pub mod bundle;
 pub mod client;
 pub mod crypto;
 pub mod manifest;
+pub mod restore;
 
 pub use bundle::{build_bundle, extract_bundle};
 pub use manifest::BackupManifest;

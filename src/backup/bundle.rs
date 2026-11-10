@@ -7,6 +7,10 @@
 //!   - `audit.db` (best-effort — bloqueado por WAL si MCP serve está corriendo)
 //!   - `sentinel.blob`
 //!   - `recovery_codes.json`
+//!   - `recovery.blob` (0.9+: the vault key wrapped under the recovery
+//!     phrase — same key as the bundle, so it is safe to carry; on restore
+//!     the bundle's copy is kept and the sentinel is reconciled with the
+//!     local one, see `backup::restore`)
 //!   - `vars.blob` (local variables, REQ-KVD-11F906 — restored with every
 //!     variable `verified:false`; the rotated copies `vars.blob.1..3` stay
 //!     out)
@@ -24,6 +28,7 @@ const INCLUDE_TOP_LEVEL: &[&str] = &[
     "audit.db",
     "sentinel.blob",
     "recovery_codes.json",
+    "recovery.blob",
     "vars.blob",
 ];
 

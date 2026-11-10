@@ -58,7 +58,7 @@ pub async fn run(cmd: McpPasswordCommand) -> KvendraResult<()> {
     let home = kvendra_home()?;
     crate::config::ensure_layout(&home)?;
     match cmd {
-        McpPasswordCommand::Enable => enable(),
+        McpPasswordCommand::Enable => enable(&home),
         McpPasswordCommand::MigrateToKeychainAcl(args) => {
             migrate_to_keychain_acl(&home, &args.client)
         }
@@ -67,9 +67,10 @@ pub async fn run(cmd: McpPasswordCommand) -> KvendraResult<()> {
     }
 }
 
-fn enable() -> KvendraResult<()> {
+fn enable(home: &Path) -> KvendraResult<()> {
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = home;
         Err(KvendraError::Config(
             "config mcp-password enable is only available on macOS — \
              use the KVENDRA_MCP_PASSWORD env var on Linux/Windows \
@@ -86,6 +87,7 @@ fn enable() -> KvendraResult<()> {
         }
         keychain_acl::save_with_user_presence(MCP_PASSWORD_LABEL, &password)
             .map_err(map_biometric_error)?;
+        crate::rekey::bind_keychain_owner(home, MCP_PASSWORD_LABEL);
         println!("Stored mcp-password in OS keychain with presence ACL.");
         println!();
         println!("Update your MCP client config (e.g. ~/.claude.json) to:");
@@ -166,6 +168,8 @@ fn migrate_to_keychain_acl(home: &Path, client: &str) -> KvendraResult<()> {
         ));
     }
 
+    crate::rekey::bind_keychain_owner(home, MCP_PASSWORD_LABEL);
+
     if let Some(obj) = kvendra_obj.as_object_mut() {
         obj.insert(
             "command".into(),
@@ -243,6 +247,7 @@ fn disable(home: &Path) -> KvendraResult<()> {
         Ok(_) | Err(BiometricError::NotFound(_)) | Err(BiometricError::Unavailable(_)) => {}
         Err(e) => return Err(map_biometric_error(e)),
     }
+    crate::rekey::unbind_keychain_owner(MCP_PASSWORD_LABEL);
     let wrapper = wrapper_path(home);
     if wrapper.exists() {
         std::fs::remove_file(&wrapper)?;

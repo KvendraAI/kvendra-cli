@@ -1,7 +1,7 @@
 //! `kvendra mcp serve` — start the JSON-RPC MCP server on stdio.
 //!
 //! The MCP server runs in the same process as the unlocked vault session
-//! (the Argon2id-derived key is RAM-only per ADR-KVD-012). Order of
+//! (the vault key is RAM-only per ADR-KVD-012). Order of
 //! preference for obtaining that key, in this release:
 //!
 //! 1. **Local session blob** (REQ-KVD-CLI-011 / ADR-KVD-029) — the
@@ -46,6 +46,7 @@ pub struct ServeArgs {
     #[arg(
         long,
         env = "KVENDRA_MCP_PASSWORD",
+        hide_env_values = true,
         conflicts_with_all = ["use_keychain", "no_unlock"]
     )]
     pub password_env: Option<String>,
@@ -69,7 +70,13 @@ pub async fn run(cmd: McpCommand) -> KvendraResult<()> {
             let cfg = Config::load(&home, None).unwrap_or_default();
             let vault = Vault::new(home.clone());
             if !args.no_unlock && vault.sentinel_path().exists() {
+                crate::rekey::cleanup_before_auth(&vault)?;
                 attach_session_key(&vault, &home, &args, cfg.vault.idle_timeout_minutes).await?;
+                if let Ok(hmac_key) = vault.audit_hmac_key()
+                    && let Err(e) = crate::rekey::finish_after_auth(&home, hmac_key).await
+                {
+                    tracing::warn!(target: "kvendra::mcp", "post-unlock housekeeping failed: {e}");
+                }
             }
             // TTL re-check on every tool call is intentionally deferred
             // post-alpha.1: the derived key already lives in this process's
@@ -366,4 +373,52 @@ mod tests {
     // builds. Validator FASE 5 (winking-owl-skills:validator) MUST exercise
     // path #3 manually on a Mac box, asserting the vault transitions to
     // Unlocked (no pending) when biometric/presence ACL succeeds.
+
+    /// REQ-KVD-CLI-CFB449 AC-REC-9 — after `recover` the session blob that
+    /// carried the vault key is gone, so `mcp serve` without credentials
+    /// boots in `LockedPendingUnlock` (it cannot self-unlock from a stale
+    /// cache). Fake keychain only.
+    #[tokio::test]
+    async fn mcp_boots_pending_after_recover() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        crate::config::ensure_layout(&home).unwrap();
+        let v = Vault::new(home.clone());
+        let m = v
+            .create_with_params_returning_material(b"hunter2-recover-mcp", fast_params())
+            .unwrap();
+        v.unlock(b"hunter2-recover-mcp", 30).unwrap();
+        let state = crate::session::local::build_state_for_current_machine(
+            v.peek_session_derived_key().unwrap(),
+            std::time::Duration::from_secs(3600),
+            &home,
+        )
+        .unwrap();
+        crate::session::local::persist_atomic(&state, &home).unwrap();
+        v.lock();
+
+        let caches = crate::rekey::FileCredentialCaches {
+            dir: dir.path().join("fake-keychain"),
+        };
+        let phrase = m.mnemonic.to_string();
+        crate::rekey::recover_with_phrase(
+            &v,
+            move || Ok(zeroize::Zeroizing::new(phrase)),
+            || Ok(zeroize::Zeroizing::new("hunter2-recover-new".to_string())),
+            &caches,
+        )
+        .await
+        .unwrap();
+
+        let fresh = Vault::new(home.clone());
+        let args = ServeArgs {
+            password_env: None,
+            use_keychain: false,
+            no_unlock: false,
+        };
+        super::attach_session_key(&fresh, &home, &args, 30)
+            .await
+            .unwrap();
+        assert_eq!(fresh.state(), VaultStateKind::LockedPendingUnlock);
+    }
 }

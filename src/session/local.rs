@@ -1,6 +1,6 @@
 //! Local master-session blob (REQ-KVD-CLI-011, ADR-KVD-029).
 //!
-//! Persists the Argon2id-derived vault key encrypted with a machine-bound
+//! Persists the vault key (MK) encrypted with a machine-bound
 //! wrap key (sub-key `kvendra/session-wrap/v1`) and a TTL, so the subprocess
 //! `kvendra mcp serve` can unlock the vault without re-prompting the master
 //! password every time a client like Claude Code or Cursor invokes it.
@@ -66,7 +66,8 @@ impl ActiveBlobPaths {
 }
 
 /// In-memory representation of the local session. The `derived_key` is the
-/// Argon2id-derived vault key (32 bytes), zeroized on drop.
+/// vault key (MK, 32 bytes: random since 0.9, the Argon2id output on 0.8
+/// vaults), zeroized on drop.
 pub struct LocalSessionState {
     pub derived_key: [u8; 32],
     pub expires_at: DateTime<Utc>,

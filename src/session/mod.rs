@@ -8,8 +8,8 @@
 //!   ≤30d refresh TTL.
 //!
 //! - **Local master session** (`local`, REQ-KVD-CLI-011 / ADR-KVD-029) —
-//!   `active.blob` + `active.blob.hmac`. Stores the Argon2id-derived vault
-//!   key encrypted with the machine-bound wrap key
+//!   `active.blob` + `active.blob.hmac`. Stores the vault key (MK) of the
+//!   vault, encrypted with the machine-bound wrap key
 //!   `kvendra/session-wrap/v1` + HMAC sidecar + TTL. Allows the subprocess
 //!   `kvendra mcp serve` to unlock the vault without re-prompting the
 //!   master password each time a client like Claude Code or Cursor spawns

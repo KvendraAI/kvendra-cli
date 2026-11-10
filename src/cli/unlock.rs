@@ -45,7 +45,7 @@ pub struct UnlockArgs {
     /// Read password from env var (testing/CI). Skips the anti-captured-env
     /// TTY guard because non-interactive environments have no TTY by
     /// definition.
-    #[arg(long, env = "KVENDRA_PASSWORD")]
+    #[arg(long, env = "KVENDRA_PASSWORD", hide_env_values = true)]
     pub password_env: Option<String>,
     /// Refresh the TTL of the existing session. Re-authenticates with the
     /// master password (v0.6.4, finding A1) — reads it from the TTY, or from
@@ -163,6 +163,9 @@ pub async fn run(args: UnlockArgs) -> KvendraResult<()> {
     // Zeroize the plaintext master password after use, on both success and
     // error paths (mirrors the `--extend` path hardened for A1; `String::drop`
     // frees but does not wipe the heap buffer).
+    // REQ-KVD-CLI-CFB449 AC-REC-6 — drop an unpublished re-wrap tmp left by
+    // a crashed recover/passwd before reading the sentinel.
+    crate::rekey::cleanup_before_auth(&vault)?;
     let unlock_res = vault.unlock(password.as_bytes(), cfg.vault.idle_timeout_minutes);
     password.zeroize();
     unlock_res?;
@@ -187,8 +190,20 @@ pub async fn run(args: UnlockArgs) -> KvendraResult<()> {
 
     // Legacy ADR-KVD-012 sentinel: update the OS keychain "presence flag"
     // if the user opted in. Does not store the derived key itself.
-    if !args.no_keychain && cfg.vault.master_password_cache == MasterPasswordCache::OsKeychain {
-        let _ = store_derived_key_in_keychain(&B64.encode(b"kvendra-keychain-sentinel-v1"));
+    if !args.no_keychain
+        && cfg.vault.master_password_cache == MasterPasswordCache::OsKeychain
+        && store_derived_key_in_keychain(&B64.encode(b"kvendra-keychain-sentinel-v1")).is_ok()
+    {
+        crate::rekey::bind_keychain_owner(&home, crate::rekey::KEYCHAIN_DERIVED_KEY_LABEL);
+    }
+
+    // AC-REC-6/7 — with the key in hand: remove a leftover pre-recover copy
+    // (audited `recover_cleanup`) and import pending pre-auth rejections
+    // into the HMAC chain (`preauth_unauthenticated`).
+    if let Ok(hmac_key) = vault.audit_hmac_key()
+        && let Err(e) = crate::rekey::finish_after_auth(&home, hmac_key).await
+    {
+        tracing::warn!(target: "kvendra::unlock", "post-unlock housekeeping failed: {e}");
     }
 
     // Audit FLAG_UNLOCK_SUCCEEDED. We have a live SessionKey, so we can
@@ -368,5 +383,60 @@ mod tests {
         unsafe {
             std::env::remove_var("KVENDRA_HOME");
         }
+    }
+
+    /// REQ-KVD-CLI-CFB449 AC-REC-6/7 — the next successful `kvendra unlock`
+    /// imports pre-auth rejections into the HMAC chain
+    /// (`preauth_unauthenticated`) and removes a leftover pre-recover copy
+    /// (`recover_cleanup`); the chain still verifies.
+    #[tokio::test]
+    async fn unlock_imports_preauth_rows_and_cleans_pre_recover() {
+        let _guard = crate::test_env_lock().lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let v = Vault::new(home.to_path_buf());
+        v.create_with_params(b"hunter2-preauth", fast_params())
+            .unwrap();
+        v.unlock(b"hunter2-preauth", 30).unwrap();
+        Config::default().save(home, &v).unwrap();
+        v.lock();
+        crate::audit::preauth::record_rejection(
+            home,
+            "recover",
+            crate::audit::preauth::Reason::PhraseMismatch,
+        );
+        let pre = crate::rekey::pre_recover_path(&v);
+        std::fs::copy(v.sentinel_path(), &pre).unwrap();
+        std::fs::write(crate::rekey::recover_tmp_path(&v), b"half").unwrap();
+
+        unsafe {
+            std::env::set_var("KVENDRA_HOME", home);
+        }
+        run(UnlockArgs {
+            password_env: Some("hunter2-preauth".into()),
+            extend: false,
+            ttl: Some("1h".into()),
+            no_keychain: true,
+        })
+        .await
+        .unwrap();
+        unsafe {
+            std::env::remove_var("KVENDRA_HOME");
+        }
+
+        assert!(!pre.exists());
+        assert!(!crate::rekey::recover_tmp_path(&v).exists());
+        assert!(!crate::audit::preauth::path(home).exists());
+        let conn = crate::audit::reader::open_readonly(&home.join("audit.db")).unwrap();
+        let rows = crate::audit::reader::list_all(&conn).unwrap();
+        assert!(
+            rows.iter()
+                .any(|r| r.flags.contains("preauth_unauthenticated")
+                    && r.flags.contains("recover_rejected_phrase_mismatch"))
+        );
+        assert!(rows.iter().any(|r| r.flags == "recover_cleanup"));
+        let key = v.audit_hmac_key_from_password(b"hunter2-preauth").unwrap();
+        crate::audit::reader::verify_chain(&conn, &key).unwrap();
     }
 }

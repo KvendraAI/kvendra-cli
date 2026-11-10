@@ -16,8 +16,9 @@ graph TB
     end
 
     subgraph Vault[vault/ — crypto + storage]
-        VSession[session.rs<br/>derived_key en RAM]
+        VSession[session.rs<br/>clave de vault en RAM]
         Kdf[kdf.rs<br/>Argon2id]
+        Envelope[envelope.rs<br/>sentinel v2 + recovery.blob v1]
         Crypto[crypto.rs<br/>AES-256-GCM]
         Blob[blob.rs<br/>secret blobs]
         Recovery[recovery.rs<br/>BIP-39 + codes]
@@ -117,13 +118,13 @@ graph TB
 
 `main.rs` parsea argv con `clap` v4 (derive macros + env support) y despacha al subcomando correspondiente. Cada subcomando es un módulo separado bajo `cli/` (`cli/init.rs`, `cli/unlock.rs`, …), con el enum `Commands` en `cli/mod.rs`. La estructura es plana — sin frameworks de plugin, sin dynamic dispatch.
 
-Subcomandos en `0.6.4`: `init`, `unlock`, `lock`, `login`, `logout`, `session` (`info`), `workspace`, `recover`, `secret`, `primitive`, `mcp`, `audit`, `dashboard`, `completion`, `config`, `backup`, `notifs`, `capabilities`, `bypass`, `protect`, `grant-pubkey`, `verify-grant`.
+Subcomandos (`kvendra --help`; `passwd` desde `0.9.0`): `init`, `unlock`, `lock`, `login`, `logout`, `session` (`info`), `workspace`, `recover`, `passwd`, `secret`, `primitive`, `mcp`, `audit`, `dashboard`, `completion`, `config`, `backup`, `notifs`, `capabilities`, `bypass`, `protect`, `grant-pubkey`, `verify-grant`.
 
 ### `vault/` — cripto y storage
 
 Donde vive la disciplina zero-knowledge. Cubierto en detalle en el [capítulo 12](./12-vault-criptografia.md). Submódulos:
 
-> **`vault::session`** — `Vault::unlock` / `Vault::lock`, derived_key en RAM, idle timer, constantes HKDF info (`kvendra/audit-hmac/v1`, `kvendra/allowlist-hmac/v1`, `kvendra/config-hmac/v1`).
+> **`vault::session`** — `Vault::unlock` / `Vault::lock`, clave de vault en RAM, idle timer, constantes HKDF info (`kvendra/audit-hmac/v1`, `kvendra/allowlist-hmac/v1`, `kvendra/config-hmac/v1`).
 >
 > **`vault::kdf`** — Argon2id derive con cost params canónicos.
 >
@@ -131,13 +132,19 @@ Donde vive la disciplina zero-knowledge. Cubierto en detalle en el [capítulo 12
 >
 > **`vault::blob`** — formato de blob (header metadata + nonce + ciphertext + tag), serialización base64.
 >
-> **`vault::recovery`** — BIP-39 phrase generation y verification, recovery codes Argon2id-hashed.
+> **`vault::envelope`** (0.9.0) — jerarquía envelope: `MasterKey` aleatoria, `sentinel.blob` v2 (wrap Argon2id + `check`), `recovery.blob` v1 (wrap con la frase), AADs y parsers versionados.
+>
+> **`vault::recovery`** — generación y parseo de la frase BIP-39 (delegan en `vault::envelope`), recovery codes Argon2id-hashed.
+>
+> **`rekey`** (0.9.0) — commit atómico del cambio de password compartido por `kvendra recover` y `kvendra passwd` (invalidación de cachés, `sentinel.blob.pre-recover`, tmp + rename, verificación, fila de audit, limpieza).
+>
+> **`audit::preauth`** (0.9.0) — `audit.preauth.jsonl`: rechazos de `recover`/`passwd` antes de tener clave, importados a la cadena HMAC con el flag `preauth_unauthenticated`.
 
 > **Nota:** en 0.6.4 la integración con el OS keychain vive en el módulo top-level **`keychain_acl/`** (`macos.rs` con `SecAccessControlCreateWithFlags(.userPresence)` — Touch ID o modal del OS; Windows/Linux rechazan fail-closed en esta release, `ADR-KVD-012` / `REQ-KVD-005`), no bajo `vault/`.
 
 ### `session/` — persistencia de sesión
 
-`vault::session` mantiene la derived key **en RAM**; la **sesión en disco** vive aparte, en `session/`:
+`vault::session` mantiene la clave de vault **en RAM**; la **sesión en disco** vive aparte, en `session/`:
 
 > **`session::local`** — `~/.kvendra/sessions/active.blob` machine-bound (hostname + uid + ruta), cifrado bajo la vault key, con TTL. Lo escribe `kvendra unlock` en tu terminal y lo lee cada `kvendra mcp serve` (`REQ-KVD-CLI-011` / `ADR-KVD-029`). `session::ttl` y `session::wrap_key` sostienen el TTL y el wrapping.
 >

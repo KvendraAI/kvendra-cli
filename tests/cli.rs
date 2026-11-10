@@ -24,6 +24,7 @@ fn cli_help_lists_subcommands() {
         .stdout(contains("unlock"))
         .stdout(contains("lock"))
         .stdout(contains("recover"))
+        .stdout(contains("passwd"))
         .stdout(contains("secret"))
         .stdout(contains("primitive"))
         .stdout(contains("mcp"))
@@ -343,4 +344,37 @@ fn backup_list_rejects_zero_limit() {
         .assert()
         .failure()
         .stderr(contains("--limit"));
+}
+
+/// Validation finding B7 — `--help` never prints the value of a password /
+/// phrase env var (clap shows `[env: X=<value>]` unless `hide_env_values`).
+#[test]
+fn help_never_prints_secret_env_values() {
+    let secret = "kvd-help-secret-value-91c2";
+    for args in [
+        vec!["init", "--help"],
+        vec!["unlock", "--help"],
+        vec!["mcp", "serve", "--help"],
+        vec!["recover", "--help"],
+        vec!["passwd", "--help"],
+    ] {
+        let out = Command::cargo_bin("kvendra")
+            .unwrap()
+            .args(&args)
+            .env("KVENDRA_INIT_PASSWORD", secret)
+            .env("KVENDRA_INIT_CONFIRM_CODE", secret)
+            .env("KVENDRA_PASSWORD", secret)
+            .env("KVENDRA_MCP_PASSWORD", secret)
+            .env("KVENDRA_NEW_PASSWORD", secret)
+            .env("KVENDRA_RECOVERY_MNEMONIC", secret)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!all.contains(secret), "{args:?} printed a secret env value");
+    }
 }

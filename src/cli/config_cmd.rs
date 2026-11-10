@@ -93,6 +93,7 @@ pub async fn run(cmd: ConfigCommand) -> KvendraResult<()> {
                     if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_LABEL) {
                         let _ = entry.delete_credential();
                     }
+                    crate::rekey::unbind_keychain_owner(KEYCHAIN_LABEL);
                     println!("OS keychain integration disabled. Stored entry wiped.");
                 }
                 KeychainCommand::Status => {

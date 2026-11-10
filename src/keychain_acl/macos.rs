@@ -20,7 +20,7 @@ use security_framework::access_control::SecAccessControl;
 use security_framework_sys::base::{errSecAuthFailed, errSecItemNotFound, errSecSuccess};
 use security_framework_sys::item::{
     kSecAttrAccessControl, kSecAttrAccount, kSecAttrService, kSecClass, kSecClassGenericPassword,
-    kSecReturnData, kSecValueData,
+    kSecReturnAttributes, kSecReturnData, kSecValueData,
 };
 use security_framework_sys::keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete};
 
@@ -108,6 +108,30 @@ pub fn read_with_user_presence(label: &str) -> Result<String, BiometricError> {
     };
     String::from_utf8(bytes)
         .map_err(|e| BiometricError::Backend(format!("keychain item not utf8: {e}")))
+}
+
+/// Whether an item exists, WITHOUT reading its data: an attributes-only
+/// query (`kSecReturnAttributes`, no `kSecReturnData`), which does not
+/// evaluate the `userPresence` ACL that only guards the secret.
+pub fn exists(label: &str) -> Result<bool, BiometricError> {
+    let mut query = build_query(label);
+    unsafe {
+        let cf_true = core_foundation::boolean::CFBoolean::true_value();
+        query.add(
+            &CFString::wrap_under_get_rule(kSecReturnAttributes),
+            &cf_true.as_CFType(),
+        );
+    }
+    let mut result: CFTypeRef = std::ptr::null();
+    let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut result) };
+    if !result.is_null() {
+        unsafe { CFRelease(result) };
+    }
+    match status {
+        s if s == errSecSuccess => Ok(true),
+        s if s == errSecItemNotFound => Ok(false),
+        other => Err(BiometricError::Backend(format!("OSStatus {other}"))),
+    }
 }
 
 pub fn delete(label: &str) -> Result<(), BiometricError> {

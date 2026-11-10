@@ -52,7 +52,7 @@ graph LR
 | # | Atacante | Capacidades | Plaintext expuesto | Mitigación canónica |
 |---|----------|-------------|-------------------|---------------------|
 | **V1** | Pasive observer del repo público (Apache-2.0) | Lee todo el código fuente | Ninguno | Auditabilidad como feature |
-| **V2** | Lectura de `~/.kvendra/` (backup leak, snapshot disco) | Lee blobs cifrados + audit.db | Ninguno sin master password | Argon2id high-cost + AES-256-GCM client-side |
+| **V2** | Lectura de `~/.kvendra/` (backup leak, snapshot disco) | Lee blobs cifrados + audit.db | Ninguno sin master password ni recovery phrase | Argon2id high-cost + AES-256-GCM client-side |
 | **V3** | Kvendra-team malicioso (insider) | Acceso total a infra Kvendra | Ninguno — la key del vault nunca cruza red | Cifrado client-side antes de cualquier upload (el Pro backup sube el vault **ya cifrado**; la key nunca sale de tu máquina) |
 | **V4** | AWS breach (post-MVP cloud sync) | Acceso completo a S3 + Lambda + KMS Kvendra-internal | Solo blobs cifrados; KMS Kvendra-internal NO toca secrets de user | Cifrado client-side; KMS solo para infra Kvendra |
 | **V5** | Auditor externo | Acceso a código + (post-MVP) infra cloud | Verificable: ningún codepath imprime/persiste plaintext | Auditabilidad |
@@ -116,19 +116,25 @@ Detalle: `../security/advisory-cli-0.6.4.md`. Reporte original: `ISSUE-KVD-CLI-B
 
 | # | Vector | Por qué aceptado | Mitigación post-MVP |
 |---|--------|------------------|---------------------|
-| **O1** | RAM dump durante sesión unlocked | Mientras el vault está unlocked, la derived key vive en RAM. Atacante con root + ptrace puede dumpearla. Trade-off de la categoría de producto. | Hardware-backed wrapping (Secure Enclave / TPM 2.0 / Yubikey FIDO2) |
+| **O1** | RAM dump durante sesión unlocked | Mientras el vault está unlocked, la clave de vault vive en RAM. Atacante con root + ptrace puede dumpearla. Trade-off de la categoría de producto. | Hardware-backed wrapping (Secure Enclave / TPM 2.0 / Yubikey FIDO2) |
 | **O1.env-var** | `KVENDRA_PASSWORD` env var visibility | El password plaintext es visible en `/proc/<pid>/environ` y `ps eww` durante la duración del comando que lo consume. Trade-off de UX vs threat model aceptado por owner para enable CI/scripts. Users en máquinas multi-tenant deben preferir `--password-stdin`. | El binary lee la env var **una vez** al inicio y `unsetenv()` antes de cualquier exec subsidiario. |
 | **O2** | Malware persistente en máquina del user con privilegios root | Si el atacante puede sustituir el binario, puede lograr cualquier cosa | Reproducible builds + SLSA-signed releases (post-MVP) |
 | **O3** | Side-channel timing attacks en CPU compartida | Argon2id es resistente pero no perfecto | `subtle` crate para constant-time ops |
-| **O4** | Coercion legal del user ("rubber-hose attack") | El user tiene la key | Recovery codes permiten reset; no es problema técnico |
+| **O4** | Coercion legal del user ("rubber-hose attack") | El user tiene la key | Ninguna en la herramienta: vault nuevo y rotar credenciales. Ni los recovery codes (solo autorizan `config rebind-home`) ni `kvendra recover` (mantiene la misma clave de vault) echan a quien ya tiene la password o la frase |
 | **O5** | Compromiso de un servicio externo (GitHub, npm, AWS) | Out of Kvendra's scope | Rotation manual + revocación en el servicio |
 | **O6** | Logging accidental del plaintext por un primitive maltrazado | Aceptado como riesgo de implementación | Audit log automático + review primitives + `zeroize` |
+
+## Recovery phrase y copias antiguas (0.9.0)
+
+> **La frase pesa lo mismo que la password.** Quien tenga las 12 palabras y una copia de los ficheros del vault abre `recovery.blob`, obtiene la clave de vault y, con `kvendra recover` sobre esa copia, fija la password que quiera. Sin los ficheros, la frase sola no sirve (la clave que envuelve se sala con el `vault_id` del vault). Por fuerza bruta no es atacable (128 bits). `THREAT-MODEL.md` §V9.
+
+> **Cambiar la password no revoca copias antiguas.** `kvendra recover` y `kvendra passwd` re-envuelven la **misma** clave de vault y solo reemplazan `sentinel.blob`. Una copia anterior de `sentinel.blob` (dentro de un `kvendra backup` ya subido, un snapshot de disco) sigue abriendo con la password de entonces y da la misma clave. Por eso `recover` es para una password **olvidada**, no **robada**: ante una sospecha de filtración, vault nuevo y rotar las credenciales. Detalle en el [capítulo 10](./10-recuperacion.md).
 
 ## Promesa final formalizada
 
 **Nivel 2 zero-knowledge (0.6.4)** — con la corrección de C3 al principio del capítulo:
 
-> Ningún codepath del binario `kvendra` (Apache-2.0, auditable) imprime ni persiste a disco el master password ni la derived key. La derived key vive solo en RAM del proceso `kvendra mcp serve` durante la sesión unlocked, y es zeroizada (`zeroize` crate) al `kvendra lock` o al timeout configurable. Los blobs en `~/.kvendra/secrets/*.blob` son AES-256-GCM con clave derivada Argon2id (cost ≥1 s/intento) — opacos sin master password.
+> Ningún codepath del binario `kvendra` (Apache-2.0, auditable) imprime ni persiste a disco el master password ni la clave de vault en claro. La clave de vault vive solo en RAM del proceso `kvendra mcp serve` durante la sesión unlocked, y es zeroizada (`zeroize` crate) al `kvendra lock` o al timeout configurable. Los blobs en `~/.kvendra/secrets/*.blob` son AES-256-GCM con clave derivada Argon2id (cost ≥1 s/intento) — opacos sin master password.
 
 **Nivel 2 ampliado a filesystem integrity** (alpha.4..alpha.7 / 0.1.0):
 
@@ -155,7 +161,7 @@ Cualquier reviewer externo puede:
 
 1. Clonar `kvendra-cli` (Apache-2.0).
 2. Auditar el path crypto (Argon2id → AES-256-GCM → zeroize) en una sesión de lectura razonable (≤2h).
-3. Confirmar que ningún codepath imprime/persiste plaintext del master password ni del derived key.
+3. Confirmar que ningún codepath imprime/persiste plaintext del master password, de la recovery phrase ni de la clave de vault.
 
 Esto es uno de los success metrics canónicos del `REQ-KVD-002`.
 

@@ -220,6 +220,7 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "unicode-normalization",
+ "zeroize",
 ]
 
 [[package]]
@@ -1415,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "kvendra"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "aes-gcm",
  "anyhow",

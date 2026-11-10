@@ -18,6 +18,7 @@ pub mod login;
 pub mod logout;
 pub mod mcp;
 pub mod notifs;
+pub mod passwd;
 pub mod primitive;
 pub mod recover;
 pub mod secret;
@@ -59,8 +60,11 @@ pub enum Commands {
     /// Workspace admin/member operations against the broker.
     #[command(subcommand)]
     Workspace(workspace::WorkspaceCommand),
-    /// Reset the master password using the BIP-39 mnemonic (ADR-KVD-011).
+    /// Forgot the master password: set a new one with the 12-word phrase
+    /// bound to this vault at `init` (0.9+ vaults).
     Recover(recover::RecoverArgs),
+    /// Change the master password knowing the current one (0.9+ vaults).
+    Passwd(passwd::PasswdArgs),
     /// Manage stored secret profiles.
     #[command(subcommand)]
     Secret(secret::SecretCommand),

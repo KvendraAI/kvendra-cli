@@ -4,6 +4,8 @@
 
 pub mod blob;
 pub mod crypto;
+pub mod envelope;
+pub mod fsutil;
 pub mod kdf;
 pub mod recovery;
 pub mod session;
@@ -12,8 +14,15 @@ use crate::config::{create_dir_secure, set_file_mode_secure};
 use crate::error::{KvendraError, KvendraResult};
 use crate::vault::blob::Blob;
 use crate::vault::crypto::{NONCE_LEN, open as aes_open, random_nonce, seal as aes_seal};
-use crate::vault::kdf::{KdfParams, derive, random_salt};
-use crate::vault::session::{DerivedSubKey, SessionKey, VaultStateKind};
+use crate::vault::envelope::{
+    MasterKey, NewVaultMaterial, RecoveryBlobV1, Sentinel, SentinelV2, create_v2_in_memory,
+    parse_recovery_blob, parse_sentinel,
+};
+use crate::vault::kdf::{KdfParams, random_salt};
+use crate::vault::session::{
+    DerivedSubKey, HKDF_INFO_AUDIT_HMAC, HKDF_INFO_LOCAL_VARS, SessionKey, VaultStateKind,
+    hkdf_expand,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -293,8 +302,10 @@ impl Vault {
         self.pending_unlock.store(true, Ordering::Release);
     }
 
-    /// Initialize the vault: write the sentinel blob (so `unlock` can verify
-    /// the master password). Idempotent if the sentinel already exists.
+    /// Initialize a v2 vault on disk (sentinel.blob v2 + recovery.blob v1).
+    /// The recovery phrase is generated and DISCARDED — `kvendra init` builds
+    /// its material with [`envelope::create_v2_in_memory`] instead so it can
+    /// show the phrase and order the writes transactionally (F2).
     pub fn create(&self, password: &[u8]) -> KvendraResult<()> {
         self.create_with_params(password, KdfParams::high_cost(random_salt()))
     }
@@ -302,6 +313,18 @@ impl Vault {
     /// Init variant that accepts custom KDF params (used by tests with fast
     /// argon2 params; production callers should use [`Vault::create`]).
     pub fn create_with_params(&self, password: &[u8], params: KdfParams) -> KvendraResult<()> {
+        self.create_with_params_returning_material(password, params)
+            .map(|_| ())
+    }
+
+    /// Like [`Vault::create_with_params`] but hands the in-memory material
+    /// (MK, phrase) back to the caller. Writes `recovery.blob` then
+    /// `sentinel.blob` (the sentinel is the commit point).
+    pub fn create_with_params_returning_material(
+        &self,
+        password: &[u8],
+        params: KdfParams,
+    ) -> KvendraResult<NewVaultMaterial> {
         create_dir_secure(&self.home)?;
         create_dir_secure(&self.secrets_dir())?;
         create_dir_secure(&self.allowlists_dir())?;
@@ -311,19 +334,20 @@ impl Vault {
                 "vault already initialized (sentinel.blob exists)".into(),
             ));
         }
-        let derived = derive(password, &params)?;
-        let nonce = random_nonce();
-        let ct = aes_seal(derived.as_bytes(), &nonce, b"kvendra-sentinel-v1")?;
-        let blob = Blob::new(params, nonce.to_vec(), ct);
-        let sentinel = self.sentinel_path();
-        std::fs::write(&sentinel, blob.to_json()?)?;
-        set_file_mode_secure(&sentinel)?;
-        Ok(())
+        let material = create_v2_in_memory(password, &params)?;
+        fsutil::write_atomic(
+            &self.recovery_blob_path(),
+            material.recovery.to_json()?.as_bytes(),
+        )?;
+        fsutil::write_atomic(
+            &self.sentinel_path(),
+            material.sentinel.to_json()?.as_bytes(),
+        )?;
+        Ok(material)
     }
 
-    /// Unlock the vault: verify password against the sentinel and store the
-    /// derived key in a `SessionKey`.
-    pub fn unlock(&self, password: &[u8], idle_timeout_minutes: u32) -> KvendraResult<()> {
+    /// Read and parse `sentinel.blob` (v1 / v2 dispatch, unknown → fail closed).
+    pub fn read_sentinel(&self) -> KvendraResult<Sentinel> {
         let path = self.sentinel_path();
         if !path.exists() {
             return Err(KvendraError::Vault(
@@ -331,23 +355,33 @@ impl Vault {
             ));
         }
         let raw = std::fs::read_to_string(&path)?;
-        let blob = Blob::from_json(&raw)?;
-        let derived = derive(password, &blob.kdf)?;
-        let mut nonce = [0u8; NONCE_LEN];
-        if blob.nonce.len() != NONCE_LEN {
-            return Err(KvendraError::Vault("sentinel nonce length invalid".into()));
-        }
-        nonce.copy_from_slice(&blob.nonce);
-        let pt = aes_open(derived.as_bytes(), &nonce, &blob.ciphertext)?;
-        if pt != b"kvendra-sentinel-v1" {
-            return Err(KvendraError::InvalidMasterPassword);
-        }
-        let session = SessionKey::new(derived, idle_timeout_minutes);
+        parse_sentinel(&raw)
+    }
+
+    /// THE password → vault-key function (v1: Argon2id output; v2: unwrap).
+    /// Wrong password → `InvalidMasterPassword`. Every password-based path
+    /// (unlock, audit verify, vars restore, backup key) goes through here.
+    pub fn master_key_from_password(&self, password: &[u8]) -> KvendraResult<MasterKey> {
+        self.read_sentinel()?.master_key_from_password(password)
+    }
+
+    /// Unlock the vault: verify password against the sentinel and keep the
+    /// vault key in a `SessionKey`.
+    pub fn unlock(&self, password: &[u8], idle_timeout_minutes: u32) -> KvendraResult<()> {
+        let mk = self.master_key_from_password(password)?;
+        self.unlock_with_master_key(mk, idle_timeout_minutes);
+        Ok(())
+    }
+
+    /// Install `mk` as the session key without reading the sentinel. Used by
+    /// `kvendra init` before `sentinel.blob` exists, and by the paths that
+    /// already verified the key.
+    pub fn unlock_with_master_key(&self, mk: MasterKey, idle_timeout_minutes: u32) {
+        let session = SessionKey::new(mk, idle_timeout_minutes);
         let mut g = self.session.lock().expect("session mutex poisoned");
         *g = Some(session);
         // REQ-KVD-CLI-42CB74 — a successful unlock supersedes pending state.
         self.pending_unlock.store(false, Ordering::Release);
-        Ok(())
     }
 
     /// Lock the vault: drop the session key (zeroizes on Drop).
@@ -356,46 +390,28 @@ impl Vault {
         *g = None;
     }
 
-    /// Unlock the vault directly with a pre-derived 32-byte key
+    /// Unlock the vault directly with the 32-byte vault key
     /// (REQ-KVD-CLI-011 / ADR-KVD-029). Used by `kvendra mcp serve` when
     /// reading the active session blob — avoids paying the Argon2id cost
     /// a second time on every MCP server startup.
     ///
-    /// The key is verified by decrypting the sentinel. A wrong key
-    /// surfaces as `InvalidMasterPassword` (same variant the
-    /// password-based path returns) so callers can recover identically.
+    /// The key is verified against the sentinel (v1: the constant sealed
+    /// under it; v2: `check`). A wrong key surfaces as
+    /// `InvalidMasterPassword` (same variant the password-based path
+    /// returns) so callers can recover identically.
     pub fn unlock_from_derived_key(
         &self,
         derived_key: &[u8; 32],
         idle_timeout_minutes: u32,
     ) -> KvendraResult<()> {
-        let path = self.sentinel_path();
-        if !path.exists() {
-            return Err(KvendraError::Vault(
-                "vault not initialized (run `kvendra init` first)".into(),
-            ));
-        }
-        let raw = std::fs::read_to_string(&path)?;
-        let blob = Blob::from_json(&raw)?;
-        let mut nonce = [0u8; NONCE_LEN];
-        if blob.nonce.len() != NONCE_LEN {
-            return Err(KvendraError::Vault("sentinel nonce length invalid".into()));
-        }
-        nonce.copy_from_slice(&blob.nonce);
-        let pt = aes_open(derived_key, &nonce, &blob.ciphertext)?;
-        if pt != b"kvendra-sentinel-v1" {
+        if !self.read_sentinel()?.verifies_master_key(derived_key)? {
             return Err(KvendraError::InvalidMasterPassword);
         }
-        let derived = crate::vault::kdf::DerivedKey(*derived_key);
-        let session = SessionKey::new(derived, idle_timeout_minutes);
-        let mut g = self.session.lock().expect("session mutex poisoned");
-        *g = Some(session);
-        // REQ-KVD-CLI-42CB74 — a successful unlock supersedes pending state.
-        self.pending_unlock.store(false, Ordering::Release);
+        self.unlock_with_master_key(MasterKey::from_key_ref(derived_key), idle_timeout_minutes);
         Ok(())
     }
 
-    /// Copy the active session's derived key out as a fresh `[u8; 32]`.
+    /// Copy the active session's vault key out as a fresh `[u8; 32]`.
     /// Used by `kvendra unlock` to write the local session blob
     /// (REQ-KVD-CLI-011 / ADR-KVD-029). Caller is responsible for
     /// `zeroize`ing the returned bytes when finished — usually by feeding
@@ -411,38 +427,50 @@ impl Vault {
         Ok(*session.peek_key()?)
     }
 
-    /// Reset the master password using the BIP-39 mnemonic.
-    ///
-    /// **DISABLED — fail closed (ISSUE-KVD-CLI-DAC4E1 / R1).** The previous
-    /// implementation only validated the mnemonic's BIP-39 SHAPE and then
-    /// discarded it: the phrase was never bound to the vault (no `recovery.blob`
-    /// is written at init, no mnemonic→key derivation exists), so it accepted
-    /// ANY valid BIP-39 phrase and rotated the sentinel to the caller's chosen
-    /// password — a takeover / lock-out for anyone who can run `recover` against
-    /// the vault files. It also never recovered the original key, so the
-    /// existing secrets (sealed under the OLD key) became unreadable afterwards.
-    ///
-    /// Rather than provide a fake recovery gate that both fails to verify the
-    /// mnemonic AND destroys access to the secrets, this refuses. Real
-    /// mnemonic-bound recovery (wrap the master key under the mnemonic in
-    /// `recovery.blob` at init; verify + recover + re-encrypt here) is the
-    /// tracked fix in ISSUE-KVD-CLI-DAC4E1.
-    pub fn reset_password_with_mnemonic(
+    /// Whether this vault has phrase-bound recovery material: sentinel v2
+    /// AND a `recovery.blob`. Never asks for or reads the phrase.
+    pub fn recovery_available(&self) -> KvendraResult<bool> {
+        Ok(matches!(self.read_sentinel()?, Sentinel::V2(_)) && self.recovery_blob_path().exists())
+    }
+
+    /// Open `recovery.blob` with `mnemonic` and verify the recovered key
+    /// against the current sentinel. No disk writes.
+    pub fn open_recovery(&self, mnemonic: &bip39::Mnemonic) -> KvendraResult<MasterKey> {
+        let Sentinel::V2(sentinel) = self.read_sentinel()? else {
+            return Err(KvendraError::RecoveryUnavailable);
+        };
+        let blob = self.read_recovery_blob()?;
+        blob.open(&sentinel, mnemonic)
+    }
+
+    /// Parse `recovery.blob` (missing → `RecoveryBlobMissing` on a v2 vault,
+    /// `RecoveryUnavailable` on a 0.8.0 one).
+    pub fn read_recovery_blob(&self) -> KvendraResult<RecoveryBlobV1> {
+        let path = self.recovery_blob_path();
+        if !path.exists() {
+            return Err(match self.read_sentinel()? {
+                Sentinel::V1(_) => KvendraError::RecoveryUnavailable,
+                Sentinel::V2(_) => KvendraError::RecoveryBlobMissing,
+            });
+        }
+        parse_recovery_blob(&std::fs::read_to_string(&path)?)
+    }
+
+    /// Build (in memory, no disk write) the sentinel that wraps `mk` under
+    /// `new_password`: new salt, new nonces, same vault_id and KDF cost.
+    /// v1 vaults cannot be re-wrapped (no migration in 0.9).
+    pub fn rewrap_password(
         &self,
-        mnemonic_phrase: &str,
-        _new_password: &[u8],
-    ) -> KvendraResult<()> {
-        // Still validate the phrase shape first so a typo gets a clear error
-        // before the "not available" message.
-        let _ = crate::vault::recovery::parse_mnemonic(mnemonic_phrase)?;
-        Err(KvendraError::Vault(
-            "mnemonic recovery is not available: this vault has no mnemonic-bound \
-             recovery material, so the phrase cannot be verified and the master key \
-             cannot be recovered. Accepting it would only take over the password \
-             without restoring access to your secrets. Restore from a `kvendra backup` \
-             instead. (tracked: ISSUE-KVD-CLI-DAC4E1)"
-                .into(),
-        ))
+        mk: &MasterKey,
+        new_password: &[u8],
+    ) -> KvendraResult<SentinelV2> {
+        match self.read_sentinel()? {
+            Sentinel::V2(s) => s.rewrap(mk, new_password),
+            Sentinel::V1(_) => Err(KvendraError::Vault(
+                "this vault was created before Kvendra 0.9; its password cannot be re-wrapped"
+                    .into(),
+            )),
+        }
     }
 
     /// Encrypt + persist a secret blob for `profile_id`. Requires unlocked.
@@ -456,7 +484,7 @@ impl Vault {
         }
         let key = session.peek_key()?;
         // Each secret blob has its own KdfParams shell so the on-disk format
-        // matches the sentinel; we re-use the master key (Argon2id-derived)
+        // matches the sentinel; we re-use the vault key (MK)
         // directly via AES-256-GCM rather than re-deriving per blob (Alpha
         // 0.1 simplification, documented in ADR-KVD-005).
         let nonce = random_nonce();
@@ -529,26 +557,8 @@ impl Vault {
     /// [`Vault::audit_hmac_key_from_password`]; used by the backup restore to
     /// re-seal a restored `vars.blob` in staging (REQ-KVD-11F906, AC-LVR-6).
     pub fn local_vars_key_from_password(&self, password: &[u8]) -> KvendraResult<DerivedSubKey> {
-        use crate::vault::session::{HKDF_INFO_LOCAL_VARS, hkdf_expand};
-        let path = self.sentinel_path();
-        if !path.exists() {
-            return Err(KvendraError::Vault(
-                "vault not initialized (run `kvendra init` first)".into(),
-            ));
-        }
-        let raw = std::fs::read_to_string(&path)?;
-        let blob = Blob::from_json(&raw)?;
-        let derived = derive(password, &blob.kdf)?;
-        let mut nonce = [0u8; NONCE_LEN];
-        if blob.nonce.len() != NONCE_LEN {
-            return Err(KvendraError::Vault("sentinel nonce length invalid".into()));
-        }
-        nonce.copy_from_slice(&blob.nonce);
-        let pt = aes_open(derived.as_bytes(), &nonce, &blob.ciphertext)?;
-        if pt != b"kvendra-sentinel-v1" {
-            return Err(KvendraError::InvalidMasterPassword);
-        }
-        Ok(hkdf_expand(derived.as_bytes(), HKDF_INFO_LOCAL_VARS))
+        let mk = self.master_key_from_password(password)?;
+        Ok(hkdf_expand(mk.as_bytes(), HKDF_INFO_LOCAL_VARS))
     }
 
     /// Re-derive the audit-HMAC sub-key from the master password without
@@ -556,33 +566,11 @@ impl Vault {
     /// CLI invocation that does not share a process with `mcp serve` can
     /// still verify the chain (per ADR-KVD-010 + ADR-KVD-012, opción B).
     ///
-    /// The derived key + sub-key both live on the stack of this call: we
-    /// build them, hand back a `Vec<u8>` whose contents the caller must
-    /// zeroize after use, and drop the parent material via ZeroizeOnDrop.
+    /// The vault key lives in a `MasterKey` (ZeroizeOnDrop); the caller must
+    /// zeroize the returned `Vec<u8>` after use.
     pub fn audit_hmac_key_from_password(&self, password: &[u8]) -> KvendraResult<Vec<u8>> {
-        use crate::vault::session::{HKDF_INFO_AUDIT_HMAC, hkdf_expand};
-        let path = self.sentinel_path();
-        if !path.exists() {
-            return Err(KvendraError::Vault(
-                "vault not initialized (run `kvendra init` first)".into(),
-            ));
-        }
-        let raw = std::fs::read_to_string(&path)?;
-        let blob = Blob::from_json(&raw)?;
-        let derived = derive(password, &blob.kdf)?;
-        // Verify the password matches (same path as `unlock`) — this also
-        // catches a corrupt sentinel.
-        let mut nonce = [0u8; NONCE_LEN];
-        if blob.nonce.len() != NONCE_LEN {
-            return Err(KvendraError::Vault("sentinel nonce length invalid".into()));
-        }
-        nonce.copy_from_slice(&blob.nonce);
-        let pt = aes_open(derived.as_bytes(), &nonce, &blob.ciphertext)?;
-        if pt != b"kvendra-sentinel-v1" {
-            return Err(KvendraError::InvalidMasterPassword);
-        }
-        let sub = hkdf_expand(derived.as_bytes(), HKDF_INFO_AUDIT_HMAC);
-        Ok(sub.to_vec())
+        let mk = self.master_key_from_password(password)?;
+        Ok(hkdf_expand(mk.as_bytes(), HKDF_INFO_AUDIT_HMAC).to_vec())
     }
 
     /// Mark a profile as quarantined (detection layer Block severity).
@@ -711,38 +699,6 @@ mod tests {
         v.create_with_params(b"correct", fast_params()).unwrap();
         let r = v.unlock(b"wrong", 30);
         assert!(matches!(r, Err(KvendraError::InvalidMasterPassword)));
-    }
-
-    #[test]
-    fn recover_refuses_unverifiable_mnemonic_and_leaves_vault_intact() {
-        // R1 (ISSUE-KVD-CLI-DAC4E1): the mnemonic is not bound to the vault, so
-        // recovery must NOT accept an arbitrary valid BIP-39 phrase and rotate
-        // the password. It fails closed and leaves the vault untouched.
-        let (_dir, v) = open_test_vault();
-        v.create_with_params(b"orig-pass", fast_params()).unwrap();
-        // The canonical all-zeros BIP-39 phrase — a valid phrase the attacker
-        // did NOT get from the owner.
-        let canonical = "abandon abandon abandon abandon abandon abandon \
-                         abandon abandon abandon abandon abandon about";
-        assert!(
-            v.reset_password_with_mnemonic(canonical, b"attacker-pass")
-                .is_err(),
-            "an unverifiable mnemonic must be refused, not accepted"
-        );
-        // The vault is unchanged: the ORIGINAL password still unlocks; the
-        // attacker's chosen password does not.
-        assert!(
-            v.unlock(b"orig-pass", 30).is_ok(),
-            "original password must still work"
-        );
-        v.lock();
-        assert!(
-            matches!(
-                v.unlock(b"attacker-pass", 30),
-                Err(KvendraError::InvalidMasterPassword)
-            ),
-            "the attacker's password must NOT have been set"
-        );
     }
 
     /// AC-AUDIT-2 cross-process verify (FAIL #3 fix): `audit_hmac_key_from_password`

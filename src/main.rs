@@ -36,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Workspace(cmd) => kvendra::cli::workspace::run(cmd).await?,
         Commands::Recover(args) => kvendra::cli::recover::run(args).await?,
+        Commands::Passwd(args) => kvendra::cli::passwd::run(args).await?,
         Commands::Secret(cmd) => kvendra::cli::secret::run(cmd).await?,
         Commands::Primitive(cmd) => kvendra::cli::primitive::run(cmd).await?,
         Commands::Mcp(cmd) => kvendra::cli::mcp::run(cmd).await?,

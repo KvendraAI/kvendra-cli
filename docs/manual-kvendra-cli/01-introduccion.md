@@ -42,7 +42,7 @@ Resumen ejecutivo de lo que un usuario real puede hacer hoy:
 > - **KDF:** Argon2id, cost ≥1 s/intento.
 > - **AEAD:** AES-256-GCM por blob.
 > - **Storage:** `~/.kvendra/secrets/<profile_id>.blob`.
-> - **Master password** jamás persiste; la derived key vive solo en RAM mientras la sesión está unlocked.
+> - **Master password** jamás persiste; la clave de vault (aleatoria desde 0.9.0, guardada solo envuelta) vive en claro solo en RAM mientras la sesión está unlocked.
 >
 > **MCP capability broker:**
 > - JSON-RPC 2.0 sobre stdio, compatible con Claude Code, Cursor, Cline, Continue.
@@ -86,7 +86,7 @@ Para evitar expectativas mal alineadas:
 - **No hay Desktop app.** Sólo CLI + TUI. Ver decisión en `ROAD-KVD-005`.
 - **No hay marketplace público de primitives.** Las 7 primitives canónicas son las que mantiene el core team. La extensibilidad community sigue siendo post-MVP.
 - **No hay hardware-backed wrapping** (Secure Enclave, TPM 2.0, FIDO2) todavía. El sub-vector O1 (RAM dump durante sesión unlocked) está documentado como aceptado en el [threat model](./18-threat-model.md); el wrapping hardware-backed es la **Fase 1** del roadmap de endurecimiento del vault (`ROAD-KVD-CLI-393064`, ver [capítulo 20](./20-roadmap.md)).
-- **La recuperación por mnemónica BIP-39 está temporalmente fail-closed** en 0.6.4: `kvendra recover` existe pero rechaza; el camino de recuperación real es `kvendra backup` (ver [capítulo 10](./10-recuperacion.md)).
+- **La recuperación por frase BIP-39 solo existe en vaults creados con 0.9.0 o posterior.** Desde `0.9.0`, `kvendra recover` fija una password nueva con la frase de 12 palabras atada al vault en `kvendra init`; en vaults anteriores se niega sin cambiar nada (no hay migración). Restaurar en una máquina nueva solo con backup + frase todavía no está soportado (ver [capítulo 10](./10-recuperacion.md)).
 
 ## Cómo se relaciona con el resto del producto Kvendra
 

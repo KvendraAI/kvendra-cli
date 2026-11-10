@@ -8,7 +8,7 @@
 //! lives only while the vault is unlocked.
 
 use crate::error::{KvendraError, KvendraResult};
-use crate::vault::kdf::DerivedKey;
+use crate::vault::envelope::MasterKey;
 use ::hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::{Duration, Instant};
@@ -53,8 +53,9 @@ impl DerivedSubKey {
 
 /// HKDF-SHA256 expand (single-step, salt-less) — enough for our 32-byte sub-keys.
 ///
-/// See RFC 5869 § 2.3. We use the master key directly as PRK (it's already
-/// 32 bytes of high-entropy material from Argon2id), so this is equivalent
+/// See RFC 5869 § 2.3. We use the vault key directly as PRK (it's already
+/// 32 bytes of high-entropy material: random since 0.9, the Argon2id output
+/// on 0.8 vaults), so this is equivalent
 /// to `HKDF-Expand(PRK=key, info, L=32)`.
 pub fn hkdf_expand(key: &[u8; 32], info: &[u8]) -> DerivedSubKey {
     // T(1) = HMAC(PRK, info || 0x01)
@@ -84,14 +85,17 @@ struct Inner {
 }
 
 impl SessionKey {
-    pub fn new(derived: DerivedKey, idle_timeout_minutes: u32) -> Self {
-        let audit_hmac_key = hkdf_expand(derived.as_bytes(), HKDF_INFO_AUDIT_HMAC);
-        let allowlist_hmac_key = hkdf_expand(derived.as_bytes(), HKDF_INFO_ALLOWLIST_HMAC);
-        let config_hmac_key = hkdf_expand(derived.as_bytes(), HKDF_INFO_CONFIG_HMAC);
-        let local_vars_key = hkdf_expand(derived.as_bytes(), HKDF_INFO_LOCAL_VARS);
+    /// Build the session from the vault key (MK). The HKDF sub-keys keep the
+    /// same info strings and the same PRK (= MK) as 0.8.0, so a v1 vault's
+    /// sub-keys are unchanged and a v2 vault's hang from its random MK.
+    pub fn new(mk: MasterKey, idle_timeout_minutes: u32) -> Self {
+        let audit_hmac_key = hkdf_expand(mk.as_bytes(), HKDF_INFO_AUDIT_HMAC);
+        let allowlist_hmac_key = hkdf_expand(mk.as_bytes(), HKDF_INFO_ALLOWLIST_HMAC);
+        let config_hmac_key = hkdf_expand(mk.as_bytes(), HKDF_INFO_CONFIG_HMAC);
+        let local_vars_key = hkdf_expand(mk.as_bytes(), HKDF_INFO_LOCAL_VARS);
         Self {
             inner: Inner {
-                key: *derived.as_bytes(),
+                key: *mk.as_bytes(),
             },
             audit_hmac_key,
             allowlist_hmac_key,
