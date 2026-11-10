@@ -437,3 +437,65 @@ pub async fn recover_with_phrase(
     )
     .await
 }
+
+/// Refusal for `kvendra passwd` on a 0.8.0 (sentinel v1) vault.
+pub const PASSWD_V1_UNSUPPORTED: &str = "This vault was created before Kvendra 0.9; changing its password is not \
+     supported. Nothing was changed.";
+
+/// Checks that need no secret: initialized, leftovers dropped, not v1.
+pub fn passwd_preflight(vault: &Vault) -> KvendraResult<()> {
+    if !vault.sentinel_path().exists() {
+        return Err(KvendraError::Vault(
+            "vault not initialized. Run `kvendra init` first.".into(),
+        ));
+    }
+    cleanup_before_auth(vault)?;
+    match vault.read_sentinel()? {
+        crate::vault::envelope::Sentinel::V1(_) => {
+            Err(KvendraError::Vault(PASSWD_V1_UNSUPPORTED.into()))
+        }
+        crate::vault::envelope::Sentinel::V2(_) => Ok(()),
+    }
+}
+
+/// `kvendra passwd` (F5): current password → MK (wrong one: logged
+/// pre-auth, nothing written) → new password (≥ 8, different) → re-wrap →
+/// [`commit_new_password`].
+pub async fn change_password(
+    vault: &Vault,
+    read_current: impl FnOnce() -> KvendraResult<Zeroizing<String>>,
+    read_new: impl FnOnce() -> KvendraResult<Zeroizing<String>>,
+    caches: &dyn CredentialCaches,
+) -> KvendraResult<()> {
+    use subtle::ConstantTimeEq;
+    let home = vault.home().to_path_buf();
+    passwd_preflight(vault)?;
+    let current = read_current()?;
+    let mk = logged(
+        &home,
+        "passwd",
+        vault.master_key_from_password(current.as_bytes()),
+    )?;
+    let new_password = read_new()?;
+    if new_password.len() < MIN_PASSWORD_LEN {
+        return Err(KvendraError::Vault(
+            "master password must be ≥ 8 characters".into(),
+        ));
+    }
+    if bool::from(current.as_bytes().ct_eq(new_password.as_bytes())) {
+        return Err(KvendraError::Vault(
+            "the new master password must differ from the current one — nothing was changed".into(),
+        ));
+    }
+    drop(current);
+    let new_sentinel = vault.rewrap_password(&mk, new_password.as_bytes())?;
+    commit_new_password(
+        vault,
+        &mk,
+        &new_sentinel,
+        new_password.as_bytes(),
+        caches,
+        RekeyAction::Passwd,
+    )
+    .await
+}

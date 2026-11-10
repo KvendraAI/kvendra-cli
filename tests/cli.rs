@@ -24,6 +24,7 @@ fn cli_help_lists_subcommands() {
         .stdout(contains("unlock"))
         .stdout(contains("lock"))
         .stdout(contains("recover"))
+        .stdout(contains("passwd"))
         .stdout(contains("secret"))
         .stdout(contains("primitive"))
         .stdout(contains("mcp"))
