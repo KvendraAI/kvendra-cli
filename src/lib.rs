@@ -30,6 +30,7 @@ pub mod mcp;
 pub mod path_id;
 pub mod primitives;
 pub mod protocol;
+pub mod rekey;
 pub mod secret_resolver;
 pub mod session;
 pub mod tui;

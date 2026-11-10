@@ -8,6 +8,7 @@ pub mod export;
 pub mod hmac;
 pub mod layout_commit;
 pub mod migrations;
+pub mod preauth;
 pub mod reader;
 pub mod schema;
 pub mod writer;
@@ -135,6 +136,21 @@ pub const FLAG_SHELL_BINARY_SHAPE_MISMATCH: &str = "shell_binary_shape_mismatch"
 /// dispatcher refuses the call before any dispatch (defence in depth next to
 /// the injective v4 layout).
 pub const FLAG_INVALID_TOOL_FIELD_DENIED: &str = "invalid_tool_field_denied";
+
+/// `kvendra recover` committed a new password (REQ-KVD-CLI-CFB449 AC-REC-7).
+pub const FLAG_RECOVER_OK: &str = "recover_ok";
+
+/// `kvendra passwd` committed a new password (AC-REC-14).
+pub const FLAG_PASSWD_OK: &str = "passwd_ok";
+
+/// Leftover `sentinel.blob.pre-recover` removed after a later successful
+/// authentication (AC-REC-6): a password change whose own audit row may be
+/// missing because the process died after the rename.
+pub const FLAG_RECOVER_CLEANUP: &str = "recover_cleanup";
+
+/// Row imported from `audit.preauth.jsonl`: a rejection recorded BEFORE any
+/// key existed, so its content is NOT authenticated (AC-REC-7).
+pub const FLAG_PREAUTH_UNAUTHENTICATED: &str = "preauth_unauthenticated";
 
 /// Status field of an audit row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
