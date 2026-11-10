@@ -48,7 +48,8 @@ enum WriterCmd {
         error_message: Option<String>,
         ack: oneshot::Sender<KvendraResult<()>>,
     },
-    Shutdown,
+    /// Stop the owner thread; `done` fires AFTER the connection is closed.
+    Shutdown { done: oneshot::Sender<()> },
 }
 
 impl AuditWriter {
@@ -62,6 +63,7 @@ impl AuditWriter {
             // Owner thread: holds Connection (not Send). Pulls commands off
             // an mpsc Receiver via blocking_recv.
             let conn = conn;
+            let mut done = None;
             while let Some(cmd) = rx.blocking_recv() {
                 match cmd {
                     WriterCmd::Record { event, ack } => {
@@ -87,8 +89,21 @@ impl AuditWriter {
                         );
                         let _ = ack.send(r);
                     }
-                    WriterCmd::Shutdown => break,
+                    WriterCmd::Shutdown { done: d } => {
+                        done = Some(d);
+                        break;
+                    }
                 }
+            }
+            // Close the connection BEFORE acknowledging the shutdown: closing
+            // the last connection checkpoints the WAL and removes
+            // `audit.db-wal` / `-shm`. Until then the files are open (on
+            // Windows they cannot be deleted) and may still change.
+            if let Err((_, e)) = conn.close() {
+                tracing::warn!(target: "kvendra::audit", "audit.db close failed: {e}");
+            }
+            if let Some(d) = done {
+                let _ = d.send(());
             }
         });
 
@@ -135,8 +150,17 @@ impl AuditWriter {
             .map_err(|_| KvendraError::Audit("writer ack dropped".into()))?
     }
 
+    /// Stop the writer and wait until its SQLite connection is CLOSED (WAL
+    /// checkpointed, `-wal`/`-shm` gone). Before 0.9 this only queued the
+    /// request, so the owner thread kept the database open — and kept
+    /// touching `audit.db*` — after the caller had "finished" (found by CI:
+    /// a vanishing `-wal` on Linux, an undeletable `audit.db` in the init
+    /// rollback on Windows).
     pub async fn shutdown(&self) {
-        let _ = self.tx.send(WriterCmd::Shutdown).await;
+        let (done, wait) = oneshot::channel();
+        if self.tx.send(WriterCmd::Shutdown { done }).await.is_ok() {
+            let _ = wait.await;
+        }
     }
 }
 
@@ -401,6 +425,45 @@ fn update_in_txn(
 
 #[cfg(test)]
 mod tests {
+
+    /// CI regression (Linux NotFound race, Windows undeletable audit.db):
+    /// when `shutdown` returns, the connection is CLOSED — WAL checkpointed,
+    /// `-wal`/`-shm` removed — and `audit.db` can be deleted at once.
+    #[tokio::test]
+    async fn shutdown_returns_only_after_the_connection_is_closed() {
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("audit.db");
+            let w = AuditWriter::spawn(db.clone(), vec![3u8; 32]).unwrap();
+            w.record(crate::audit::AuditEvent {
+                ts_unix_ms: 1,
+                profile_id: "kvendra.system".into(),
+                primitive: "kvendra.system".into(),
+                action: "t".into(),
+                args_hash_hex: String::new(),
+                status: crate::audit::Status::Ok,
+                severity: crate::audit::Severity::Info,
+                flags: String::new(),
+                remote_audit_id: None,
+                error_code: None,
+                error_message: None,
+            })
+            .await
+            .unwrap();
+            w.shutdown().await;
+            assert!(
+                !dir.path().join("audit.db-wal").exists(),
+                "WAL still present"
+            );
+            assert!(
+                !dir.path().join("audit.db-shm").exists(),
+                "SHM still present"
+            );
+            std::fs::remove_file(&db).unwrap();
+            // A second shutdown on a stopped writer returns immediately.
+            w.shutdown().await;
+        }
+    }
     use super::*;
     use crate::audit::reader::{list_all, verify_chain};
     use std::sync::{Arc, Barrier};

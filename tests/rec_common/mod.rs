@@ -134,10 +134,24 @@ pub fn hashes(root: &Path) -> BTreeMap<String, String> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
         for e in std::fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
+            // Empty advisory lock files (`.rekey.lock`, `.init.lock`,
+            // `sessions/active.blob.lock`) hold no vault data, and on Windows
+            // a file locked by another handle cannot be read.
+            if p.extension().is_some_and(|e| e == "lock") {
+                continue;
+            }
             if p.is_dir() {
                 walk(root, &p, out);
             } else {
-                let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                // Forward slashes on every OS, so prefixes like "sessions/"
+                // in `hashes_except` also match on Windows.
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 out.insert(rel, hex::encode(Sha256::digest(std::fs::read(&p).unwrap())));
             }
         }

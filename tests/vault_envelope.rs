@@ -175,12 +175,122 @@ fn v2_files_format_and_permissions() {
             );
         }
     }
-    let raw = std::fs::read_to_string(v.recovery_blob_path()).unwrap()
-        + &std::fs::read_to_string(v.sentinel_path()).unwrap();
-    for w in m.mnemonic.to_string().split(' ') {
-        assert!(!raw.contains(&format!("\"{w}\"")));
+    let files = [
+        std::fs::read_to_string(v.recovery_blob_path()).unwrap(),
+        std::fs::read_to_string(v.sentinel_path()).unwrap(),
+    ];
+    assert_no_phrase_or_key_leak(&files, &m.mnemonic, &m.master_key, &m.vault_id.0);
+}
+
+/// AC-REC-8 leak check, robust to BIP-39 words that are also JSON keys of
+/// the blobs ("salt", "check", "wrap", "version" — the old substring check
+/// `"\"<word>\""` failed ~2 % of runs without any leak, CI macOS):
+/// - no full phrase and no two consecutive phrase words anywhere;
+/// - no MK / BIP-39 seed / KEK_rec bytes in hex or base64 anywhere;
+/// - every JSON string VALUE (keys excluded) is a known constant or valid
+///   base64 (ciphertext, nonce, salt, vault_id) — so no phrase word can sit
+///   in a value either.
+fn assert_no_phrase_or_key_leak(
+    files: &[String],
+    mnemonic: &bip39::Mnemonic,
+    mk: &kvendra::vault::envelope::MasterKey,
+    vault_id: &[u8],
+) {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as B64;
+    let raw = files.concat();
+    let phrase = mnemonic.to_string();
+    let words: Vec<&str> = phrase.split(' ').collect();
+    assert!(!raw.contains(&phrase), "full phrase persisted");
+    for pair in words.windows(2) {
+        assert!(!raw.contains(&pair.join(" ")), "phrase words persisted");
     }
-    assert!(!raw.contains(&hex::encode(m.master_key.as_bytes())));
+    let seed = mnemonic.to_seed_normalized("");
+    let kek = kvendra::vault::envelope::recovery_kek(mnemonic, vault_id);
+    for (name, secret) in [
+        ("MK", mk.as_bytes().as_slice()),
+        ("seed", seed.as_slice()),
+        ("KEK_rec", kek.as_slice()),
+    ] {
+        assert!(
+            !raw.contains(&hex::encode(secret)),
+            "{name} persisted (hex)"
+        );
+        assert!(
+            !raw.contains(&B64.encode(secret)),
+            "{name} persisted (base64)"
+        );
+    }
+    fn values<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s),
+            serde_json::Value::Array(a) => a.iter().for_each(|x| values(x, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|x| values(x, out)),
+            _ => {}
+        }
+    }
+    let known = [
+        kvendra::vault::envelope::RECOVERY_FORMAT,
+        kvendra::vault::envelope::RECOVERY_KDF_LABEL,
+    ];
+    for f in files {
+        let j: serde_json::Value = serde_json::from_str(f).unwrap();
+        let mut vals = Vec::new();
+        values(&j, &mut vals);
+        for val in vals {
+            assert!(!words.contains(&val), "a phrase word is stored as a value");
+            assert!(
+                known.contains(&val) || B64.decode(val).is_ok(),
+                "unexpected free-text value in a blob: {val:?}"
+            );
+        }
+    }
+}
+
+/// Deterministic version: phrases that DO contain words equal to the blob
+/// keys ("salt", "check", "wrap", "version"), plus many random vaults. The
+/// leak check must pass on all of them (and did not before the fix for the
+/// first group).
+#[test]
+fn no_leak_even_when_the_phrase_contains_json_key_words() {
+    use kvendra::vault::envelope::{MasterKey, RecoveryBlobV1, SentinelV2, VaultId};
+    let mut found = 0;
+    for key_word in ["salt", "check", "wrap", "version"] {
+        let mut i: u32 = 0;
+        let mnemonic = loop {
+            let mut entropy = [0u8; 16];
+            entropy[..4].copy_from_slice(&i.to_be_bytes());
+            let m = bip39::Mnemonic::from_entropy(&entropy).unwrap();
+            if m.to_string().split(' ').any(|w| w == key_word) {
+                break m;
+            }
+            i += 1;
+        };
+        let mk = MasterKey::generate();
+        let id = VaultId::generate();
+        let sentinel = SentinelV2::seal(&mk, id, b"kvd-env-pw-1", &fast_params()).unwrap();
+        let recovery = RecoveryBlobV1::seal(&mk, id, &mnemonic).unwrap();
+        let files = [recovery.to_json().unwrap(), sentinel.to_json().unwrap()];
+        assert!(
+            files.concat().contains(&format!("\"{key_word}\"")),
+            "precondition"
+        );
+        assert_no_phrase_or_key_leak(&files, &mnemonic, &mk, &id.0);
+        found += 1;
+    }
+    assert_eq!(found, 4);
+    for _ in 0..25 {
+        let dir = tempfile::tempdir().unwrap();
+        let v = Vault::new(dir.path().to_path_buf());
+        let m = v
+            .create_with_params_returning_material(b"kvd-env-pw-1", fast_params())
+            .unwrap();
+        let files = [
+            std::fs::read_to_string(v.recovery_blob_path()).unwrap(),
+            std::fs::read_to_string(v.sentinel_path()).unwrap(),
+        ];
+        assert_no_phrase_or_key_leak(&files, &m.mnemonic, &m.master_key, &m.vault_id.0);
+    }
 }
 
 /// AC-REC-2 — on disk: the right phrase opens; another vault's phrase is a

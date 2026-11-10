@@ -303,7 +303,16 @@ pub(crate) async fn commit_new_vault(
     let res = write_vault_files(home, vault, material, codes).await;
     vault.lock();
     if let Err(e) = res {
-        rollback(home, &before);
+        // Every audit writer of this run was shut down (connection closed)
+        // inside `write_vault_files`, so nothing holds `audit.db` open here
+        // (on Windows an open SQLite file cannot be deleted).
+        let failed = rollback(home, &before);
+        if !failed.is_empty() {
+            return Err(KvendraError::Vault(format!(
+                "{e}; rollback could NOT remove: {} — remove them by hand before retrying",
+                failed.join(", ")
+            )));
+        }
         return Err(e);
     }
     Ok(())
@@ -430,9 +439,14 @@ fn top_level_names(home: &Path) -> KvendraResult<HashSet<OsString>> {
 
 /// Remove every top-level init artifact that did not exist before the
 /// commit started (registered writes + sqlite side files + sentinel tmp).
-fn rollback(home: &Path, before: &HashSet<OsString>) {
-    let Ok(entries) = std::fs::read_dir(home) else {
-        return;
+fn rollback(home: &Path, before: &HashSet<OsString>) -> Vec<String> {
+    let mut failed = Vec::new();
+    let entries = match std::fs::read_dir(home) {
+        Ok(e) => e,
+        Err(e) => {
+            failed.push(format!("cannot list the vault home: {e}"));
+            return failed;
+        }
     };
     for e in entries.flatten() {
         let name = e.file_name();
@@ -446,10 +460,15 @@ fn rollback(home: &Path, before: &HashSet<OsString>) {
         if n == "sentinel.blob" {
             continue;
         }
-        if INIT_PREFIXES.iter().any(|p| n.starts_with(p)) && e.path().is_file() {
-            let _ = std::fs::remove_file(e.path());
+        if INIT_PREFIXES.iter().any(|p| n.starts_with(p))
+            && e.path().is_file()
+            && let Err(err) = std::fs::remove_file(e.path())
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            failed.push(format!("{n}: {err}"));
         }
     }
+    failed
 }
 
 /// Fresh `.init-orphans-<unix_ts>[-n]/` (0700) under `home`.
