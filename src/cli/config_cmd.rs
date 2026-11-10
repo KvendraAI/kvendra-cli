@@ -1,12 +1,14 @@
 //! `kvendra config <subcommand>` — runtime configuration management.
 //!
 //! Pase B implements `keychain enable | disable | status` per ADR-KVD-012:
-//! - When `enable`d, the derived key is written to the OS keychain after
-//!   each `unlock`, so subsequent unlocks can read from the keychain (with
-//!   biometric prompt on supported platforms) instead of re-prompting for
-//!   the master password.
-//! - When `disable`d, the keychain entry is wiped and unlocks fall back to
-//!   the master password prompt.
+//! - When `enable`d, `kvendra unlock` writes a constant presence flag to the
+//!   OS keychain entry `kvendra/derived-key/v1` after each successful unlock.
+//!   The flag is never key material and nothing reads it back to skip the
+//!   password: every unlock still asks for the master password.
+//! - When `disable`d, the keychain entry is wiped.
+//!
+//! Keeping the master password in the keychain for `kvendra mcp serve` is a
+//! separate, presence-gated feature: `kvendra config mcp-password enable`.
 
 use crate::cli::config_approval::{ApprovalCommand, run as run_approval};
 use crate::cli::config_mcp_password::{McpPasswordCommand, run as run_mcp_password};
@@ -78,14 +80,7 @@ pub async fn run(cmd: ConfigCommand) -> KvendraResult<()> {
                 KeychainCommand::Enable => {
                     cfg.vault.master_password_cache = MasterPasswordCache::OsKeychain;
                     cfg.save(&home, &vault)?;
-                    println!("OS keychain integration enabled.");
-                    println!(
-                        "WARNING: the derived key will be stored in the OS keychain on the next unlock."
-                    );
-                    println!(
-                        "This relaxes the strict RAM-only invariant of the threat model (V4)."
-                    );
-                    println!("Disable at any time with `kvendra config keychain disable`.");
+                    print!("{}", keychain_enable_notice());
                 }
                 KeychainCommand::Disable => {
                     cfg.vault.master_password_cache = MasterPasswordCache::RamOnly;
@@ -145,7 +140,22 @@ fn unlock_for_config(home: &std::path::Path) -> KvendraResult<Vault> {
     Ok(vault)
 }
 
-/// Helper used by `kvendra unlock`: persist derived key in OS keychain.
+/// What `kvendra config keychain enable` prints. It must describe what the
+/// code stores (a presence flag, never key material): see ISSUE-KVD-CLI-426DD0.
+pub fn keychain_enable_notice() -> &'static str {
+    "OS keychain integration enabled.\n\
+     After each successful `kvendra unlock`, a presence flag (no key material) is written\n\
+     to the OS keychain entry `kvendra/derived-key/v1`.\n\
+     The master password is still required at every unlock: neither the vault key nor the\n\
+     password is cached by this setting.\n\
+     To keep the master password in the keychain for `kvendra mcp serve`, use\n\
+     `kvendra config mcp-password enable` (presence-gated).\n\
+     Disable at any time with `kvendra config keychain disable`.\n"
+}
+
+/// Helper used by `kvendra unlock`: write the value it is given (today the
+/// constant presence flag) to the OS keychain entry. The caller decides what
+/// is stored; `unlock` never passes key material.
 pub fn store_derived_key_in_keychain(key_b64: &str) -> KvendraResult<()> {
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_LABEL)
         .map_err(|e| KvendraError::Keychain(e.to_string()))?;
@@ -155,11 +165,28 @@ pub fn store_derived_key_in_keychain(key_b64: &str) -> KvendraResult<()> {
     Ok(())
 }
 
-/// Helper used by `kvendra unlock`: try to read derived key from OS keychain.
+/// Read the value stored in the OS keychain entry (the presence flag).
 pub fn read_derived_key_from_keychain() -> KvendraResult<String> {
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_LABEL)
         .map_err(|e| KvendraError::Keychain(e.to_string()))?;
     entry
         .get_password()
         .map_err(|e| KvendraError::Keychain(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keychain_enable_notice;
+
+    /// ISSUE-KVD-CLI-426DD0: the notice must describe what is stored (a
+    /// presence flag) and must not claim the key or the password is cached.
+    #[test]
+    fn keychain_enable_notice_says_what_is_really_stored() {
+        let n = keychain_enable_notice();
+        assert!(n.contains("presence flag (no key material)"));
+        assert!(n.contains("still required at every unlock"));
+        assert!(n.contains("kvendra config mcp-password enable"));
+        assert!(!n.contains(concat!("derived key ", "will be stored")));
+        assert!(!n.contains("RAM-only invariant"));
+    }
 }
