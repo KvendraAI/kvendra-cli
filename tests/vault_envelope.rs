@@ -215,7 +215,7 @@ fn recovery_on_disk_right_wrong_and_foreign_blob() {
     assert!(!a.recovery_available().unwrap());
     assert!(matches!(
         a.open_recovery(&ma.mnemonic),
-        Err(KvendraError::RecoveryUnavailable)
+        Err(KvendraError::RecoveryBlobMissing)
     ));
 }
 

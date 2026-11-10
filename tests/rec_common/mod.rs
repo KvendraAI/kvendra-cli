@@ -108,6 +108,11 @@ pub async fn setup() -> Fixture {
     };
     std::fs::write(fake.entry_path(KEYCHAIN_DERIVED_KEY_LABEL), "flag").unwrap();
     std::fs::write(fake.entry_path(KEYCHAIN_MCP_PASSWORD_LABEL), OLD_PW).unwrap();
+    // Both entries are bound to THIS vault (owner tag = its vault_id).
+    use kvendra::rekey::CredentialCaches;
+    let id = m.vault_id.to_hex();
+    fake.set_owner(KEYCHAIN_DERIVED_KEY_LABEL, &id).unwrap();
+    fake.set_owner(KEYCHAIN_MCP_PASSWORD_LABEL, &id).unwrap();
     std::fs::create_dir_all(home.join("wrappers")).unwrap();
     std::fs::write(
         home.join("wrappers").join(LEGACY_WRAPPER_NAME),

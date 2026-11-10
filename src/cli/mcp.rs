@@ -46,6 +46,7 @@ pub struct ServeArgs {
     #[arg(
         long,
         env = "KVENDRA_MCP_PASSWORD",
+        hide_env_values = true,
         conflicts_with_all = ["use_keychain", "no_unlock"]
     )]
     pub password_env: Option<String>,

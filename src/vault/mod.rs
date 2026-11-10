@@ -407,7 +407,7 @@ impl Vault {
         if !self.read_sentinel()?.verifies_master_key(derived_key)? {
             return Err(KvendraError::InvalidMasterPassword);
         }
-        self.unlock_with_master_key(MasterKey::from_bytes(*derived_key), idle_timeout_minutes);
+        self.unlock_with_master_key(MasterKey::from_key_ref(derived_key), idle_timeout_minutes);
         Ok(())
     }
 
@@ -443,11 +443,15 @@ impl Vault {
         blob.open(&sentinel, mnemonic)
     }
 
-    /// Parse `recovery.blob` (missing → `RecoveryUnavailable`).
+    /// Parse `recovery.blob` (missing → `RecoveryBlobMissing` on a v2 vault,
+    /// `RecoveryUnavailable` on a 0.8.0 one).
     pub fn read_recovery_blob(&self) -> KvendraResult<RecoveryBlobV1> {
         let path = self.recovery_blob_path();
         if !path.exists() {
-            return Err(KvendraError::RecoveryUnavailable);
+            return Err(match self.read_sentinel()? {
+                Sentinel::V1(_) => KvendraError::RecoveryUnavailable,
+                Sentinel::V2(_) => KvendraError::RecoveryBlobMissing,
+            });
         }
         parse_recovery_blob(&std::fs::read_to_string(&path)?)
     }

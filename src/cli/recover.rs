@@ -51,7 +51,7 @@ pub async fn run(args: RecoverArgs) -> KvendraResult<()> {
         },
         move || match new_password_env {
             Some(s) => Ok(Zeroizing::new(s)),
-            None => crate::cli::init::prompt_password_with_confirmation(3).map(Zeroizing::new),
+            None => crate::cli::init::prompt_password_with_confirmation(3),
         },
         caches.as_ref(),
     )

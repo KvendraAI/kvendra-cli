@@ -91,6 +91,14 @@ impl MasterKey {
         Self(bytes)
     }
 
+    /// Copy a borrowed key straight into a new `MasterKey` (no stack copy
+    /// left behind in the caller).
+    pub fn from_key_ref(bytes: &[u8; MK_LEN]) -> Self {
+        let mut mk = Self([0u8; MK_LEN]);
+        mk.0.copy_from_slice(bytes);
+        mk
+    }
+
     pub fn as_bytes(&self) -> &[u8; MK_LEN] {
         &self.0
     }
@@ -258,9 +266,15 @@ fn open(key: &[u8; 32], aad: &[u8], nonce: &[u8], ct: &[u8]) -> Option<Zeroizing
         .map(Zeroizing::new)
 }
 
+/// Copy `pt` straight into a `MasterKey` (no intermediate `[u8; 32]` left
+/// on the stack).
 fn mk_from_plaintext(pt: &[u8]) -> Option<MasterKey> {
-    let arr: [u8; MK_LEN] = pt.try_into().ok()?;
-    Some(MasterKey(arr))
+    if pt.len() != MK_LEN {
+        return None;
+    }
+    let mut mk = MasterKey([0u8; MK_LEN]);
+    mk.0.copy_from_slice(pt);
+    Some(mk)
 }
 
 // ─── AADs ────────────────────────────────────────────────────────────────
@@ -330,11 +344,13 @@ impl Sentinel {
     pub fn master_key_from_password(&self, password: &[u8]) -> KvendraResult<MasterKey> {
         match self {
             Sentinel::V1(blob) => {
+                // Same Argon2id bounds as v2, checked BEFORE deriving (B4).
+                validate_kdf(&KdfV2::from_params(&blob.kdf))?;
                 let derived = derive(password, &blob.kdf)?;
                 if !v1_check(blob, derived.as_bytes())? {
                     return Err(KvendraError::InvalidMasterPassword);
                 }
-                Ok(MasterKey(*derived.as_bytes()))
+                Ok(mk_from_plaintext(derived.as_bytes()).expect("32-byte Argon2id output"))
             }
             Sentinel::V2(s) => s.unwrap_with_password(password),
         }
@@ -344,7 +360,7 @@ impl Sentinel {
     pub fn verifies_master_key(&self, key: &[u8; MK_LEN]) -> KvendraResult<bool> {
         match self {
             Sentinel::V1(blob) => v1_check(blob, key),
-            Sentinel::V2(s) => Ok(s.verifies(&MasterKey(*key))),
+            Sentinel::V2(s) => Ok(s.verifies(&mk_from_plaintext(key).expect("32 bytes"))),
         }
     }
 }
@@ -491,13 +507,18 @@ pub fn generate_mnemonic() -> KvendraResult<Mnemonic> {
 /// Normalize (lowercase, single spaces) and parse a user phrase. Never
 /// echoes a word: the error only carries a position or a count.
 pub fn parse_phrase(phrase: &str) -> KvendraResult<Mnemonic> {
-    let normalized: Zeroizing<String> = Zeroizing::new(
-        phrase
-            .split_whitespace()
-            .map(str::to_lowercase)
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
+    // Built in place in one zeroizing buffer (no per-word `String`s left in
+    // the heap — B6). Capacity covers any Unicode lowercase expansion.
+    let mut normalized: Zeroizing<String> =
+        Zeroizing::new(String::with_capacity(phrase.len() * 3 + 1));
+    for (i, word) in phrase.split_whitespace().enumerate() {
+        if i > 0 {
+            normalized.push(' ');
+        }
+        for c in word.chars().flat_map(char::to_lowercase) {
+            normalized.push(c);
+        }
+    }
     let got = normalized.split(' ').filter(|w| !w.is_empty()).count();
     if got != RECOVERY_WORD_COUNT {
         return Err(KvendraError::RecoveryPhraseInvalid {
@@ -864,5 +885,30 @@ mod tests {
         assert!(!dbg.contains(&mk_hex) && !dbg.contains(&mk_b64));
         let kek = recovery_kek(&m.mnemonic, &m.vault_id.0);
         assert!(!dbg.contains(&hex::encode(kek.as_ref())));
+    }
+
+    /// B4 — a v1 sentinel with hostile Argon2id parameters is refused before
+    /// deriving (m_cost 4 GiB would otherwise allocate it).
+    #[test]
+    fn v1_sentinel_with_hostile_kdf_is_refused_before_deriving() {
+        let blob = Blob::new(
+            KdfParams {
+                m_cost_kib: 4 * 1024 * 1024,
+                t_cost: 2,
+                p_cost: 1,
+                salt: vec![1u8; 16],
+            },
+            vec![0u8; 12],
+            vec![0u8; 35],
+        );
+        let s = Sentinel::V1(blob);
+        let err = s.master_key_from_password(b"whatever").unwrap_err();
+        assert!(
+            err.to_string().contains("out of the accepted range"),
+            "{err}"
+        );
+        let mut t = Blob::new(fast_params(), vec![0u8; 12], vec![0u8; 35]);
+        t.kdf.t_cost = 1000;
+        assert!(Sentinel::V1(t).master_key_from_password(b"x").is_err());
     }
 }

@@ -24,8 +24,11 @@ use std::path::{Path, PathBuf};
 
 /// File name under the vault home.
 pub const FILE_NAME: &str = "audit.preauth.jsonl";
-/// Retention cap.
+/// Retention cap (lines), enforced on append AND on import.
 pub const MAX_LINES: usize = 1000;
+/// Size cap enforced on import: only the last `MAX_BYTES` of the file are
+/// read (a well-formed line is < 200 bytes, so this covers `MAX_LINES`).
+pub const MAX_BYTES: u64 = 256 * 1024;
 
 /// Commands that log pre-auth rejections.
 const ACTIONS: &[&str] = &["recover", "passwd"];
@@ -65,10 +68,32 @@ impl Reason {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Line {
+    /// Random 128-bit id (hex). Makes the import idempotent: a line whose id
+    /// is already in the chain is not imported again (crash mid-import).
+    id: String,
     ts_unix_ms: i64,
     action: String,
     status: String,
     reason: String,
+}
+
+fn new_line_id() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    hex::encode(b)
+}
+
+fn valid_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+/// `args_hash` of an imported row: binds the reason and the line id.
+fn row_args_hash(id: &str, reason: Reason) -> String {
+    args_hash_hex(&serde_json::json!({ "preauth_id": id, "reason": reason.as_str() }))
 }
 
 pub fn path(home: &Path) -> PathBuf {
@@ -105,6 +130,7 @@ fn append(home: &Path, action: &str, reason: Reason) -> KvendraResult<()> {
         lines.drain(..lines.len() + 1 - MAX_LINES);
     }
     let new_line = serde_json::to_string(&Line {
+        id: new_line_id(),
         ts_unix_ms: now_ms(),
         action: action.into(),
         status: "rejected".into(),
@@ -120,15 +146,30 @@ fn append(home: &Path, action: &str, reason: Reason) -> KvendraResult<()> {
     fsutil::write_atomic(&p, out.as_bytes())
 }
 
-/// Validated lines currently pending import.
-fn pending(home: &Path) -> KvendraResult<Vec<(i64, &'static str, Reason)>> {
-    let raw = match std::fs::read_to_string(path(home)) {
-        Ok(s) => s,
+/// Validated lines currently pending import: at most the last
+/// [`MAX_BYTES`] of the file and the last [`MAX_LINES`] valid lines.
+fn pending(home: &Path) -> KvendraResult<Vec<(String, i64, &'static str, Reason)>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = match std::fs::File::open(path(home)) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
+    let len = f.metadata()?.len();
+    let truncated = len > MAX_BYTES;
+    if truncated {
+        f.seek(SeekFrom::Start(len - MAX_BYTES))?;
+    }
+    let mut buf = Vec::with_capacity(len.min(MAX_BYTES) as usize);
+    f.take(MAX_BYTES).read_to_end(&mut buf)?;
+    let raw = String::from_utf8_lossy(&buf);
+    let mut lines = raw.lines();
+    if truncated {
+        // The first line may be cut in the middle.
+        lines.next();
+    }
     let mut out = Vec::new();
-    for l in raw.lines() {
+    for l in lines {
         let Ok(line) = serde_json::from_str::<Line>(l) else {
             continue;
         };
@@ -138,32 +179,61 @@ fn pending(home: &Path) -> KvendraResult<Vec<(i64, &'static str, Reason)>> {
         let Some(reason) = Reason::parse(&line.reason) else {
             continue;
         };
-        if line.status != "rejected" || line.ts_unix_ms <= 0 {
+        if line.status != "rejected" || line.ts_unix_ms <= 0 || !valid_id(&line.id) {
             continue;
         }
-        out.push((line.ts_unix_ms, *action, reason));
+        out.push((line.id, line.ts_unix_ms, *action, reason));
+    }
+    if out.len() > MAX_LINES {
+        out.drain(..out.len() - MAX_LINES);
     }
     Ok(out)
 }
 
+/// `args_hash` of every pre-auth row already in the chain.
+fn imported_hashes(home: &Path) -> KvendraResult<std::collections::HashSet<String>> {
+    let db = home.join("audit.db");
+    if !db.exists() {
+        return Ok(Default::default());
+    }
+    let conn = crate::audit::reader::open_readonly(&db)?;
+    Ok(crate::audit::reader::list_all(&conn)?
+        .into_iter()
+        .filter(|r| r.flags.contains(FLAG_PREAUTH_UNAUTHENTICATED))
+        .map(|r| r.args_hash_hex)
+        .collect())
+}
+
 /// Import every pending line into the HMAC chain (flag
-/// `preauth_unauthenticated`) and remove the file. Returns the number of
-/// imported rows.
+/// `preauth_unauthenticated`) and remove the file. Idempotent: a line
+/// already imported (same id) by a run that crashed before removing the
+/// file is skipped. Returns the number of rows written.
 pub async fn flush_into_chain(home: &Path, hmac_key: Vec<u8>) -> KvendraResult<usize> {
     let p = path(home);
     if !p.exists() {
         return Ok(0);
     }
     let rows = pending(home)?;
-    if !rows.is_empty() {
+    let done = imported_hashes(home)?;
+    let todo: Vec<_> = rows
+        .into_iter()
+        .filter(|(id, _, _, reason)| !done.contains(&row_args_hash(id, *reason)))
+        .collect();
+    if !todo.is_empty() {
         let writer = AuditWriter::spawn(home.join("audit.db"), hmac_key)?;
-        for (ts, action, reason) in &rows {
+        for (n, (id, ts, action, reason)) in todo.iter().enumerate() {
+            if n > 0
+                && let Err(e) = crate::fault::maybe_fail("preauth.mid_import")
+            {
+                writer.shutdown().await;
+                return Err(e);
+            }
             let event = AuditEvent {
                 ts_unix_ms: *ts,
                 profile_id: PRIMITIVE_SYSTEM.into(),
                 primitive: PRIMITIVE_SYSTEM.into(),
                 action: (*action).into(),
-                args_hash_hex: args_hash_hex(&serde_json::json!({ "reason": reason.as_str() })),
+                args_hash_hex: row_args_hash(id, *reason),
                 status: Status::Error,
                 severity: Severity::Warn,
                 flags: format!(
@@ -182,7 +252,7 @@ pub async fn flush_into_chain(home: &Path, hmac_key: Vec<u8>) -> KvendraResult<u
         writer.shutdown().await;
     }
     std::fs::remove_file(&p)?;
-    Ok(rows.len())
+    Ok(todo.len())
 }
 
 #[cfg(test)]
@@ -215,16 +285,84 @@ mod tests {
         let mut raw = std::fs::read_to_string(path(dir.path())).unwrap();
         raw.push_str("not json\n");
         raw.push_str(
-            r#"{"ts_unix_ms":1,"action":"recover","status":"rejected","reason":"free text here"}"#,
+            r#"{"id":"00000000000000000000000000000001","ts_unix_ms":1,"action":"recover","status":"rejected","reason":"free text here"}"#,
         );
         raw.push('\n');
         raw.push_str(
-            r#"{"ts_unix_ms":1,"action":"rm -rf","status":"rejected","reason":"unavailable"}"#,
+            r#"{"id":"00000000000000000000000000000002","ts_unix_ms":1,"action":"rm -rf","status":"rejected","reason":"unavailable"}"#,
         );
         raw.push('\n');
         std::fs::write(path(dir.path()), raw).unwrap();
         let p = pending(dir.path()).unwrap();
         assert_eq!(p.len(), 1);
-        assert_eq!(p[0].2, Reason::PhraseInvalid);
+        assert_eq!(p[0].3, Reason::PhraseInvalid);
+    }
+
+    /// B5 — the line cap and the size cap also apply on import.
+    #[test]
+    fn pending_caps_lines_and_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut raw = String::new();
+        for i in 0..1500u32 {
+            raw.push_str(&format!(
+                "{{\"id\":\"{:032x}\",\"ts_unix_ms\":{},\"action\":\"recover\",\"status\":\"rejected\",\"reason\":\"phrase_mismatch\"}}\n",
+                i + 1,
+                i + 1
+            ));
+        }
+        std::fs::write(path(dir.path()), &raw).unwrap();
+        let p = pending(dir.path()).unwrap();
+        assert_eq!(p.len(), MAX_LINES);
+        assert_eq!(p.last().unwrap().1, 1500, "keeps the newest lines");
+        // A huge file: only the tail is read.
+        let mut big = "x".repeat(4 * MAX_BYTES as usize);
+        big.push('\n');
+        big.push_str(&raw);
+        std::fs::write(path(dir.path()), &big).unwrap();
+        let p = pending(dir.path()).unwrap();
+        assert!(!p.is_empty() && p.len() <= MAX_LINES);
+    }
+
+    /// B5 — a crash in the middle of an import never duplicates rows when
+    /// the file is imported again.
+    #[tokio::test]
+    async fn import_is_idempotent_after_partial_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        for _ in 0..3 {
+            append(home, "recover", Reason::PhraseMismatch).unwrap();
+        }
+        let saved = std::fs::read(path(home)).unwrap();
+        let key = vec![7u8; 32];
+        assert_eq!(flush_into_chain(home, key.clone()).await.unwrap(), 3);
+        // Simulate "rows written, file not yet removed".
+        std::fs::write(path(home), &saved).unwrap();
+        assert_eq!(flush_into_chain(home, key.clone()).await.unwrap(), 0);
+        let conn = crate::audit::reader::open_readonly(&home.join("audit.db")).unwrap();
+        let rows = crate::audit::reader::list_all(&conn).unwrap();
+        assert_eq!(rows.len(), 3);
+        crate::audit::reader::verify_chain(&conn, &key).unwrap();
+    }
+
+    /// B5 — failure after the first row of an import: the retry imports the
+    /// rest exactly once.
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn import_resumes_without_duplicates_after_mid_import_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        for _ in 0..3 {
+            append(home, "passwd", Reason::PasswordInvalid).unwrap();
+        }
+        let key = vec![9u8; 32];
+        {
+            let _armed = crate::fault::arm("preauth.mid_import");
+            assert!(flush_into_chain(home, key.clone()).await.is_err());
+        }
+        assert!(path(home).exists(), "file kept until the import completes");
+        assert_eq!(flush_into_chain(home, key.clone()).await.unwrap(), 2);
+        let conn = crate::audit::reader::open_readonly(&home.join("audit.db")).unwrap();
+        assert_eq!(crate::audit::reader::list_all(&conn).unwrap().len(), 3);
+        crate::audit::reader::verify_chain(&conn, &key).unwrap();
     }
 }

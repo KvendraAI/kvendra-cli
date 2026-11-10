@@ -39,6 +39,16 @@ pub enum KvendraError {
     )]
     RecoveryUnavailable,
 
+    /// 0.9+ vault (sentinel v2) whose `recovery.blob` is missing.
+    #[error(
+        "This vault has no recovery.blob, so the recovery phrase cannot be verified against it. \
+         Nothing was changed. If you still have this vault's recovery.blob (for example in an \
+         earlier copy of ~/.kvendra), put it back and run `kvendra recover` again. Otherwise, \
+         if you forgot the master password, the way out is a new vault: move ~/.kvendra aside, \
+         run `kvendra init`, and add your secrets again (they are re-issuable credentials)."
+    )]
+    RecoveryBlobMissing,
+
     /// Recovery material present but unusable (unknown version, vault_id
     /// that does not match the sentinel, recovered key failing `check`).
     #[error("recovery material is corrupt or does not match this vault: {0}. Nothing was changed.")]

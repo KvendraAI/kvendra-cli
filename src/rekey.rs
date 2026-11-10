@@ -43,51 +43,76 @@ pub const KEYCHAIN_MCP_PASSWORD_LABEL: &str = "kvendra/mcp-password/v1";
 /// Legacy MCP wrapper script (may embed the password).
 pub const LEGACY_WRAPPER_NAME: &str = "kvendra-mcp-serve";
 
+/// Suffix of the companion entry that records which vault wrote a keychain
+/// entry. The keychain is global to the OS user while vaults are per
+/// `KVENDRA_HOME`, so `recover` / `passwd` only remove an entry whose owner
+/// tag is THIS vault's `vault_id` (public, non-secret) — never another
+/// vault's credential (REQ-KVD-CLI-CFB449, validation finding M3).
+pub const KEYCHAIN_OWNER_SUFFIX: &str = "#owner";
+
+pub fn owner_label(label: &str) -> String {
+    format!("{label}{KEYCHAIN_OWNER_SUFFIX}")
+}
+
 /// OS credential caches that a password change must invalidate. Abstracted
 /// so tests never read or delete the machine's real keychain entries.
 pub trait CredentialCaches: Send + Sync {
-    /// Remove `kvendra/derived-key/v1`. Absent = success.
-    fn delete_derived_key(&self) -> KvendraResult<()>;
-    /// Remove `kvendra/mcp-password/v1`. Absent = success.
-    fn delete_mcp_password(&self) -> KvendraResult<()>;
+    /// `vault_id` (hex) recorded for `label`, if any. Backend errors read
+    /// as "no owner" (the entry is then left untouched).
+    fn owner(&self, label: &str) -> Option<String>;
+    /// Record `vault_id_hex` as the owner of `label`.
+    fn set_owner(&self, label: &str, vault_id_hex: &str) -> KvendraResult<()>;
+    /// Remove the entry itself. Absent = success.
+    fn delete_entry(&self, label: &str) -> KvendraResult<()>;
+    /// Remove the owner tag. Absent = success.
+    fn delete_owner(&self, label: &str) -> KvendraResult<()>;
 }
 
 /// Real OS keychain.
 pub struct OsCredentialCaches;
 
 impl CredentialCaches for OsCredentialCaches {
-    fn delete_derived_key(&self) -> KvendraResult<()> {
-        // Since 0.5 this entry only ever holds a constant presence flag
-        // (`kvendra unlock` stores B64("kvendra-keychain-sentinel-v1")), never
-        // key material, so it cannot open the vault with any password. A
-        // backend that is not available (headless Linux, CI) therefore must
-        // not block a recovery: warn and continue.
-        match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_DERIVED_KEY_LABEL) {
-            Ok(entry) => match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(e) => {
-                    tracing::warn!(target: "kvendra::rekey", "derived-key/v1 not removed: {e}");
+    fn owner(&self, label: &str) -> Option<String> {
+        keyring::Entry::new(KEYCHAIN_SERVICE, &owner_label(label))
+            .ok()?
+            .get_password()
+            .ok()
+    }
+
+    fn set_owner(&self, label: &str, vault_id_hex: &str) -> KvendraResult<()> {
+        keyring::Entry::new(KEYCHAIN_SERVICE, &owner_label(label))
+            .and_then(|e| e.set_password(vault_id_hex))
+            .map_err(|e| KvendraError::Keychain(e.to_string()))
+    }
+
+    fn delete_entry(&self, label: &str) -> KvendraResult<()> {
+        if label == KEYCHAIN_MCP_PASSWORD_LABEL {
+            use crate::keychain_acl::{self, BiometricError};
+            return match keychain_acl::delete(label) {
+                Ok(()) | Err(BiometricError::NotFound(_)) | Err(BiometricError::Unavailable(_)) => {
                     Ok(())
                 }
+                Err(e) => Err(KvendraError::Keychain(format!(
+                    "could not remove {label}: {e:?}"
+                ))),
+            };
+        }
+        match keyring::Entry::new(KEYCHAIN_SERVICE, label) {
+            Ok(entry) => match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(KvendraError::Keychain(e.to_string())),
             },
-            Err(e) => {
-                tracing::warn!(target: "kvendra::rekey", "keychain backend unavailable: {e}");
-                Ok(())
-            }
+            Err(e) => Err(KvendraError::Keychain(e.to_string())),
         }
     }
 
-    fn delete_mcp_password(&self) -> KvendraResult<()> {
-        use crate::keychain_acl::{self, BiometricError};
-        // This entry holds the OLD master password: failing to remove it
-        // aborts the commit.
-        match keychain_acl::delete(KEYCHAIN_MCP_PASSWORD_LABEL) {
-            Ok(()) | Err(BiometricError::NotFound(_)) | Err(BiometricError::Unavailable(_)) => {
-                Ok(())
-            }
-            Err(e) => Err(KvendraError::Keychain(format!(
-                "could not remove {KEYCHAIN_MCP_PASSWORD_LABEL}: {e:?}"
-            ))),
+    fn delete_owner(&self, label: &str) -> KvendraResult<()> {
+        match keyring::Entry::new(KEYCHAIN_SERVICE, &owner_label(label)) {
+            Ok(entry) => match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(KvendraError::Keychain(e.to_string())),
+            },
+            Err(e) => Err(KvendraError::Keychain(e.to_string())),
         }
     }
 }
@@ -102,7 +127,7 @@ impl FileCredentialCaches {
         self.dir.join(label.replace('/', "_"))
     }
 
-    fn delete(&self, label: &str) -> KvendraResult<()> {
+    fn remove(&self, label: &str) -> KvendraResult<()> {
         if std::env::var("KVENDRA_TEST_KEYCHAIN_FAIL").is_ok_and(|l| l == label) {
             return Err(KvendraError::Keychain(format!(
                 "fake keychain refused {label}"
@@ -117,12 +142,22 @@ impl FileCredentialCaches {
 }
 
 impl CredentialCaches for FileCredentialCaches {
-    fn delete_derived_key(&self) -> KvendraResult<()> {
-        self.delete(KEYCHAIN_DERIVED_KEY_LABEL)
+    fn owner(&self, label: &str) -> Option<String> {
+        std::fs::read_to_string(self.entry_path(&owner_label(label))).ok()
     }
 
-    fn delete_mcp_password(&self) -> KvendraResult<()> {
-        self.delete(KEYCHAIN_MCP_PASSWORD_LABEL)
+    fn set_owner(&self, label: &str, vault_id_hex: &str) -> KvendraResult<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::write(self.entry_path(&owner_label(label)), vault_id_hex)?;
+        Ok(())
+    }
+
+    fn delete_entry(&self, label: &str) -> KvendraResult<()> {
+        self.remove(label)
+    }
+
+    fn delete_owner(&self, label: &str) -> KvendraResult<()> {
+        self.remove(&owner_label(label))
     }
 }
 
@@ -177,11 +212,30 @@ pub fn recover_tmp_path(vault: &Vault) -> PathBuf {
     fsutil::sibling(&vault.sentinel_path(), "recover-tmp")
 }
 
+/// Exclusive per-vault lock held by `recover` / `passwd` for the whole
+/// commit, and taken (non-blocking) by the leftover cleanup, so one command
+/// never deletes the other's `.pre-recover` / `.recover-tmp` mid-commit.
+pub type RekeyLock = fsutil::FileLock;
+
+pub const REKEY_LOCK_NAME: &str = ".rekey.lock";
+
+/// `Ok(None)` when another process holds the lock.
+pub fn try_lock_rekey(home: &Path) -> KvendraResult<Option<RekeyLock>> {
+    fsutil::try_lock_exclusive(&home.join(REKEY_LOCK_NAME))
+}
+
 /// Before any authentication: drop an unpublished tmp sentinel and, if the
 /// sentinel itself is missing but a pre-recover copy exists, put the copy
 /// back. Never deletes the pre-recover copy (that needs proof the current
 /// sentinel opens: [`finish_after_auth`]).
 pub fn cleanup_before_auth(vault: &Vault) -> KvendraResult<()> {
+    if !recover_tmp_path(vault).exists() && !pre_recover_path(vault).exists() {
+        return Ok(());
+    }
+    // A recover/passwd in progress owns these files: leave them alone.
+    let Some(_lock) = try_lock_rekey(vault.home())? else {
+        return Ok(());
+    };
     let tmp = recover_tmp_path(vault);
     if tmp.exists() {
         std::fs::remove_file(&tmp)?;
@@ -200,7 +254,14 @@ pub fn cleanup_before_auth(vault: &Vault) -> KvendraResult<()> {
 pub async fn finish_after_auth(home: &Path, audit_hmac_key: Vec<u8>) -> KvendraResult<()> {
     let vault = Vault::new(home.to_path_buf());
     let pre = pre_recover_path(&vault);
-    if pre.exists() {
+    let lock = if pre.exists() {
+        try_lock_rekey(home)?
+    } else {
+        None
+    };
+    if let Some(_lock) = lock
+        && pre.exists()
+    {
         std::fs::remove_file(&pre)?;
         fsutil::fsync_dir(home)?;
         record_system_row(
@@ -240,18 +301,80 @@ async fn record_system_row(
     r.map(|_| ())
 }
 
+/// Record the current vault (`home`, sentinel v2) as the owner of the
+/// keychain `label` it just wrote. Best effort: a v1 vault or an unavailable
+/// backend just leaves the entry untagged (never removed by recover/passwd).
+pub fn bind_keychain_owner(home: &Path, label: &str) {
+    let vault = Vault::new(home.to_path_buf());
+    let Ok(crate::vault::envelope::Sentinel::V2(s)) = vault.read_sentinel() else {
+        return;
+    };
+    let Ok(id) = s.vault_id() else { return };
+    match caches_for_process() {
+        Ok(c) => {
+            if let Err(e) = c.set_owner(label, &id.to_hex()) {
+                tracing::warn!(target: "kvendra::rekey", "keychain owner tag not written: {e}");
+            }
+        }
+        Err(e) => tracing::warn!(target: "kvendra::rekey", "keychain owner tag not written: {e}"),
+    }
+}
+
+/// Remove the owner tag of `label` (used by the `disable` commands).
+pub fn unbind_keychain_owner(label: &str) {
+    if let Ok(c) = caches_for_process() {
+        let _ = c.delete_owner(label);
+    }
+}
+
+/// Keychain entries left untouched because they are not bound to this vault.
+pub fn not_owned_notice(label: &str) -> String {
+    let fix = if label == KEYCHAIN_MCP_PASSWORD_LABEL {
+        "kvendra config mcp-password disable"
+    } else {
+        "kvendra config keychain disable"
+    };
+    format!(
+        "note: keychain entry {label} was left untouched: it is not bound to this vault \
+         (written by another vault or by a release before 0.9). It cannot open this vault \
+         with the new password; if it holds this vault's old password, remove it with `{fix}`."
+    )
+}
+
 /// Invalidate every cache holding MK or the old password. Idempotent.
-pub fn invalidate_caches(home: &Path, caches: &dyn CredentialCaches) -> KvendraResult<()> {
+/// Keychain entries are removed only when their owner tag is `vault_id_hex`
+/// (M3); the labels skipped are returned so the caller can tell the user.
+pub fn invalidate_caches(
+    home: &Path,
+    vault_id_hex: &str,
+    caches: &dyn CredentialCaches,
+) -> KvendraResult<Vec<&'static str>> {
     crate::session::local::delete(home)?;
-    caches.delete_derived_key()?;
-    caches.delete_mcp_password()?;
+    let mut skipped = Vec::new();
+    for label in [KEYCHAIN_DERIVED_KEY_LABEL, KEYCHAIN_MCP_PASSWORD_LABEL] {
+        if caches.owner(label).as_deref() != Some(vault_id_hex) {
+            skipped.push(label);
+            continue;
+        }
+        match caches.delete_entry(label) {
+            Ok(()) => {}
+            // The mcp-password entry holds the OLD password: abort.
+            Err(e) if label == KEYCHAIN_MCP_PASSWORD_LABEL => return Err(e),
+            // derived-key/v1 only ever holds a constant presence flag (never
+            // key material): a backend failure must not block recovery.
+            Err(e) => tracing::warn!(target: "kvendra::rekey", "{label} not removed: {e}"),
+        }
+        if let Err(e) = caches.delete_owner(label) {
+            tracing::warn!(target: "kvendra::rekey", "{label} owner tag not removed: {e}");
+        }
+    }
     let wrapper = home.join("wrappers").join(LEGACY_WRAPPER_NAME);
     match std::fs::remove_file(&wrapper) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    Ok(())
+    Ok(skipped)
 }
 
 /// Publish `new_sentinel` (which must wrap `mk`) as the vault's sentinel.
@@ -274,8 +397,24 @@ pub async fn commit_new_password(
     let pre = pre_recover_path(vault);
     let tmp = recover_tmp_path(vault);
 
+    let vault_id_hex = new_sentinel.vault_id()?.to_hex();
+    let _lock = try_lock_rekey(&home)?.ok_or_else(|| {
+        KvendraError::Vault(
+            "another `kvendra recover` or `kvendra passwd` is in progress on this vault; \
+             nothing was changed"
+                .into(),
+        )
+    })?;
+    // Under the lock: the CURRENT sentinel (maybe just re-wrapped by another
+    // command) must still be this vault's.
+    if !vault.read_sentinel()?.verifies_master_key(mk.as_bytes())? {
+        return Err(KvendraError::Vault(
+            "sentinel.blob changed and no longer matches this vault's key; nothing was changed"
+                .into(),
+        ));
+    }
     maybe_fail("rekey.before_invalidate")?;
-    invalidate_caches(&home, caches)?;
+    let skipped = invalidate_caches(&home, &vault_id_hex, caches)?;
     maybe_fail("rekey.after_invalidate")?;
 
     // The caller proved `mk` against the CURRENT sentinel, so a stale
@@ -303,6 +442,9 @@ pub async fn commit_new_password(
     }
     if let Err(e) = crate::audit::preauth::flush_into_chain(&home, hmac_key).await {
         tracing::warn!(target: "kvendra::rekey", "pre-auth rejections not imported yet: {e}");
+    }
+    for label in skipped {
+        eprintln!("{}", not_owned_notice(label));
     }
     Ok(())
 }
@@ -368,7 +510,9 @@ fn restore_previous(home: &Path, sentinel: &Path, pre: &Path, tmp: &Path, origin
 /// Map a rejection to its pre-auth reason (None = not a pre-auth rejection).
 fn preauth_reason(e: &KvendraError) -> Option<Reason> {
     match e {
-        KvendraError::RecoveryUnavailable => Some(Reason::Unavailable),
+        KvendraError::RecoveryUnavailable | KvendraError::RecoveryBlobMissing => {
+            Some(Reason::Unavailable)
+        }
         KvendraError::RecoveryPhraseInvalid { .. } => Some(Reason::PhraseInvalid),
         KvendraError::RecoveryPhraseMismatch => Some(Reason::PhraseMismatch),
         KvendraError::RecoveryMaterialCorrupt(_) => Some(Reason::MaterialCorrupt),
@@ -407,11 +551,14 @@ pub async fn recover_with_phrase(
         ));
     }
     cleanup_before_auth(vault)?;
-    let available = logged(&home, "recover", vault.recovery_available())?;
-    if !available {
+    if matches!(
+        vault.read_sentinel()?,
+        crate::vault::envelope::Sentinel::V1(_)
+    ) {
         return logged(&home, "recover", Err(KvendraError::RecoveryUnavailable));
     }
-    // Corrupt / unknown-version material is refused before the phrase.
+    // Missing (RecoveryBlobMissing) or corrupt / unknown-version material is
+    // refused before the phrase.
     logged(&home, "recover", vault.read_recovery_blob())?;
 
     let phrase = read_phrase()?;

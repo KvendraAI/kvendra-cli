@@ -42,9 +42,31 @@ fn backup_audit_db(audit_db_path: &Path) -> Option<std::path::PathBuf> {
         audit_db_path.file_name()?.to_string_lossy(),
         ts
     );
-    let backup_path = audit_db_path.with_file_name(backup_name);
-    match std::fs::copy(audit_db_path, &backup_path) {
-        Ok(_) => Some(backup_path),
+    // Created 0600 + create_new from the first byte (never 0644 under the
+    // umask, never through a pre-planted file or symlink).
+    let copy = || -> crate::error::KvendraResult<std::path::PathBuf> {
+        let bytes = std::fs::read(audit_db_path)?;
+        let mut n = 0u32;
+        loop {
+            let name = if n == 0 {
+                backup_name.clone()
+            } else {
+                format!("{backup_name}.{n}")
+            };
+            let p = audit_db_path.with_file_name(name);
+            match crate::vault::fsutil::write_new_synced(&p, &bytes) {
+                Ok(()) => return Ok(p),
+                Err(crate::error::KvendraError::Io(e))
+                    if e.kind() == std::io::ErrorKind::AlreadyExists && n < 16 =>
+                {
+                    n += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    match copy() {
+        Ok(p) => Some(p),
         Err(e) => {
             tracing::warn!(
                 source = %audit_db_path.display(),
@@ -405,5 +427,26 @@ mod tests {
         // Before apply_pending, the ledger table doesn't even exist yet —
         // current_version creates it and reports 0.
         assert_eq!(current_version(&conn).unwrap(), 0);
+    }
+
+    /// Validation finding B11 — the pre-migration copy of `audit.db` is
+    /// 0600 from its creation and never overwrites an existing file.
+    #[cfg(unix)]
+    #[test]
+    fn audit_db_backup_is_0600_and_never_overwrites() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("audit.db");
+        std::fs::write(&db, b"kvd-audit-bytes").unwrap();
+        let a = backup_audit_db(&db).unwrap();
+        let b = backup_audit_db(&db).unwrap();
+        assert_ne!(a, b, "a same-second backup must not overwrite the first");
+        for p in [a, b] {
+            assert_eq!(
+                std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(std::fs::read(&p).unwrap(), b"kvd-audit-bytes");
+        }
     }
 }

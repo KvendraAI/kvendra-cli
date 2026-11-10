@@ -82,6 +82,9 @@ fn init_writes_v2_vault_bound_to_the_shown_phrase() {
     );
     assert!(stdout.contains("They do NOT recover a forgotten password."));
     assert!(stdout.contains("Recovery phrase bound to this vault (recovery.blob)."));
+    // D1 — 0.9.0 cannot restore onto a new machine with backup + phrase.
+    assert!(!stdout.contains("restored from"), "{stdout}");
+    assert!(!stdout.contains("on a new one"), "{stdout}");
     let v = Vault::new(dir.path().to_path_buf());
     let Sentinel::V2(s) = v.read_sentinel().unwrap() else {
         unreachable!()
@@ -299,6 +302,90 @@ mod hooks {
             assert_eq!(
                 std::fs::metadata(&save).unwrap().permissions().mode() & 0o777,
                 0o600
+            );
+        }
+    }
+
+    /// M1 — a symlink or an existing file at `--save-to` is refused untouched
+    /// and nothing of the vault is written; a failure right after the file
+    /// was created removes it.
+    #[cfg(unix)]
+    #[test]
+    fn save_to_symlink_or_existing_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let target = dir.path().join("victim.txt");
+        std::fs::write(&target, b"kvd-victim").unwrap();
+        let link = dir.path().join("codes-link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        for save in [link.clone(), target.clone()] {
+            let out = fast(&mut init_cmd(&home))
+                .arg("--save-to")
+                .arg(&save)
+                .output()
+                .unwrap();
+            assert!(!out.status.success());
+            assert!(String::from_utf8_lossy(&out.stderr).contains("refusing to write --save-to"));
+            assert_eq!(std::fs::read(&target).unwrap(), b"kvd-victim");
+            assert_no_vault(&home);
+        }
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let save = dir.path().join("codes.txt");
+        let out = fast(&mut init_cmd(&home))
+            .arg("--save-to")
+            .arg(&save)
+            .env("KVENDRA_TEST_FAIL_AT", "init.after_save_to")
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            !save.exists(),
+            "a failure after creating --save-to must remove it"
+        );
+        assert_no_vault(&home);
+    }
+
+    /// M2 — two concurrent inits on one home: exactly one vault, coherent
+    /// (the winner's phrase recovers it, its password opens it).
+    #[test]
+    fn concurrent_inits_leave_exactly_one_coherent_vault() {
+        for _ in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let spawn = || {
+                let mut c = std::process::Command::new(assert_cmd::cargo::cargo_bin("kvendra"));
+                c.args(["init", "--no-verify"])
+                    .env("KVENDRA_HOME", &home)
+                    .env("HOME", &home)
+                    .env("KVENDRA_INIT_PASSWORD", PW)
+                    .env("KVENDRA_TEST_FAST_KDF", "1")
+                    .env_remove("KVENDRA_TEST_FAIL_AT")
+                    .env_remove("KVENDRA_TEST_CRASH_AT")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                c.spawn().unwrap()
+            };
+            let (a, b) = (spawn(), spawn());
+            let outs = [a.wait_with_output().unwrap(), b.wait_with_output().unwrap()];
+            let ok: Vec<_> = outs.iter().filter(|o| o.status.success()).collect();
+            assert_eq!(ok.len(), 1, "exactly one init must win");
+            let loser = outs.iter().find(|o| !o.status.success()).unwrap();
+            let err = String::from_utf8_lossy(&loser.stderr);
+            assert!(
+                err.contains("another `kvendra init` is running")
+                    || err.contains("already initialized"),
+                "{err}"
+            );
+            assert_v2_vault_bound_to(
+                &home,
+                &phrase_from_stdout(&String::from_utf8_lossy(&ok[0].stdout)),
             );
         }
     }

@@ -94,9 +94,9 @@ El binario imprime el material de recuperación **una sola vez**:
 BIP-39 mnemonic (12 words):
     <word1> <word2> ... <word12>
 
-What the 12 words do: they recover access to THIS vault if you forget the master
-password (`kvendra recover`), ...  Anyone with them can set a new password: keep
-them offline.
+What the 12 words do: they recover access to THIS vault on this machine if you
+forget the master password (`kvendra recover`). Anyone with them can set a new
+password: keep them offline.
 
 Numeric one-time codes (8 codes):
     NNNN-NNNN-NN
@@ -106,7 +106,7 @@ What the 8 codes do: they authorise `kvendra config rebind-home` only. They do N
 recover a forgotten password.
 ```
 
-> **Nota (0.9.0):** el texto del banner menciona también «a new one restored from `kvendra backup`». En 0.9.0 `kvendra backup pull` necesita el `sentinel.blob` de este vault en la máquina (abre el bundle con la password actual), así que restaurar en una máquina nueva solo con backup + frase **todavía no está soportado**. Ver [capítulo 10](./10-recuperacion.md).
+> **Nota (0.9.0):** la frase recupera el acceso **en la máquina donde está el vault** (necesita su `sentinel.blob` y su `recovery.blob`). Restaurar en una máquina nueva solo con backup + frase **todavía no está soportado**: `kvendra backup pull` necesita la password actual y el vault local. Ver [capítulo 10](./10-recuperacion.md).
 
 > **Advertencia:** la frase es un secreto **del mismo peso que el master password**: quien la tenga junto con una copia de tus ficheros del vault puede fijar una password nueva y leer tus secretos. Si haces screenshot, la copias al clipboard, la escribes en un fichero o la dejas en el scrollback del terminal, ese rastro equivale a la llave del vault. Escríbela a mano o guárdala en un gestor de contraseñas separado.
 

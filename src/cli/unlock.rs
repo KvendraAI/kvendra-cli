@@ -45,7 +45,7 @@ pub struct UnlockArgs {
     /// Read password from env var (testing/CI). Skips the anti-captured-env
     /// TTY guard because non-interactive environments have no TTY by
     /// definition.
-    #[arg(long, env = "KVENDRA_PASSWORD")]
+    #[arg(long, env = "KVENDRA_PASSWORD", hide_env_values = true)]
     pub password_env: Option<String>,
     /// Refresh the TTL of the existing session. Re-authenticates with the
     /// master password (v0.6.4, finding A1) — reads it from the TTY, or from
@@ -190,8 +190,11 @@ pub async fn run(args: UnlockArgs) -> KvendraResult<()> {
 
     // Legacy ADR-KVD-012 sentinel: update the OS keychain "presence flag"
     // if the user opted in. Does not store the derived key itself.
-    if !args.no_keychain && cfg.vault.master_password_cache == MasterPasswordCache::OsKeychain {
-        let _ = store_derived_key_in_keychain(&B64.encode(b"kvendra-keychain-sentinel-v1"));
+    if !args.no_keychain
+        && cfg.vault.master_password_cache == MasterPasswordCache::OsKeychain
+        && store_derived_key_in_keychain(&B64.encode(b"kvendra-keychain-sentinel-v1")).is_ok()
+    {
+        crate::rekey::bind_keychain_owner(&home, crate::rekey::KEYCHAIN_DERIVED_KEY_LABEL);
     }
 
     // AC-REC-6/7 — with the key in hand: remove a leftover pre-recover copy

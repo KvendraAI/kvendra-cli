@@ -1,7 +1,7 @@
 //! `kvendra init` — vault bootstrap with full recovery UX (ADR-KVD-011).
 
 use crate::audit::bootstrap::write_vault_created_event;
-use crate::config::{Config, create_dir_secure, ensure_layout, kvendra_home, set_file_mode_secure};
+use crate::config::{Config, create_dir_secure, ensure_layout, kvendra_home};
 use crate::error::{KvendraError, KvendraResult};
 use crate::fault::maybe_fail;
 use crate::vault::Vault;
@@ -34,14 +34,20 @@ fn passwords_match(pw1: &str, pw2: &str) -> bool {
 /// comparison. Loops up to `max_attempts` before erroring out — protects
 /// against silent typos at vault setup, which would otherwise become
 /// undetectable until the first `unlock` (AC-VAULT-1, REQ-KVD-002).
-pub(crate) fn prompt_password_with_confirmation(max_attempts: u8) -> KvendraResult<String> {
+pub(crate) fn prompt_password_with_confirmation(
+    max_attempts: u8,
+) -> KvendraResult<Zeroizing<String>> {
     for attempt in 1..=max_attempts {
         println!("Enter a master password (will not echo):");
-        let pw1 = rpassword::read_password()
-            .map_err(|e| KvendraError::Vault(format!("read password: {e}")))?;
+        let pw1 = Zeroizing::new(
+            rpassword::read_password()
+                .map_err(|e| KvendraError::Vault(format!("read password: {e}")))?,
+        );
         println!("Confirm master password:");
-        let pw2 = rpassword::read_password()
-            .map_err(|e| KvendraError::Vault(format!("read password confirmation: {e}")))?;
+        let pw2 = Zeroizing::new(
+            rpassword::read_password()
+                .map_err(|e| KvendraError::Vault(format!("read password confirmation: {e}")))?,
+        );
         if passwords_match(&pw1, &pw2) {
             return Ok(pw1);
         }
@@ -62,10 +68,10 @@ pub struct InitArgs {
     #[arg(long)]
     pub no_verify: bool,
     /// Read the master password from this env var instead of prompting.
-    #[arg(long, env = "KVENDRA_INIT_PASSWORD")]
+    #[arg(long, env = "KVENDRA_INIT_PASSWORD", hide_env_values = true)]
     pub password_env: Option<String>,
     /// Pre-confirmation code (for non-interactive setups).
-    #[arg(long, env = "KVENDRA_INIT_CONFIRM_CODE")]
+    #[arg(long, env = "KVENDRA_INIT_CONFIRM_CODE", hide_env_values = true)]
     pub confirm_code: Option<String>,
     /// Save recovery codes (mnemonic + numeric) to this path (warns about 0600).
     #[arg(long)]
@@ -93,6 +99,9 @@ const INIT_PREFIXES: &[&str] = &[
 
 const SENTINEL_TMP_SUFFIX: &str = "init-tmp";
 
+/// Per-home lock serializing concurrent `kvendra init` runs (finding M2).
+pub(crate) const INIT_LOCK_NAME: &str = ".init.lock";
+
 pub async fn run(args: InitArgs) -> KvendraResult<()> {
     let home = args
         .home_override
@@ -100,6 +109,14 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
         .map(Ok)
         .unwrap_or_else(kvendra_home)?;
     ensure_layout(&home)?;
+
+    // Two concurrent inits on the same home would interleave their files:
+    // the second one refuses while the first holds the lock (M2).
+    let _init_lock = fsutil::try_lock_exclusive(&home.join(INIT_LOCK_NAME))?.ok_or_else(|| {
+        KvendraError::Vault(
+            "another `kvendra init` is running on this vault home — nothing was changed".into(),
+        )
+    })?;
 
     let vault = Vault::new(home.clone());
     if vault.sentinel_path().exists() {
@@ -113,10 +130,10 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
         );
     }
 
-    let password = Zeroizing::new(match args.password_env.clone() {
-        Some(s) => s,
+    let password = match args.password_env.clone() {
+        Some(s) => Zeroizing::new(s),
         None => prompt_password_with_confirmation(MAX_CONFIRMATION_ATTEMPTS)?,
-    });
+    };
     if password.len() < 8 {
         return Err(KvendraError::Vault(
             "master password must be ≥ 8 characters".into(),
@@ -138,9 +155,9 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
     println!("    {mnemonic}");
     println!();
     println!(
-        "What the 12 words do: they recover access to THIS vault if you forget the master \
-         password (`kvendra recover`), on this machine or on a new one restored from \
-         `kvendra backup`. Anyone with them can set a new password: keep them offline."
+        "What the 12 words do: they recover access to THIS vault on this machine if you \
+         forget the master password (`kvendra recover`). Anyone with them can set a new \
+         password: keep them offline."
     );
     println!();
     println!("Numeric one-time codes (8 codes):");
@@ -156,24 +173,19 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
     println!("════════════════════════════════════════════════════════════════");
     println!();
 
-    // Optional save-to file (same content as 0.8.0). Removed again if init
-    // aborts: its phrase would belong to a vault that does not exist.
+    // Optional save-to file (same content as 0.8.0). Created exclusively,
+    // O_NOFOLLOW, 0600 from the first byte (finding M1); removed again on
+    // ANY later failure, its own write included: its phrase would belong to
+    // a vault that does not exist.
     let mut save_to_written: Option<PathBuf> = None;
-    if let Some(path) = &args.save_to {
-        let mut content = Zeroizing::new(String::new());
-        content.push_str("# kvendra recovery codes — KEEP THIS FILE OFFLINE\n");
-        content.push_str(&format!("mnemonic: {mnemonic}\n"));
-        content.push_str("codes:\n");
-        for c in &codes {
-            content.push_str(&format!("  - {c}\n"));
+    let result = async {
+        if let Some(path) = &args.save_to {
+            write_save_to(path, mnemonic, &codes, &mut save_to_written)?;
+            println!("Recovery material written to {} (0600).", path.display());
         }
-        std::fs::write(path, content.as_bytes())?;
-        save_to_written = Some(path.clone());
-        set_file_mode_secure(path)?;
-        println!("Recovery material written to {} (0600).", path.display());
+        confirm_and_commit(&args, &home, &vault, &material, &codes).await
     }
-
-    let result = confirm_and_commit(&args, &home, &vault, &material, &codes).await;
+    .await;
     if let Err(e) = result {
         if let Some(p) = save_to_written {
             let _ = std::fs::remove_file(&p);
@@ -188,6 +200,58 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
     println!("Vault initialized at {}", home.display());
     println!("Recovery phrase bound to this vault (recovery.blob).");
     Ok(())
+}
+
+/// Write the `--save-to` file. `written` is set as soon as THIS call created
+/// the file, so the caller's rollback removes it even if a later write or
+/// fsync fails; a pre-existing path (file or symlink) is refused untouched.
+fn write_save_to(
+    path: &Path,
+    mnemonic: &bip39::Mnemonic,
+    codes: &[String],
+    written: &mut Option<PathBuf>,
+) -> KvendraResult<()> {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+    let mut content = Zeroizing::new(String::with_capacity(1024));
+    content.push_str("# kvendra recovery codes — KEEP THIS FILE OFFLINE\n");
+    content.push_str("mnemonic: ");
+    write!(content, "{mnemonic}").map_err(|_| KvendraError::Internal)?;
+    content.push('\n');
+    content.push_str("codes:\n");
+    for c in codes {
+        content.push_str("  - ");
+        content.push_str(c);
+        content.push('\n');
+    }
+    let mut file = fsutil::create_new_secure(path).map_err(|e| match e {
+        KvendraError::Io(io)
+            if io.kind() == std::io::ErrorKind::AlreadyExists
+                || io.raw_os_error() == Some(libc_eloop()) =>
+        {
+            KvendraError::Vault(format!(
+                "refusing to write --save-to: {} already exists (file or symlink) — nothing was \
+                 written there",
+                path.display()
+            ))
+        }
+        other => other,
+    })?;
+    *written = Some(path.to_path_buf());
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    maybe_fail("init.after_save_to")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn libc_eloop() -> i32 {
+    libc::ELOOP
+}
+
+#[cfg(not(unix))]
+fn libc_eloop() -> i32 {
+    -1
 }
 
 async fn confirm_and_commit(
@@ -248,6 +312,19 @@ async fn write_vault_files(
     material: &NewVaultMaterial,
     codes: &[String],
 ) -> KvendraResult<()> {
+    // Precondition (M2): nothing of a vault may exist yet. Under the init
+    // lock this always holds; it also protects library callers.
+    for p in [
+        vault.sentinel_path(),
+        vault.recovery_blob_path(),
+        vault.recovery_codes_path(),
+        vault.audit_db_path(),
+        home.join("config.toml"),
+    ] {
+        if p.exists() {
+            return Err(KvendraError::Vault(ALREADY_INITIALIZED.into()));
+        }
+    }
     maybe_fail("init.before_recovery_codes")?;
     let stored = hash_codes(codes)?;
     fsutil::write_atomic(
@@ -285,7 +362,14 @@ async fn write_vault_files(
     let _ = std::fs::remove_file(&tmp);
     fsutil::write_new_synced(&tmp, material.sentinel.to_json()?.as_bytes())?;
     maybe_fail("init.before_sentinel_rename")?;
-    std::fs::rename(&tmp, &sentinel)?;
+    // Never overwrite a sentinel that appeared meanwhile (M2).
+    fsutil::publish_no_overwrite(&tmp, &sentinel).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            KvendraError::Vault(ALREADY_INITIALIZED.into())
+        } else {
+            e.into()
+        }
+    })?;
     // Past the rename the vault exists: a failure to fsync the directory
     // must not roll it back (that would delete a live vault's files).
     if let Err(e) = fsutil::fsync_dir(home) {
@@ -353,6 +437,12 @@ fn rollback(home: &Path, before: &HashSet<OsString>) {
             continue;
         }
         let n = name.to_string_lossy();
+        // Never the published sentinel itself: if it is not in `before`, a
+        // successful commit put it there (rollback only runs on failure
+        // before the publish) or another writer did.
+        if n == "sentinel.blob" {
+            continue;
+        }
         if INIT_PREFIXES.iter().any(|p| n.starts_with(p)) && e.path().is_file() {
             let _ = std::fs::remove_file(e.path());
         }
@@ -408,5 +498,38 @@ mod tests {
         assert!(!passwords_match("hunter2-test", "hunter2-tes"));
         assert!(!passwords_match("a", "ab"));
         assert!(!passwords_match("ab", "a"));
+    }
+
+    /// M2 — a second commit on a home that already holds a vault refuses
+    /// before writing and leaves the first vault coherent (its phrase still
+    /// recovers, the second phrase does not).
+    #[tokio::test]
+    async fn second_commit_never_overwrites_an_existing_vault() {
+        use crate::vault::Vault;
+        use crate::vault::envelope::create_v2_in_memory;
+        use crate::vault::kdf::KdfParams;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::config::ensure_layout(home).unwrap();
+        let fast = || KdfParams {
+            m_cost_kib: 19_456,
+            t_cost: 2,
+            p_cost: 1,
+            salt: vec![2u8; 16],
+        };
+        let a = create_v2_in_memory(b"kvd-init-a-pass", &fast()).unwrap();
+        let b = create_v2_in_memory(b"kvd-init-b-pass", &fast()).unwrap();
+        let codes = crate::vault::recovery::generate_codes();
+        let v = Vault::new(home.to_path_buf());
+        super::commit_new_vault(home, &v, &a, &codes).await.unwrap();
+        let before = std::fs::read(v.recovery_blob_path()).unwrap();
+        let err = super::commit_new_vault(home, &v, &b, &codes)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already initialized"), "{err}");
+        assert_eq!(std::fs::read(v.recovery_blob_path()).unwrap(), before);
+        assert!(v.open_recovery(&a.mnemonic).is_ok());
+        assert!(v.open_recovery(&b.mnemonic).is_err());
+        v.unlock(b"kvd-init-a-pass", 30).unwrap();
     }
 }
