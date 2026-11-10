@@ -58,11 +58,23 @@ manager has.
 - **Losing your vault backup** means the secrets are gone. They are not
   irreplaceable: the vault holds tokens you can re-issue at GitHub, AWS, etc.
   Keep your `kvendra backup` somewhere safe.
-  Note: mnemonic-based password recovery (`kvendra recover`) is **temporarily
-  disabled** while a secure, mnemonic-bound implementation is built
-  (tracked internally). Until then, an encrypted `kvendra backup` is the
-  recovery path — keep it, and still keep your written-down mnemonic for when
-  recovery ships.
+- **Forgetting your master password** is recoverable on vaults created with
+  Kvendra 0.9.0 or later: `kvendra recover` asks for the 12-word phrase shown
+  at `kvendra init` and sets a new password. Your secrets, local variables,
+  allowlists, grants and backups keep working. On a vault created before
+  0.9.0 the phrase was never bound to the vault, so `recover` refuses without
+  changing anything; the way out there is a new vault.
+- **A backup alone does not help with a forgotten password.** A
+  `kvendra backup` bundle is encrypted under the vault key and is pulled with
+  the current master password of this vault; without the password (or the
+  phrase, to set a new one first) it cannot be opened.
+- **Recovery is for a forgotten password, not a stolen one.** Changing the
+  password (`kvendra recover` or `kvendra passwd`) keeps the same vault key,
+  so older copies of the vault files (earlier backups, disk snapshots) still
+  open with the old password. If you think the password or the phrase leaked,
+  create a new vault and rotate the credentials it held.
+- **The 12-word phrase is as powerful as your password.** Anyone with it and a
+  copy of your vault files can set a new password. Keep it offline.
 
 ## What you can do TODAY to raise your protection
 
@@ -73,8 +85,17 @@ None of this needs a new release:
   (`kvendra unlock --ttl 1h`). This shrinks the Case-B window.
 - **Keep allowlists minimal.** Grant each profile only the operations and
   targets it needs. The broker is only as tight as your allowlists.
-- **Keep an encrypted `kvendra backup`** (and your mnemonic for later), so
-  device loss is survivable. Backup is currently the reliable recovery path.
+- **Keep your 12-word recovery phrase offline** (paper, a separate password
+  manager). It is what gets you back in if you forget the master password.
+- **Keep an encrypted `kvendra backup`**, so damaged or deleted vault files
+  can be brought back. Backup and phrase cover different losses: the backup
+  brings files back, the phrase brings access back. In 0.9.0
+  `kvendra backup pull` restores into a staging directory and opens the
+  bundle with this vault's current master password, so it needs this vault's
+  `sentinel.blob` on the machine; restoring onto a brand-new machine from a
+  backup plus the phrase is not supported yet.
+- **Change the password knowing the current one** with `kvendra passwd`
+  (0.9.0+ vaults).
 - **Prefer short-lived provider credentials** where the provider offers them
   (for example, AWS STS session credentials over long-lived keys), so a leak is
   time-bounded.

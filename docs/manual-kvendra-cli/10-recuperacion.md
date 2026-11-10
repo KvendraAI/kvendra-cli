@@ -2,173 +2,239 @@
 
 ## Descripción
 
-Kvendra CLI genera en `kvendra init` **dos mecanismos independientes** — mostrados al usuario una sola vez — y en 0.6.4 los complementa con un **backup cifrado** (Pro tier), que es hoy el camino de recuperación operativo:
+`kvendra init` entrega al usuario, una sola vez, **dos mecanismos independientes**, y Pro tier añade un tercero:
 
-> **Recovery phrase BIP-39 (12 words)** — pensada para el *reset completo* del master password (`kvendra recover`). Se memoriza/anota offline; no vive en la máquina. **En 0.6.4 este reset está fail-closed** (ver abajo): guárdala igualmente para cuando se reactive.
+> **Recovery phrase BIP-39 (12 palabras)** — si olvidas el master password, `kvendra recover` te deja fijar uno nuevo con ella. Desde `0.9.0` la frase está **atada a este vault**: envuelve la clave de vault en `recovery.blob`. Se anota offline; no vive en la máquina.
 >
-> **Recovery codes numéricos (8 codes)** — barrera **adicional** sobre el master password para *autenticar acciones críticas* (p. ej. `config rebind-home`). Argon2id-hashed en `~/.kvendra/recovery_codes.json`, single-use.
+> **Recovery codes numéricos (8 códigos)** — barrera **adicional** sobre el master password para autorizar `kvendra config rebind-home`. Argon2id-hashed en `~/.kvendra/recovery_codes.json`, single-use. **No** recuperan una password olvidada.
 >
-> **Backup cifrado (`kvendra backup`, Pro tier)** — el camino de recuperación **recomendado hoy** mientras la mnemónica está deshabilitada.
+> **Backup cifrado (`kvendra backup`, Pro tier)** — trae de vuelta **ficheros** del vault, no el **acceso**: se abre con la password actual.
 
-Este capítulo explica cuándo se usa cada uno, los flujos paso a paso y las garantías de seguridad. La diferencia conceptual entre phrase y codes está en `GLO-KVD-010` (phrase) y `GLO-KVD-011` (codes); qué te protege y qué no, en llano, en [`../security/protection-levels.md`](../security/protection-levels.md).
+Además, `kvendra passwd` cambia la password **sabiendo la actual**.
 
-## Recovery phrase BIP-39 — reset del master password
+Este capítulo explica cuándo se usa cada uno, los flujos paso a paso, los errores posibles y las garantías. Qué te protege y qué no, en llano: [`../security/protection-levels.md`](../security/protection-levels.md).
 
-> **Advertencia (0.6.4):** La recuperación por mnemónica (`kvendra recover`) está **temporalmente deshabilitada / fail-closed** en esta versión. El comando **existe**, pero **rechaza** mientras se construye una implementación segura *mnemonic-bound* (antes aceptaba cualquier frase BIP-39 válida; ese fail-open se cerró). **No cuentes con `recover` para restaurar hoy.** El camino de recuperación real en 0.6.4 es un `kvendra backup` cifrado (ver abajo). Guarda igualmente tu mnemónica anotada, para cuando la recuperación se reactive. Detalle en llano: [`../security/protection-levels.md`](../security/protection-levels.md).
+## Qué vault tienes
 
-### Cuándo usarla (diseño previsto)
+Todo lo de recuperación por frase depende del formato del vault:
 
-- Has olvidado el master password.
-- Sospechas que el master password fue comprometido y quieres rotar.
+| Vault creado con | `sentinel.blob` | `recovery.blob` | `kvendra recover` | `kvendra passwd` |
+|---|---|---|---|---|
+| `0.9.0` o posterior | v2 | sí | **disponible** | disponible |
+| `0.8.x` o anterior | v1 | no | se niega, sin cambiar nada | se niega, sin cambiar nada |
 
-En ambos casos, **hoy** la vía operativa es restaurar desde `kvendra backup` (o re-init si no tienes backup); ver «El camino real de recuperación hoy — `kvendra backup`».
+`0.9.0` **no migra** vaults antiguos: un vault `0.8.x` sigue abriendo igual que antes, pero su frase nunca se ató al vault y no se puede verificar. En sentido contrario **no hay downgrade**: un binario `0.8.x` no abre un vault creado con `0.9.0`.
 
-### El comando `kvendra recover`
+## `kvendra recover` — olvidé el master password
+
+### Cuándo usarlo
+
+- Has **olvidado** el master password y tienes la frase de 12 palabras.
+
+**No** es la herramienta para una password **robada**: `recover` mantiene la misma clave de vault, y las copias antiguas de `sentinel.blob` (en backups anteriores, snapshots de disco) siguen abriendo con la password antigua. Si sospechas una filtración de la password o de la frase, crea un vault nuevo y rota las credenciales que guardaba (ver «Password o frase comprometidas»).
+
+### El comando
 
 ```bash
 kvendra recover
 ```
 
-Reset del master password usando la mnemónica BIP-39 (ADR-KVD-011). Flags reales (`kvendra recover --help`):
+Flags (`kvendra recover --help`):
 
-> **`--mnemonic-env <VAR>`** (env: `KVENDRA_RECOVERY_MNEMONIC`) — lee la mnemónica de esa variable de entorno (testing/CI) en vez de pedirla por prompt.
+> **`--mnemonic-env <VAR>`** (env: `KVENDRA_RECOVERY_MNEMONIC`) — lee la frase de esa variable en vez del prompt. **Solo testing/CI** con vaults desechables: la frase pesa lo mismo que la password.
 >
-> **`--new-password-env <VAR>`** (env: `KVENDRA_NEW_PASSWORD`) — lee el nuevo master password de esa variable de entorno (testing/CI).
+> **`--new-password-env <VAR>`** (env: `KVENDRA_NEW_PASSWORD`) — lee la password nueva de esa variable. **Solo testing/CI.**
 
-> **Nota:** En 0.6.4 este comando **rechaza fail-closed** aunque introduzcas la mnemónica correcta. El diseño previsto (cuando se reactive) descifra `recovery.blob`, deriva la nueva clave Argon2id del nuevo master password, re-cifra los blobs de `~/.kvendra/secrets/`, regenera `sentinel.blob`, re-firma `config.toml` y los allowlists, y registra `vault.recovery_completed` en el audit log. Ninguna de esas escrituras ocurre hoy: el comando aborta antes.
+### Flujo
 
-## El camino real de recuperación hoy — `kvendra backup`
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Usuario
+    participant C as kvendra recover
+    participant FS as ~/.kvendra/
 
-Mientras la mnemónica está fail-closed, el **backup cifrado en la nube (Pro tier)** es la ruta fiable de recuperación. El vault se sube cifrado; el destino sigue necesitando tu master password para descifrarlo.
+    C->>FS: ¿sentinel v2 + recovery.blob? (antes de pedir la frase)
+    C->>FS: valida formato/versión de recovery.blob
+    C->>U: Enter the 12-word recovery phrase (will not echo)
+    U-->>C: 12 palabras
+    C->>C: valida BIP-39 (nº de palabras, wordlist, checksum)
+    C->>C: abre recovery.blob → MK, verifica contra check del sentinel
+    C->>U: password nueva + confirmación (≥ 8)
+    C->>C: re-envuelve la MK con la password nueva (en RAM)
+    C->>FS: borra blob de sesión + caché del keychain
+    C->>FS: sentinel.blob → sentinel.blob.pre-recover
+    C->>FS: sentinel.blob.recover-tmp → rename sobre sentinel.blob
+    C->>C: verifica que la password nueva da la misma MK
+    C->>FS: fila de audit `recover` (recover_ok)
+    C->>FS: borra sentinel.blob.pre-recover
+    C->>U: Master password reset.
+```
+
+Nada se escribe en el vault antes del commit (pasos 9–14). Solo cambia `sentinel.blob`: secretos, variables locales, allowlists y `config.toml` firmados, grants, backups y la cadena de audit siguen funcionando porque cuelgan de la misma clave de vault.
+
+Salida al terminar:
+
+```
+Master password reset. Your secrets, local variables, allowlists, grants and backups keep
+working. Active sessions and the keychain cache were cleared; any running
+`kvendra mcp serve` keeps its in-memory session until it expires — restart it. If you
+suspect the old password was stolen, recovery is not enough: create a new vault.
+```
+
+Después: `kvendra unlock` con la password nueva y reinicia los `kvendra mcp serve` que tuvieras abiertos.
+
+### Errores
+
+Todos terminan con «Nothing was changed»: la password antigua sigue vigente.
+
+| Situación | Mensaje (resumen) | Qué hacer |
+|---|---|---|
+| Vault anterior a `0.9.0` (o sin `recovery.blob`) | `This vault was created before Kvendra 0.9, so its recovery phrase was never bound to it and cannot be verified.` Se muestra **antes** de pedir la frase. | No hay recuperación por frase para ese vault: ver «Vault anterior a 0.9.0». |
+| Frase mal formada | `the phrase is not a valid BIP-39 recovery phrase:` + `expected 12 words, got N` / `word #N is not in the BIP-39 English wordlist` / `the checksum does not match (a word is wrong or out of order)` | Revisa la frase anotada. El mensaje da una posición o un número, nunca una palabra. Mayúsculas y espacios extra no importan. |
+| Frase válida de otro vault | `the phrase is a valid BIP-39 phrase but it does not belong to this vault.` | Es la frase de otro `init` (por ejemplo, de un vault que recreaste). |
+| Material dañado | `recovery material is corrupt or does not match this vault: …` (versión desconocida, `vault_id` que no cuadra con el sentinel, clave recuperada que no verifica) | `recovery.blob` o `sentinel.blob` alterados o de vaults distintos. Restaura los ficheros de este vault (backup) y repite. |
+
+La password nueva debe tener ≥ 8 caracteres y confirmarse (3 intentos).
+
+Cada rechazo deja una línea en `~/.kvendra/audit.preauth.jsonl` (0600, máx. 1000 líneas, sin frase, sin password, vocabulario cerrado). Como no hay clave todavía, no puede ir a la cadena HMAC en ese momento: el siguiente `kvendra unlock` o `kvendra mcp serve` que sí tenga la clave la importa en `audit.db` como fila marcada `preauth_unauthenticated` (p. ej. `recover_rejected_phrase_mismatch`) y vacía el fichero.
+
+### Si se corta a mitad
+
+El commit está pensado para que un corte de luz o un kill en cualquier punto deje un vault que abre con la password **antigua o la nueva**, nunca con ninguna: los dos sentinels envuelven la misma clave, y un fallo en los pasos de publicación restaura el sentinel anterior.
+
+Restos posibles y limpieza:
+
+- `sentinel.blob.recover-tmp` (no publicado): se borra al empezar el siguiente `unlock`, `mcp serve`, `recover` o `passwd`.
+- `sentinel.blob.pre-recover` (copia previa): si falta `sentinel.blob`, se vuelve a poner en su sitio; si el sentinel actual abre, el siguiente unlock con éxito la borra y deja la fila `recover_cleanup` en el audit.
+
+Prueba primero la password nueva; si no abre, la antigua.
+
+### Vault anterior a 0.9.0
+
+Si el vault se creó con `0.8.x` o antes y olvidaste la password, no hay forma de recuperarlo: la frase de entonces nunca se ató al vault. La salida es un vault nuevo:
 
 ```bash
-# autenticación Pro (persiste el JWT en ~/.kvendra/sessions/pro.token)
+mv ~/.kvendra ~/.kvendra.old
+kvendra init
+```
+
+y volver a añadir los secretos (son credenciales re-emitibles en GitHub, AWS, npm…). El vault nuevo ya tiene recuperación por frase.
+
+## `kvendra passwd` — cambiar la password sabiendo la actual
+
+```bash
+kvendra passwd
+```
+
+Pide la password actual, la nueva y su confirmación, **siempre desde un terminal real** (misma defensa anti-captured-env que `kvendra unlock`). Solo para tests/CI: `KVENDRA_PASSWORD` + `KVENDRA_NEW_PASSWORD` (hacen falta las dos; si falta una, exige terminal).
+
+- La nueva debe tener ≥ 8 caracteres y ser distinta de la actual.
+- Password actual incorrecta → rechazo registrado en `audit.preauth.jsonl` (`passwd_rejected_password_invalid`), nada escrito.
+- Usa el mismo commit atómico que `recover` (fila de audit `passwd_ok`) y borra igual sesiones y caché del keychain.
+- En vaults `0.8.x` se niega: `This vault was created before Kvendra 0.9; changing its password is not supported. Nothing was changed.`
+
+El mensaje final recuerda lo mismo que este capítulo: las copias antiguas de `sentinel.blob` (por ejemplo dentro de backups anteriores) siguen abriendo con la password **antigua**.
+
+## Backup y recuperación
+
+`kvendra backup` (Pro tier) sube un bundle cifrado client-side con una sub-key de la clave de vault. Desde `0.9.0` el bundle incluye `recovery.blob`.
+
+```bash
 kvendra login --pro
-
-# subir el vault cifrado
-kvendra backup push --label "pre-migracion-portatil"
-
-# en la máquina nueva (o tras un desastre): listar y restaurar
+kvendra backup push --label "antes-de-migrar"
 kvendra backup list
-kvendra backup pull                 # trae y restaura el último
+kvendra backup pull                 # restaura el último en ~/.kvendra/staging_restore
 kvendra backup restore <BACKUP_ID>  # restaura una versión concreta
 ```
 
-Subcomandos de `kvendra backup` (`--help`): `push` (con `--force`, `--label`, `--password-stdin`), `list` (`--limit`), `pull` (`--id`, `--yes`, `--out`, `--password-stdin`), `restore <BACKUP_ID>` (`--yes`, `--password-stdin`) y `prune <BACKUP_ID>` (`--yes`). Requiere Pro tier y `kvendra login --pro`.
+Lo que hace y lo que no, en `0.9.0`:
 
-> **Nota:** Guarda **igualmente** tu mnemónica BIP-39 anotada offline. Cuando la recuperación mnemónica se reactive en una versión futura, volverá a ser el segundo mecanismo independiente. Hasta entonces, backup + master password es la combinación operativa.
+- **Restaura en un directorio de staging** (`~/.kvendra/staging_restore` o `--out`); tú lo mueves a su sitio.
+- **Pide la password actual de este vault** y necesita el `sentinel.blob` de este vault en la máquina. Un backup hecho **antes** de un `recover`/`passwd` se descifra con la password **nueva** (la clave de vault no cambió).
+- **Reconcilia el sentinel**: si el bundle es de este vault (mismo `vault_id`, su `check` abre con la clave local), el `sentinel.blob` del staging se sustituye por el actual, para que restaurar no resucite la password olvidada. Lo indica con `The restored sentinel.blob was replaced by this vault's current one`. Un bundle v2 de otro vault se rechaza sin dejar el staging a medias. Las variables locales vuelven como `verified:false` (`kvendra vars verify --all`).
+- **No sirve con una password olvidada**: sin la password (o sin fijar antes una nueva con la frase) el bundle no se abre.
+- **Máquina nueva**: restaurar desde backup + frase en una máquina sin este vault **todavía no está soportado** (`backup pull` necesita el sentinel local). Si conservas una copia a nivel de ficheros de `~/.kvendra/` (disco, snapshot) que incluya `recovery.blob`, `kvendra recover` funciona sobre ella.
 
-## Recovery codes — autenticar acciones críticas
+## Recovery codes — autorizar `rebind-home`
 
 ### Cuándo usarlos
 
-Los recovery codes autentican **acciones críticas** como barrera adicional sobre el master password. La acción canónica que **consume un código** en `0.6.4` es:
+La acción que **consume un código** es:
 
-> **`kvendra config rebind-home --new-path <PATH>`** — re-anclar el vault a una nueva ubicación tras mover `~/.kvendra/` (REQ-KVD-008). Verificación de **triple barrera**: master password + **un recovery code** + confirmación por TTY.
+> **`kvendra config rebind-home --new-path <PATH>`** — re-anclar el vault a una nueva ubicación tras mover `~/.kvendra/` (REQ-KVD-008). Triple barrera: master password + **un recovery code** + confirmación por TTY.
 
-No confundir con `kvendra config recovery-codes regenerate`, que **no** consume un código: usa **doble barrera** (master password + teclear el acknowledge `REGENERATE-RECOVERY-CODES`) — ver «Regenerar el set de recovery codes».
+No confundir con `kvendra config recovery-codes regenerate`, que **no** consume un código: doble barrera (master password + teclear `REGENERATE-RECOVERY-CODES`).
 
-### Paso 1 — Inicie la acción crítica
+### Paso 1 — Inicie la acción
 
 ```bash
 kvendra config rebind-home --new-path /Volumes/EncryptedDisk/.kvendra
 ```
 
-El binario, tras pedir el master password, muestra:
-
-```
-This action requires a recovery code to confirm.
-You have 6 recovery codes remaining.
-
-Enter recovery code:
-```
+Tras el master password, el binario pide un recovery code.
 
 ### Paso 2 — Introduzca un código
 
-Pegue uno de los 8 códigos generados en `kvendra init`. Format esperado: `NNNN-NNNN-NNNN` (digits + hyphens). El binario:
+Uno de los 8 códigos de `kvendra init`, formato `NNNN-NNNN-NN` (10 dígitos). El binario:
 
-1. Hashes el input con Argon2id usando el salt del code candidato (busca por iteración en los 8 hashes guardados).
+1. Hashea el input con Argon2id con el salt de cada código guardado.
 2. Compara con `subtle::ConstantTimeEq`.
-3. Match → marca el código como `used_at: <now>`, ejecuta la acción.
-4. No match → falla con error genérico (no revela cuál no matcheó), incrementa contador anti-bruteforce.
+3. Match → marca el código `used_at: <now>` y ejecuta la acción.
+4. No match → error genérico (no revela cuál falló).
 
 ### Garantías
 
-> **Single-use enforced** — un código consumido queda marcado `used_at`; el siguiente intento con el mismo número falla con `RecoveryCodeAlreadyUsed`.
+> **Single-use enforced** — un código consumido queda marcado `used_at`; reutilizarlo falla.
 >
-> **Audit log** — fila `recovery_code_consumed` con el `code_id` (1-8), `action` que se autorizó. Intentos fallidos generan `recovery_code_replay_attempted` (post alpha.11).
+> **Audit log** — fila `recovery_code_consumed` con el `code_id` y la acción autorizada; los reintentos generan `recovery_code_replay_attempted`.
 >
-> **Argon2id cost** — los codes son single-use y de longitud fija; el cost se calibra para no penalizar UX en confirmation flows pero suficiente para resistir bruteforce offline si el `recovery_codes.json` se exfiltra.
->
-> **Storage** — `~/.kvendra/recovery_codes.json` con permissions `0600`, hashes Argon2id+salt-per-code, no contiene los códigos en plaintext.
-
-### Paso 3 — Tras la acción
-
-El binario muestra advertencia si quedan ≤2 códigos sin usar:
-
-```
-✓ Action completed.
-⚠ You have 2 recovery codes remaining. Consider regenerating:
-  kvendra config recovery-codes regenerate
-```
-
-Esta advertencia también aparece como warning en `kvendra dashboard`.
+> **Storage** — `~/.kvendra/recovery_codes.json` (0600), hashes Argon2id con salt por código; nunca los códigos en claro.
 
 ## Regenerar el set de recovery codes
 
-Disponible en `0.6.4` (REQ-KVD-CLI-003). Comando:
-
 ```bash
 kvendra config recovery-codes regenerate
 ```
 
-**Doble barrera** (`kvendra config recovery-codes regenerate --help`): master password + teclear por TTY el acknowledge exacto `REGENERATE-RECOVERY-CODES`. Flujo:
+Doble barrera: master password + teclear literalmente `REGENERATE-RECOVERY-CODES`. Genera 8 códigos nuevos, sobrescribe `recovery_codes.json`, los muestra una vez y deja la fila `recovery_codes_regenerated`. No toca la frase ni `recovery.blob`.
 
-1. Pide el master password (autenticación; **no** consume un recovery code).
-2. Pide teclear literalmente `REGENERATE-RECOVERY-CODES` para confirmar.
-3. Genera 8 códigos numéricos nuevos y los Argon2id-hashea con salt-per-code nuevo.
-4. Sobrescribe `~/.kvendra/recovery_codes.json`.
-5. Muestra los nuevos códigos una sola vez. Confírmalos guardados offline antes de continuar (mismo patrón que `kvendra init`).
-6. Audit log: row `recovery_codes_regenerated`.
+> **Advertencia:** regenerar invalida el set anterior **completo**.
 
-> **Advertencia:** Regenerar invalida el set anterior **completamente**. Si tenías códigos no usados anotados offline y los pierdes, has perdido esos códigos para siempre — el nuevo set los reemplaza.
+## Diferencias entre los mecanismos
 
-## Diferencias entre los dos mecanismos
+| | Recovery phrase | Recovery codes | `kvendra backup` |
+|---|---|---|---|
+| **Qué es** | 12 palabras BIP-39 | 8 códigos numéricos | Bundle cifrado en la nube (Pro) |
+| **Storage** | Solo offline (tú); en disco solo la clave de vault cifrada bajo ella (`recovery.blob`) | `recovery_codes.json` (Argon2id-hashed) | Kvendra cloud, cifrado client-side |
+| **Para qué** | Password **olvidada** → `kvendra recover` (vaults ≥ 0.9.0) | Autorizar `config rebind-home` | Recuperar **ficheros** del vault |
+| **Reutilizable** | Sí, mientras exista el vault | No, single-use | Sí |
+| **Regenerable** | No (solo con un vault nuevo) | Sí (`config recovery-codes regenerate`) | Cada `push` |
 
-| | Recovery phrase | Recovery codes |
-|---|---|---|
-| **Cantidad** | 12 BIP-39 words | 8 numeric codes |
-| **Storage** | Solo offline (tú) | `~/.kvendra/recovery_codes.json` (Argon2id-hashed) |
-| **Uso** | Reset completo del master password (**fail-closed en 0.6.4**; ver arriba) | Confirmar acciones críticas como `config rebind-home` (single-use) |
-| **Reutilizable** | Sí, hasta nuevo `init` desde cero | No, single-use |
-| **Regenerable** | Solo con re-init (destructive) | Sí: `kvendra config recovery-codes regenerate` |
-| **Reset implícito de**: | Master password, todas las sub-keys, todos los blobs (re-cifrados) | Solo confirma una acción puntual |
+## Casos de pérdida
 
-## Casos de pérdida total
+### He olvidado la password y tengo la frase
 
-### He perdido master password Y recovery phrase
+`kvendra recover` (vault ≥ 0.9.0). Ver arriba.
 
-> **No hay recovery posible.** Es feature, no bug — exactamente la promesa zero-knowledge.
+### He perdido la password Y la frase
+
+> **No hay recuperación posible.** Es la promesa zero-knowledge.
 >
-> Opciones:
->
-> 1. **Restaurar desde `kvendra backup`** (Pro tier), si mantienes uno: `kvendra login --pro && kvendra backup pull`. Recuperas el vault cifrado, pero **sigues necesitando el master password** para descifrarlo — así que esto solo ayuda si perdiste la máquina, no el password. Es el camino de recuperación recomendado hoy (la mnemónica está fail-closed).
-> 2. Re-init desde cero: `rm -rf ~/.kvendra/ && kvendra init`. Pierdes todos los profiles y allowlists. Tendrás que rehacerlos. Los tokens originales en los servicios externos (GitHub, AWS, npm) **siguen siendo válidos** — solo has perdido las copias cifradas que tenías guardadas.
+> Un backup no ayuda: se abre con la password. La salida es un vault nuevo (`mv ~/.kvendra ~/.kvendra.old && kvendra init`) y volver a añadir los secretos. Los tokens originales en GitHub, AWS, npm **siguen siendo válidos**; solo has perdido las copias cifradas.
 
-### He perdido todos los recovery codes pero recuerdo el master password
+### He perdido la frase pero recuerdo la password
 
-Sin problema directo — los recovery codes solo son necesarios para acciones marcadas como críticas. Las operaciones normales (`secret add/list/rotate`, `mcp serve`, `audit`) funcionan solo con master password.
+El vault funciona con normalidad, pero ya no tienes red si olvidas la password. `0.9.0` no permite regenerar la frase de un vault existente: si quieres volver a tenerla, crea un vault nuevo y migra los secretos.
 
-Para regenerar:
+### Password o frase comprometidas
 
-```bash
-kvendra config recovery-codes regenerate
-```
+Ni `recover` ni `passwd` echan a quien ya tiene la password o la frase (la clave de vault no cambia y las copias antiguas siguen abriendo). Crea un vault nuevo y **rota cada credencial** que guardaba en su servicio.
 
-(Disponible en `0.6.4` con doble barrera: master password + acknowledge `REGENERATE-RECOVERY-CODES`.)
+### He perdido los recovery codes pero recuerdo la password
+
+Solo hacen falta para `config rebind-home`. Regenera: `kvendra config recovery-codes regenerate`.
 
 ## Notas importantes
 
-> **Nota:** Las dos garantías clave son: (1) la recovery phrase **no vive en la máquina** — es responsabilidad tuya guardarla offline; (2) los recovery codes **single-use enforced** — Kvendra no aceptará el mismo código dos veces, ni siquiera si te equivocas tecleando.
-
-> **Advertencia:** Si guardas la recovery phrase en un fichero `recovery-phrase.txt` en la misma máquina, has anulado la garantía zero-knowledge (esto es distinto del `kvendra backup` cifrado, que sí es seguro porque va cifrado con tu master password). La phrase debe vivir físicamente fuera del dispositivo (papel, gestor de contraseñas offline, caja fuerte, dispositivo separado). En entornos enterprise, política recomendada: phrase + codes en *split knowledge* — phrase a un custodian, codes a otro.
+> **Advertencia:** la frase pesa lo mismo que el master password: quien la tenga junto con una copia de tus ficheros del vault puede fijar una password nueva. Si la guardas en `recovery-phrase.txt` en la misma máquina, has anulado la garantía. Debe vivir fuera del dispositivo (papel, gestor de contraseñas separado, caja fuerte). En enterprise: *split knowledge* — frase a un custodio, códigos a otro.

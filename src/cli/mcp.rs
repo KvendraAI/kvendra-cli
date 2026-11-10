@@ -1,7 +1,7 @@
 //! `kvendra mcp serve` — start the JSON-RPC MCP server on stdio.
 //!
 //! The MCP server runs in the same process as the unlocked vault session
-//! (the Argon2id-derived key is RAM-only per ADR-KVD-012). Order of
+//! (the vault key is RAM-only per ADR-KVD-012). Order of
 //! preference for obtaining that key, in this release:
 //!
 //! 1. **Local session blob** (REQ-KVD-CLI-011 / ADR-KVD-029) — the

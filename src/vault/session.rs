@@ -53,8 +53,9 @@ impl DerivedSubKey {
 
 /// HKDF-SHA256 expand (single-step, salt-less) — enough for our 32-byte sub-keys.
 ///
-/// See RFC 5869 § 2.3. We use the master key directly as PRK (it's already
-/// 32 bytes of high-entropy material from Argon2id), so this is equivalent
+/// See RFC 5869 § 2.3. We use the vault key directly as PRK (it's already
+/// 32 bytes of high-entropy material: random since 0.9, the Argon2id output
+/// on 0.8 vaults), so this is equivalent
 /// to `HKDF-Expand(PRK=key, info, L=32)`.
 pub fn hkdf_expand(key: &[u8; 32], info: &[u8]) -> DerivedSubKey {
     // T(1) = HMAC(PRK, info || 0x01)

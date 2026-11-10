@@ -34,7 +34,7 @@ Todas las versiones reflejan el `Cargo.toml` real de `0.6.4`:
 | `serde_json` | 1 | — | JSON-RPC, audit JSON export |
 | `serde_yaml_ng` | 0.10 | — | Allowlist YAML parser (fork mantenido de `serde_yaml`, deprecated upstream) |
 | `toml` | 0.8 | — | `config.toml` |
-| `argon2` | 0.5 | — | KDF (master password → derived key) |
+| `argon2` | 0.5 | — | KDF (master password → clave que envuelve la clave de vault) |
 | `aes-gcm` | 0.10 | — | AEAD AES-256-GCM (blobs) |
 | `zeroize` | 1 | `zeroize_derive` | Memory clearing en `Drop` |
 | `subtle` | 2 | — | Constant-time comparisons |
@@ -44,7 +44,7 @@ Todas las versiones reflejan el `Cargo.toml` real de `0.6.4`:
 | `rand` | 0.8 | — | RNG |
 | `ed25519-dalek` | 2 | `rand_core`, `zeroize` | Firma asimétrica de grants break-glass ([cap. 23](./23-break-glass.md)) |
 | `serde_jcs` | 0.1 | — | Canonicalización JCS (RFC 8785) del grant antes de firmar |
-| `bip39` | 2 | `rand` | Recovery phrase 12 words |
+| `bip39` | 2 | `rand`, `zeroize` | Recovery phrase 12 words (seed → HKDF → wrap de `recovery.blob`) |
 | `rusqlite` | 0.31 | `bundled` | SQLite (audit.db) |
 | `keyring` | 3 | `apple-native`, `windows-native`, `linux-native-sync-persistent` | OS keychain integration |
 | `reqwest` | 0.12 | `rustls-tls`, `json`, `stream`, `multipart` | HTTP client (primitives, workspace, backup) |
@@ -186,6 +186,7 @@ Cambios de stack previstos siguen la roadmap de endurecimiento del vault (`ROAD-
 | `ADR-KVD-009` | MSRV 1.88 (edition 2024 + stack) |
 | `ADR-KVD-010` | Threat model Nivel 2 zero-knowledge formal |
 | `ADR-KVD-011` | Recovery codes UX pattern |
+| `ADR-KVD-CLI-4810AF` | Envelope de la clave de vault y recuperación por frase atada al vault (0.9.0) |
 | `ADR-KVD-012` | Master password storage local (RAM-only default + opt-in keychain ACL) |
 | `ADR-KVD-022` | HKDF sub-key naming convention (`kvendra/<purpose>/v<n>`) |
 | `ADR-KVD-029` | Wrap key machine-bound del blob de sesión (residual C3) |

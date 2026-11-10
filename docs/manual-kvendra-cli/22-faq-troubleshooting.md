@@ -135,7 +135,7 @@ A futuro, el marketplace (`kvendra-skills`, post-MVP) permitirá primitives comm
 
 ### ¿Por qué el master password no se puede recuperar por email?
 
-Por diseño. La promesa zero-knowledge implica que ningún canal externo (incluido Kvendra) tiene capacidad para descifrar tu vault. El recovery vive en la **recovery phrase BIP-39** que tú anotaste offline en `kvendra init`. Si la pierdes también, el vault se va — feature, no bug. Ver [capítulo 10](./10-recuperacion.md).
+Por diseño. La promesa zero-knowledge implica que ningún canal externo (incluido Kvendra) tiene capacidad para descifrar tu vault. El recovery vive en la **recovery phrase BIP-39** que tú anotaste offline en `kvendra init`: si olvidas la password, `kvendra recover` te deja fijar una nueva con ella (vaults creados con `0.9.0` o posterior; en vaults anteriores se niega y la salida es un vault nuevo). Un `kvendra backup` no sirve para esto: se abre con la password. Si pierdes la password y la frase, el vault se va — feature, no bug. Ver [capítulo 10](./10-recuperacion.md).
 
 ### ¿Por qué `serde_yaml_ng` y no `serde_yaml`?
 

@@ -114,8 +114,10 @@ kvendra audit --json | head -5
 ```
 
 Expected: `audit.db` row `vault_created` present, files in `~/.kvendra/`
-with permissions `0600` (sentinel.blob, recovery_codes.json, config.toml)
-and `0700` (the dir itself).
+with permissions `0600` (sentinel.blob, recovery.blob, recovery_codes.json,
+config.toml) and `0700` (the dir itself). `recovery.blob` (0.9.0+) is what lets
+`kvendra recover` reset a forgotten master password with the 12-word phrase
+shown by `kvendra init`; keep that phrase offline.
 
 ## What's next
 

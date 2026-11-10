@@ -480,7 +480,7 @@ impl Vault {
         }
         let key = session.peek_key()?;
         // Each secret blob has its own KdfParams shell so the on-disk format
-        // matches the sentinel; we re-use the master key (Argon2id-derived)
+        // matches the sentinel; we re-use the vault key (MK)
         // directly via AES-256-GCM rather than re-deriving per blob (Alpha
         // 0.1 simplification, documented in ADR-KVD-005).
         let nonce = random_nonce();

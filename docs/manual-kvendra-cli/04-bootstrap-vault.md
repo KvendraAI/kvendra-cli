@@ -2,15 +2,15 @@
 
 ## Descripción
 
-`kvendra init` crea la estructura `~/.kvendra/` en tu home, deriva la *encryption key* desde un master password que tú eliges, genera una **recovery phrase BIP-39 de 12 palabras** y un set de **8 recovery codes** numéricos one-time. Es el primer comando que ejecutas tras instalar y solo se ejecuta una vez por máquina.
+`kvendra init` crea la estructura `~/.kvendra/` en tu home, genera una **clave de vault aleatoria** (32 bytes) y la guarda **envuelta** dos veces: bajo tu master password (`sentinel.blob`) y bajo una **recovery phrase BIP-39 de 12 palabras** (`recovery.blob`). Además genera un set de **8 recovery codes** numéricos one-time. Es el primer comando que ejecutas tras instalar y solo se ejecuta una vez por vault.
 
-Este capítulo describe el flujo paso a paso, qué se persiste, qué tienes que guardar offline y cómo abortar limpiamente si algo va mal antes del commit final.
+Este capítulo describe el flujo de `0.9.0` paso a paso, qué se persiste, qué tienes que guardar offline y qué pasa si algo falla antes del commit final.
 
 ## Prerrequisitos
 
 - Binario `kvendra` instalado y verificable con `kvendra --version` ([capítulo 3](./03-instalacion.md)).
-- Carpeta `~/.kvendra/` no existe (o está vacía y dispuesto a sobrescribirla con confirmación).
-- Lugar offline donde anotar la recovery phrase y los recovery codes (libreta, gestor de contraseñas physical, caja fuerte). Esto **no** es opcional.
+- No existe un `sentinel.blob` en `~/.kvendra/` (si existe, `init` se niega; ver «Vault ya inicializado»).
+- Lugar offline donde anotar la recovery phrase y los recovery codes (libreta, gestor de contraseñas separado, caja fuerte). Esto **no** es opcional.
 
 ## Flujo end-to-end
 
@@ -19,29 +19,28 @@ sequenceDiagram
     autonumber
     participant U as Usuario
     participant C as kvendra (CLI)
+    participant RAM as RAM (proceso)
     participant FS as ~/.kvendra/
-    participant RAM as RAM (process)
 
     U->>C: kvendra init
     C->>U: Prompt master password (1)
     U-->>C: ********
     C->>U: Prompt master password (2 — confirmación)
     U-->>C: ********
-    C->>RAM: Argon2id derive (cost ≥1s)
-    RAM->>RAM: derived_key (32 bytes)
-    C->>U: Muestra 12 BIP-39 words
-    C->>U: Muestra 8 recovery codes numéricos
-    C->>U: Pide confirmación explícita "los he guardado offline"
-    U-->>C: yes
-    C->>FS: Persiste config.toml (HMAC sidecar)
-    C->>FS: Persiste sentinel.blob (verifica unlock)
-    C->>FS: Persiste recovery.blob (re-cifrada con BIP-39 key)
-    C->>FS: Persiste recovery_codes.json (Argon2id-hashed)
-    C->>FS: Inicializa audit.db (HMAC chain genesis row)
-    C->>U: ✓ Vault initialized
+    C->>RAM: MK aleatoria + vault_id + frase de 12 palabras
+    C->>RAM: sentinel v2 (MK envuelta con Argon2id(password)) y recovery.blob v1 (MK envuelta con la frase)
+    C->>U: Muestra las 12 palabras y los 8 códigos (una sola vez)
+    C->>U: Pide uno de los 8 códigos para confirmar que los guardaste
+    U-->>C: código
+    C->>FS: recovery_codes.json (Argon2id-hashed)
+    C->>FS: recovery.blob
+    C->>FS: audit.db (fila vault_created)
+    C->>FS: config.toml (firmado HMAC)
+    C->>FS: sentinel.blob (tmp + fsync + rename: punto de commit)
+    C->>U: Vault initialized
 ```
 
-Hasta el paso 9 nada toca disco. Si abortas con Ctrl+C antes, no hay residuos.
+Todo el material se construye en RAM antes de tocar el home. Si la confirmación falla, no se escribe nada.
 
 ## Pasos detallados
 
@@ -51,152 +50,121 @@ Hasta el paso 9 nada toca disco. Si abortas con Ctrl+C antes, no hay residuos.
 kvendra init
 ```
 
-No acepta argumentos posicionales. Banderas reales en `0.6.4` (`kvendra init --help`):
+No acepta argumentos posicionales. Banderas reales (`kvendra init --help`):
 
 > **`--password-env <VAR>`** (env: `KVENDRA_INIT_PASSWORD`) — lee el master password de esa variable de entorno en vez de pedirlo por prompt. Para setups CI / no interactivos.
 >
-> **`--confirm-code <CODE>`** (env: `KVENDRA_INIT_CONFIRM_CODE`) — código de pre-confirmación para saltar el prompt "yes" interactivo en setups no interactivos.
+> **`--confirm-code <CODE>`** (env: `KVENDRA_INIT_CONFIRM_CODE`) — código de confirmación para saltar el prompt interactivo. Tiene que ser uno de los 8 códigos generados en esa misma ejecución, así que en la práctica solo sirve en tests.
 >
-> **`--save-to <PATH>`** — guarda los recovery codes (mnemónica BIP-39 + los numéricos) en ese fichero. Avisa si el modo no es `0600`. **Trade-off:** escribirlos a disco anula parte de la garantía offline (ver Paso 4); úselo solo con un destino que borre o custodie después.
+> **`--save-to <PATH>`** — guarda la mnemónica BIP-39 y los códigos numéricos en ese fichero (modo `0600`). **Trade-off:** escribirlos a disco anula parte de la garantía offline (ver Paso 3). Si el `init` aborta después, el fichero se borra: su frase pertenecería a un vault que no existe.
 >
-> **`--no-verify`** — salta el paso interactivo de verificación. **Solo testing.**
+> **`--no-verify`** — salta el paso de confirmación. **Solo testing.**
 >
 > **`--home-override <PATH>`** (env: `KVENDRA_HOME`) — reubica el home del vault. Pensado para testing; para mover `~/.kvendra/` en producción use `kvendra config rebind-home` (triple barrera; ver [capítulo 10](./10-recuperacion.md)).
 
-> **Nota:** En `0.6.4` `kvendra init` **no** tiene un flag `--force` que borre un vault existente. Si `~/.kvendra/` ya existe y quiere empezar de cero, borre la carpeta a mano (`rm -rf ~/.kvendra/`, ver «Aborto seguro») antes de reinicializar.
+> **Nota:** `kvendra init` **no** tiene un flag `--force` que borre un vault existente.
 
 ### Paso 2 — Introduzca el master password
 
 El binario pide la password dos veces (sin echo):
 
 ```
-Master password:
+Enter a master password (will not echo):
 Confirm master password:
 ```
 
 Reglas:
 
-- Mínimo 12 caracteres. No hay máximo.
-- Validación: las dos entradas deben coincidir byte a byte.
-- Cualquier diferencia aborta sin escribir nada a disco.
+- Mínimo 8 caracteres.
+- Las dos entradas se comparan en tiempo constante. Si no coinciden, se reintenta hasta 3 veces; al tercer fallo el `init` aborta sin escribir nada.
 
-> **Advertencia:** Esta es la **única** password que tienes que recordar. No se persiste, no se sincroniza, no se recupera por email. Si la olvidas, necesitarás la recovery phrase BIP-39 (paso 4) o los recovery codes (paso 5) para volver a entrar al vault.
+> **Advertencia:** No se persiste, no se sincroniza, no se recupera por email. Si la olvidas, la **recovery phrase** (paso 3) te deja fijar una nueva con `kvendra recover` ([capítulo 10](./10-recuperacion.md)). Los recovery codes **no** sirven para eso.
 
-### Paso 3 — Espere la derivación Argon2id
+La clave de vault (MK) es aleatoria; la password solo la envuelve, mediante Argon2id con `m_cost` 64 MiB, `t_cost` 3, `p_cost` 1 y salt aleatoria de 16 bytes. Los parámetros viajan dentro de `sentinel.blob`. Detalle en el [capítulo 12](./12-vault-criptografia.md).
 
-Tras la confirmación, el binario ejecuta Argon2id con cost params calibrados a aproximadamente 1 segundo en hardware moderno. Verá un breve "computing..." y la prompt se libera cuando la derived key está en RAM.
+### Paso 3 — Anote la recovery phrase y los 8 códigos
 
-La cost params están en `config.toml` y son fijas para `0.6.4`:
-
-> **Argon2id parameters:**
-> - `m_cost`: 65536 KiB (64 MiB)
-> - `t_cost`: 3 iterations
-> - `p_cost`: 4 lanes
-> - Output: 32 bytes (clave AES-256-GCM)
-
-Esto se cubre en detalle en el [capítulo 12](./12-vault-criptografia.md).
-
-### Paso 4 — Anote la recovery phrase BIP-39
-
-El binario imprime 12 palabras del wordlist BIP-39 estándar:
+El binario imprime el material de recuperación **una sola vez**:
 
 ```
-Your recovery phrase (12 words):
+════════════════════════════════════════════════════════════════
+  Recovery material — SAVE THESE NOW. They will not be shown again.
+════════════════════════════════════════════════════════════════
 
-  1. abandon    2. ability    3. able       4. about
-  5. above      6. absent     7. absorb     8. abstract
-  9. absurd    10. abuse     11. access    12. accident
+BIP-39 mnemonic (12 words):
+    <word1> <word2> ... <word12>
 
-These words let you reset the master password if you forget it.
-Write them down OFFLINE. They will not be shown again.
+What the 12 words do: they recover access to THIS vault if you forget the master
+password (`kvendra recover`), ...  Anyone with them can set a new password: keep
+them offline.
+
+Numeric one-time codes (8 codes):
+    NNNN-NNNN-NN
+    ...
+
+What the 8 codes do: they authorise `kvendra config rebind-home` only. They do NOT
+recover a forgotten password.
 ```
 
-> **Advertencia:** Si en este momento haces screenshot, copias al clipboard, escribes en un fichero, o las dejas en el scrollback de tu terminal, **el dump de pantalla acaba siendo equivalente al token raíz del vault**. La recomendación canónica es escribirlas a mano en una libreta física o introducirlas en un gestor de contraseñas offline.
+> **Nota (0.9.0):** el texto del banner menciona también «a new one restored from `kvendra backup`». En 0.9.0 `kvendra backup pull` necesita el `sentinel.blob` de este vault en la máquina (abre el bundle con la password actual), así que restaurar en una máquina nueva solo con backup + frase **todavía no está soportado**. Ver [capítulo 10](./10-recuperacion.md).
 
-### Paso 5 — Anote los 8 recovery codes
+> **Advertencia:** la frase es un secreto **del mismo peso que el master password**: quien la tenga junto con una copia de tus ficheros del vault puede fijar una password nueva y leer tus secretos. Si haces screenshot, la copias al clipboard, la escribes en un fichero o la dejas en el scrollback del terminal, ese rastro equivale a la llave del vault. Escríbela a mano o guárdala en un gestor de contraseñas separado.
 
-A continuación se muestran 8 códigos numéricos:
-
-```
-Your recovery codes (8 single-use):
-
-  1. 4827-1539-0026   2. 9180-2647-3315
-  3. 5023-8194-6770   4. 1738-4205-9412
-  5. 6914-3082-5867   6. 2456-7019-8133
-  7. 8203-1654-9028   8. 3079-5482-1166
-
-Each code can be used ONCE for critical actions (revoke, force-rotate, ...).
-Save them with your recovery phrase.
-```
-
-Diferencias con la recovery phrase:
+Diferencias:
 
 | | Recovery phrase | Recovery codes |
 |---|---|---|
-| Cantidad | 12 BIP-39 words | 8 numeric codes |
-| Storage | Solo offline (tú) | `~/.kvendra/recovery_codes.json` (Argon2id-hashed) |
-| Uso | Reset del master password | Confirmar acciones críticas |
-| Reutilizables | Sí, hasta nuevo `init` | No, single-use |
-| Regenerables | Solo con re-init | Sí: `kvendra config recovery-codes regenerate` (doble barrera; disponible en `0.6.4`) |
+| Cantidad | 12 palabras BIP-39 (128 bits de entropía) | 8 códigos numéricos `NNNN-NNNN-NN` |
+| Storage | Solo offline (tú); en disco solo `recovery.blob`, la MK cifrada bajo ella | `~/.kvendra/recovery_codes.json` (Argon2id-hashed) |
+| Uso | Fijar una password nueva si olvidas la actual (`kvendra recover`) | Autorizar `kvendra config rebind-home` |
+| Reutilizable | Sí, mientras exista el vault | No, single-use |
+| Regenerable | No (solo con un vault nuevo) | Sí: `kvendra config recovery-codes regenerate` |
 
-Ver detalle de uso en el [capítulo 10](./10-recuperacion.md).
-
-### Paso 6 — Confirme explícitamente que los ha guardado
-
-El binario pide:
+### Paso 4 — Confirme que los ha guardado
 
 ```
-Type "yes" to confirm you have saved both the recovery phrase
-AND the recovery codes offline:
+To confirm you saved the recovery codes, enter ANY of the 8 numeric codes:
 ```
 
-Cualquier cosa distinta de `yes` aborta el init sin escribir nada a disco. Las palabras y códigos generados se zeroizan en RAM y se descartan. Tendrás que ejecutar `kvendra init` otra vez.
+Si lo que tecleas no es uno de los 8 códigos, el `init` aborta (`confirmation code did not match a generated recovery code — init aborted`) sin haber escrito nada en el home. Las palabras y códigos se descartan; tendrás que ejecutar `kvendra init` otra vez y anotar el material nuevo.
 
-### Paso 7 — Verifique la estructura creada
+### Paso 5 — Commit y estructura creada
 
-Tras el confirm, el binario imprime:
+Tras la confirmación, el binario escribe en este orden: `recovery_codes.json` → `recovery.blob` → `audit.db` (fila `vault_created`) → `config.toml` firmado → **`sentinel.blob`**. El sentinel se publica con fichero temporal + fsync + rename atómico: **ese rename es el punto de commit**. Un fallo antes del rename borra todo lo que esta ejecución escribió.
 
 ```
-✓ Vault initialized at /Users/<you>/.kvendra/
-  - config.toml (HMAC-signed)
-  - sentinel.blob
-  - recovery.blob
-  - recovery_codes.json (mode 0600)
-  - audit.db (HMAC chain initialized)
+Vault initialized at /Users/<you>/.kvendra
+Recovery phrase bound to this vault (recovery.blob).
 ```
 
-Listado real:
+Listado:
 
 ```bash
 ls -la ~/.kvendra/
 ```
 
-Esperado:
+Ficheros relevantes (todos `0600`; directorios `0700`):
 
 ```
-config.toml          0600   # flags configurables, HMAC en config.toml.hmac
-config.toml.hmac     0600   # firma sub-key kvendra/config-hmac/v1
-sentinel.blob        0600   # used to verify unlock attempts
-recovery.blob        0600   # KDF-mnemonic-derived ciphertext
-recovery_codes.json  0600   # 8 Argon2id-hashed codes
-audit.db             0600   # SQLite WAL, chain genesis row
-secrets/             0700   # vacía (no profiles aún)
-allowlists/          0700   # vacía (no allowlists aún)
+sentinel.blob        # v2: MK envuelta con Argon2id(password) + check
+recovery.blob        # v1: MK envuelta con la frase (BIP-39 seed + HKDF)
+recovery_codes.json  # 8 códigos Argon2id-hashed
+config.toml          # firmado HMAC (sub-key kvendra/config-hmac/v1)
+audit.db             # SQLite WAL, cadena HMAC con la fila vault_created
 ```
 
-Permisos `0600` en ficheros y `0700` en directorios. Si `umask` de tu shell es laxo, el binario igual fuerza estos modes — es defensa en profundidad.
+## Vault ya inicializado
 
-## Aborto seguro
+Si `sentinel.blob` ya existe, `init` se niega:
 
-Hasta el paso 6 (confirm), todos los artefactos viven en RAM. Ctrl+C aborta limpiamente: no quedan ficheros parciales, la derived key se zeroiza, las recovery seeds se descartan.
-
-A partir del paso 7, los ficheros existen. Si quiere descartarlos:
-
-```bash
-rm -rf ~/.kvendra/
+```
+vault already initialized. Forgot the master password? `kvendra recover` (needs your
+12-word phrase). To change it knowing the current one: `kvendra passwd`.
 ```
 
-> **Advertencia:** `rm -rf ~/.kvendra/` es destructivo. Si ya tenías profiles guardados, los pierdes irrecoverable salvo backup propio. En el bootstrap inicial es seguro porque aún no hay nada que perder.
+## Init interrumpido
+
+Si un `init` anterior murió (corte de luz, kill) antes del commit, pueden quedar ficheros sueltos sin `sentinel.blob`. El siguiente `kvendra init` **no los borra**: los mueve a `~/.kvendra/.init-orphans-<timestamp>/` y avisa por stderr. Puedes borrar esa carpeta cuando quieras: su frase pertenecía a un vault que nunca existió.
 
 ## Validación post-init
 
@@ -206,11 +174,7 @@ Confirme que el unlock funciona antes de cerrar la sesión:
 kvendra unlock
 ```
 
-Introduzca el master password. La sesión queda activa hasta que expire su TTL (por defecto **4h**; se puede acotar por unlock con `kvendra unlock --ttl 1h`). El TTL vigente se **lee** con `kvendra session info` — no se deduce del reloj de pared. Salida aproximada:
-
-```
-✓ Vault unlocked. Session active (TTL 4h). Check with `kvendra session info`.
-```
+Introduzca el master password. La sesión queda activa hasta que expire su TTL (por defecto **4h**; se puede acotar por unlock con `kvendra unlock --ttl 1h`). El TTL vigente se **lee** con `kvendra session info`.
 
 Lock manual:
 
@@ -218,10 +182,12 @@ Lock manual:
 kvendra lock
 ```
 
-Esto zeroiza la derived key en RAM y deja el vault locked. El siguiente `unlock` pedirá la password otra vez.
+Esto zeroiza la clave de vault en RAM y deja el vault locked. El siguiente `unlock` pedirá la password otra vez.
 
 ## Notas importantes
 
-> **Nota:** El TTL de sesión por defecto es **4h**. En `0.6.4` **no** existe `kvendra config set …`: el TTL se ajusta **por unlock** con `kvendra unlock --ttl <30m|4h|8h|1d>` (sujeto al cap `session.max_ttl` cuando sea configurable), se **refresca** re-autenticando con `kvendra unlock --extend`, y se **consulta** con `kvendra session info`. Ver patrón conocido sobre el restart de Claude Code en `PAT-KVD-009` (también recogido en el [capítulo 22](./22-faq-troubleshooting.md)).
+> **Nota:** **no** existe `kvendra config set …`: el TTL se ajusta **por unlock** con `kvendra unlock --ttl <30m|4h|8h|1d>`, se **refresca** con `kvendra unlock --extend` y se **consulta** con `kvendra session info`. Ver `PAT-KVD-009` (también en el [capítulo 22](./22-faq-troubleshooting.md)).
 
-> **Advertencia:** No edite manualmente `config.toml` ni `recovery_codes.json`. Ambos están firmados con HMAC sidecar (`config.toml.hmac`) o hasheados (`recovery_codes.json` no editable trivialmente). Cualquier mismatch detectado al startup hace que el binario rechace la sesión con error explícito (vector L1 GAP_5/GAP_7 cerrados, ver [capítulo 18](./18-threat-model.md)).
+> **Nota:** para cambiar la password sabiendo la actual, `kvendra passwd` ([capítulo 10](./10-recuperacion.md)).
+
+> **Advertencia:** No edite manualmente `config.toml`, `recovery_codes.json`, `sentinel.blob` ni `recovery.blob`. `config.toml` va firmado con HMAC y se rechaza si no cuadra; los blobs llevan AAD que los ata a este vault y a su versión de formato, y un fichero alterado se rechaza fail-closed.

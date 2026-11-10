@@ -231,6 +231,9 @@ Ejemplo de mismatch:
 | `(internal)` | `vault.unlock`, `vault.lock` | Sesiones |
 | `(internal)` | `allowlist_hmac_migrated` | Migraciones automáticas (post alpha.11) |
 | `(internal)` | `recovery_code_replay_attempted` | Intento de re-uso de un recovery code |
+| `kvendra.system` | `recover` / `passwd` (flag `recover_ok` / `passwd_ok`) | Cambio de password confirmado (0.9.0) |
+| `kvendra.system` | flag `recover_cleanup` | Se borró un `sentinel.blob.pre-recover` sobrante tras un unlock con éxito (0.9.0) |
+| `kvendra.system` | flags `preauth_unauthenticated,<action>_rejected_<reason>` | Rechazo de `recover`/`passwd` importado desde `audit.preauth.jsonl`; su contenido **no** está autenticado (0.9.0) |
 
 ## Troubleshooting
 

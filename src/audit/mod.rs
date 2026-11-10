@@ -40,8 +40,10 @@ pub const FLAG_UNLOCK_REJECTED_STDIO_NOT_OWNED: &str = "unlock_rejected_stdio_no
 /// `kvendra unlock --extend` bumped the TTL of an existing session.
 pub const FLAG_UNLOCK_EXTENDED: &str = "unlock_extended";
 
-/// `kvendra unlock --recovery` consumed one recovery code and reset the
-/// master password (chains to REQ-KVD-CLI-003 / ADR-KVD-012).
+/// Reserved, never emitted: there is no `kvendra unlock --recovery`, and a
+/// recovery code never resets the master password (codes only authorise
+/// `kvendra config rebind-home`; a forgotten password goes through
+/// `kvendra recover` and the 12-word phrase).
 pub const FLAG_UNLOCK_RECOVERY_CODE_CONSUMED: &str = "unlock_recovery_code_consumed";
 
 /// `kvendra lock` deleted the active session blob.

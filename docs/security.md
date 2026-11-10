@@ -2,10 +2,15 @@
 
 ## Trust narrative
 
-kvendra implements a **zero-knowledge vault** (Argon2id-derived key,
-AES-256-GCM ciphers, master password never stored to disk except as a
-sentinel hash) plus a **capability-based MCP broker** (7 git/github/npm/
-pypi/aws/http/shell primitives + an escape hatch for raw tokens).
+kvendra implements a **zero-knowledge vault** (random vault key wrapped
+under an Argon2id-derived key since 0.9.0, AES-256-GCM ciphers, master
+password never stored to disk) plus a **capability-based MCP broker**
+(7 git/github/npm/pypi/aws/http/shell primitives + an escape hatch for raw
+tokens).
+
+> **0.9.0 update — key hierarchy and recovery.** See
+> [Vault key hierarchy and recovery (0.9.0)](#vault-key-hierarchy-and-recovery-090)
+> below. The rest of this page describes the 0.6.4 hardening and still holds.
 
 > **Read first:** for plain-language expectations (what protects you, what does
 > not, and how to raise it) see
@@ -39,13 +44,55 @@ The trust narrative (0.6.4):
    with sub-key `kvendra/audit-hmac/v1`. Tampering detected via
    `kvendra audit --verify`.
 
+## Vault key hierarchy and recovery (0.9.0)
+
+Vaults created with 0.9.0 or later use an envelope:
+
+- The **vault key** (MK) is 32 random bytes. Secret blobs, local variables,
+  the HKDF sub-keys (allowlist/config HMAC, audit HMAC, backup) and the
+  audit chain all hang from it.
+- `sentinel.blob` **v2** stores MK wrapped (AES-256-GCM) under
+  `Argon2id(master password, salt)`, plus `check`, an AEAD of a constant
+  under MK that lets a candidate MK (from the session blob or the recovery
+  phrase) be verified without the password.
+- `recovery.blob` **v1** stores MK wrapped under
+  `HKDF-SHA256(salt = vault_id, IKM = BIP-39 seed of the 12-word phrase,
+  info = "kvendra/recovery-wrap/v1")`. The phrase itself is never stored.
+- Every AEAD carries an AAD binding the format label, the format version and
+  the public `vault_id` (and, for the password wrap, the Argon2id
+  parameters), so a ciphertext cannot be moved between vaults or formats.
+
+`kvendra recover` (forgotten password: 12-word phrase → new password) and
+`kvendra passwd` (current password → new password) only re-wrap MK and
+replace `sentinel.blob` with an atomic tmp + fsync + rename commit; the
+previous sentinel is restored on any failure, and a crash leaves a vault
+that opens with the old password or the new one. Both invalidate the
+session blob and the keychain caches. Rejected attempts happen before any
+key exists, so they are logged to `audit.preauth.jsonl` (no secret, closed
+vocabulary) and imported into the HMAC chain, flagged
+`preauth_unauthenticated`, at the next successful unlock.
+
+Limits, stated plainly:
+
+- **The phrase is as powerful as the password**: phrase + a copy of the
+  vault files = a new password of the attacker's choosing.
+- **Changing the password does not revoke old copies**: an earlier
+  `sentinel.blob` (in an older backup, a disk snapshot) still opens with
+  the old password and yields the same MK. Recovery is for a forgotten
+  password, not a stolen one; for a suspected leak, create a new vault.
+- **Vaults created before 0.9.0** (sentinel v1, no `recovery.blob`) keep
+  working, but `recover` and `passwd` refuse on them without changing
+  anything. There is no migration in 0.9.0.
+
+Full treatment: [`THREAT-MODEL.md`](../THREAT-MODEL.md) (V9 and "Changing
+the password does not revoke old copies").
+
 ## Session blob threat model
 
 `~/.kvendra/sessions/active.blob` is the new asset that lets
 `kvendra mcp serve` start without re-prompting. It is **not** the
-master password and **not** the Argon2id-derived key on its own — it
-is the derived key sealed under a machine-bound wrap key with a
-short TTL.
+master password on its own — it is the vault key sealed under a
+machine-bound wrap key with a short TTL.
 
 ### What protects the blob
 
