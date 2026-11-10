@@ -62,7 +62,7 @@ sequenceDiagram
     C->>C: abre recovery.blob → MK, verifica contra check del sentinel
     C->>U: password nueva + confirmación (≥ 8)
     C->>C: re-envuelve la MK con la password nueva (en RAM)
-    C->>FS: borra blob de sesión + caché del keychain
+    C->>FS: borra blob de sesión y entradas del keychain de ESTE vault
     C->>FS: sentinel.blob → sentinel.blob.pre-recover
     C->>FS: sentinel.blob.recover-tmp → rename sobre sentinel.blob
     C->>C: verifica que la password nueva da la misma MK
@@ -73,14 +73,25 @@ sequenceDiagram
 
 Nada se escribe en el vault antes del commit (pasos 9–14). Solo cambia `sentinel.blob`: secretos, variables locales, allowlists y `config.toml` firmados, grants, backups y la cadena de audit siguen funcionando porque cuelgan de la misma clave de vault.
 
-Salida al terminar:
+Salida al terminar: el mensaje dice **exactamente** qué se limpió, entrada a entrada. Ejemplo en una máquina con la sesión activa y la entrada `mcp-password/v1` de este vault:
 
 ```
-Master password reset. Your secrets, local variables, allowlists, grants and backups keep
-working. Active sessions and the keychain cache were cleared; any running
-`kvendra mcp serve` keeps its in-memory session until it expires — restart it. If you
-suspect the old password was stolen, recovery is not enough: create a new vault.
+Master password reset. Your secrets, local variables, allowlists, grants and backups keep working.
+The local session (sessions/active.blob) was cleared.
+Keychain entry kvendra/mcp-password/v1 was removed.
+Any running `kvendra mcp serve` keeps its in-memory session until it expires — restart it.
+If you suspect the old password was stolen, recovery is not enough: create a new vault.
 ```
+
+Cada entrada del keychain (`kvendra/derived-key/v1`, `kvendra/mcp-password/v1`) acaba en uno de tres estados:
+
+| Estado | Cuándo | Qué dice el mensaje |
+|---|---|---|
+| **Borrada** | Su etiqueta de dueño (`<label>#owner`) es el `vault_id` de este vault | `Keychain entry … was removed.` |
+| **No existe** | No hay entrada | Nada (si no hay ninguna: `No kvendra keychain entries were found.`) |
+| **Dejada** | Es de otro vault, o no tiene dueño (escrita antes de 0.9) | `… was left untouched: …` y, si no tiene dueño, el comando `disable` que la quita |
+
+Una entrada dejada no abre este vault (el sentinel nuevo exige la password nueva), pero puede guardar la password **antigua**. Si el backend del keychain falla al leer el dueño de `mcp-password/v1`, el comando aborta sin cambiar nada; para `derived-key/v1` (solo un flag de presencia) sigue y lo avisa.
 
 Después: `kvendra unlock` con la password nueva y reinicia los `kvendra mcp serve` que tuvieras abiertos.
 
@@ -131,7 +142,7 @@ Pide la password actual, la nueva y su confirmación, **siempre desde un termina
 
 - La nueva debe tener ≥ 8 caracteres y ser distinta de la actual.
 - Password actual incorrecta → rechazo registrado en `audit.preauth.jsonl` (`passwd_rejected_password_invalid`), nada escrito.
-- Usa el mismo commit atómico que `recover` (fila de audit `passwd_ok`) y borra igual sesiones y caché del keychain.
+- Usa el mismo commit atómico que `recover` (fila de audit `passwd_ok`) e invalida igual la sesión y las entradas del keychain de este vault, con el mismo mensaje detallado (borrada / no existe / dejada).
 - En vaults `0.8.x` se niega: `This vault was created before Kvendra 0.9; changing its password is not supported. Nothing was changed.`
 
 El mensaje final recuerda lo mismo que este capítulo: las copias antiguas de `sentinel.blob` (por ejemplo dentro de backups anteriores) siguen abriendo con la password **antigua**.
@@ -155,6 +166,7 @@ Lo que hace y lo que no, en `0.9.0`:
 - **Reconcilia el sentinel**: si el bundle es de este vault (mismo `vault_id`, su `check` abre con la clave local), el `sentinel.blob` del staging se sustituye por el actual, para que restaurar no resucite la password olvidada. Lo indica con `The restored sentinel.blob was replaced by this vault's current one`. Un bundle v2 de otro vault se rechaza sin dejar el staging a medias. Las variables locales vuelven como `verified:false` (`kvendra vars verify --all`).
 - **No sirve con una password olvidada**: sin la password (o sin fijar antes una nueva con la frase) el bundle no se abre.
 - **Máquina nueva**: restaurar desde backup + frase en una máquina sin este vault **todavía no está soportado** (`backup pull` necesita el sentinel local). Si conservas una copia a nivel de ficheros de `~/.kvendra/` (disco, snapshot) que incluya `recovery.blob`, `kvendra recover` funciona sobre ella.
+  - **Si esa copia está en otra ruta** (`KVENDRA_HOME` distinto del original), `recover` funciona, pero el `config.toml` firmado sigue apuntando a la ruta original: el siguiente `kvendra unlock` falla con `home_redirect_detected` hasta que ejecutas `kvendra config rebind-home --new-path <ruta-nueva>` (pide uno de los 8 códigos de recuperación, ver más abajo). Si la copia vuelve a su ruta original, no hace falta.
 
 ## Recovery codes — autorizar `rebind-home`
 

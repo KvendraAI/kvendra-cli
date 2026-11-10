@@ -13,12 +13,6 @@ use crate::vault::Vault;
 use clap::Args;
 use zeroize::Zeroizing;
 
-/// Printed after a successful recovery.
-pub const SUCCESS_MESSAGE: &str = "Master password reset. Your secrets, local variables, allowlists, grants and \
-     backups keep working. Active sessions and the keychain cache were cleared; any running \
-     `kvendra mcp serve` keeps its in-memory session until it expires — restart it. If you \
-     suspect the old password was stolen, recovery is not enough: create a new vault.";
-
 #[derive(Debug, Args)]
 pub struct RecoverArgs {
     /// Read the mnemonic from this env var instead of prompting (testing/CI).
@@ -38,7 +32,7 @@ pub async fn run(args: RecoverArgs) -> KvendraResult<()> {
         new_password_env,
     } = args;
 
-    recover_with_phrase(
+    let report = recover_with_phrase(
         &vault,
         move || match mnemonic_env {
             Some(s) => Ok(Zeroizing::new(s)),
@@ -56,6 +50,10 @@ pub async fn run(args: RecoverArgs) -> KvendraResult<()> {
         caches.as_ref(),
     )
     .await?;
-    println!("{SUCCESS_MESSAGE}");
+    // Says exactly what was cleared and what was left (M1).
+    println!(
+        "{}",
+        crate::rekey::success_message(crate::rekey::RekeyAction::Recover, &report)
+    );
     Ok(())
 }

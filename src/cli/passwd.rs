@@ -3,7 +3,8 @@
 //!
 //! Re-wraps the vault key under the new password with the same atomic commit
 //! as `kvendra recover` ([`crate::rekey::commit_new_password`]): sessions
-//! and keychain caches are invalidated, nothing else on disk changes.
+//! and this vault's keychain entries are invalidated (the final message says
+//! exactly which), nothing else on disk changes.
 
 use crate::captured_env::ensure_real_terminal;
 use crate::config::kvendra_home;
@@ -12,13 +13,6 @@ use crate::rekey::{caches_for_process, change_password};
 use crate::vault::Vault;
 use clap::Args;
 use zeroize::Zeroizing;
-
-/// Printed after a successful change.
-pub const SUCCESS_MESSAGE: &str = "Master password changed. Your secrets, local variables, allowlists, grants and \
-     backups keep working. Active sessions and the keychain cache were cleared; any running \
-     `kvendra mcp serve` keeps its in-memory session until it expires — restart it. Old copies \
-     of sentinel.blob (for example inside earlier backups) still open with the OLD password: \
-     if you suspect it was stolen, create a new vault instead.";
 
 #[derive(Debug, Args)]
 pub struct PasswdArgs {
@@ -59,7 +53,7 @@ pub async fn run(args: PasswdArgs) -> KvendraResult<()> {
         None
     };
     let tty_ref = tty.as_ref();
-    change_password(
+    let report = change_password(
         &vault,
         move || match current {
             Some(p) => Ok(p),
@@ -92,6 +86,10 @@ pub async fn run(args: PasswdArgs) -> KvendraResult<()> {
         caches.as_ref(),
     )
     .await?;
-    println!("{SUCCESS_MESSAGE}");
+    // Says exactly what was cleared and what was left (M1).
+    println!(
+        "{}",
+        crate::rekey::success_message(crate::rekey::RekeyAction::Passwd, &report)
+    );
     Ok(())
 }

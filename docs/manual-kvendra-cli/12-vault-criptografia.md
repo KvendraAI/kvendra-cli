@@ -224,7 +224,7 @@ Modos posibles, decisión `ADR-KVD-012`:
 
 > **Decisión clave**: el modo `--use-keychain` **NO almacena la clave de vault** en el keychain. Almacena un sentinel cifrado con una key protegida por biometría; el unlock real sigue requiriendo el master password textual o re-derivar tras `userPresence` confirmation. Esta sutileza cierra el vector L1 GAP_1 + GAP_2.
 
-> **Nota (0.9.0):** `kvendra recover` y `kvendra passwd` borran el blob de sesión y las entradas del keychain antes de publicar el sentinel nuevo. Un `kvendra mcp serve` ya en marcha conserva su sesión en RAM hasta que expira: reinícialo.
+> **Nota (0.9.0):** `kvendra recover` y `kvendra passwd` borran el blob de sesión y las entradas del keychain **de este vault** (las que llevan su `vault_id` como dueño) antes de publicar el sentinel nuevo; las de otro vault o sin dueño se dejan y el mensaje final lo dice (ver [cap. 10](./10-recuperacion.md)). Un `kvendra mcp serve` ya en marcha conserva su sesión en RAM hasta que expira: reinícialo.
 
 > **Advertencia (C3):** el blob de sesión `active.blob` **sí** guarda la MK como payload, cifrada con una wrap key derivada de inputs **públicos** (machine-bound, sin la master password). Es un trade-off consciente (`ADR-KVD-029`) para no re-pedir la contraseña en cada invocación: un proceso mismo-uid con el vault desbloqueado puede recuperar la clave. Es el residual **C3** del [capítulo 18](./18-threat-model.md); el fix real es el hardware-backed wrapping del roadmap (opt-in).
 

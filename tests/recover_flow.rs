@@ -28,6 +28,7 @@ async fn recover(f: &Fixture, phrase: &str, new_pw: Option<&str>) -> Result<(), 
         &f.caches(),
     )
     .await
+    .map(|_| ())
 }
 
 /// AC-REC-1 + AC-REC-6 + AC-REC-7 (ok row) + AC-REC-9.
@@ -282,7 +283,11 @@ async fn rejections_are_logged_preauth_and_imported_on_success() {
 #[tokio::test]
 async fn keychain_failure_aborts_without_commit() {
     let f = setup().await;
-    let caches = FailingMcp(f.caches());
+    let caches = Faulty {
+        inner: f.caches(),
+        fail_delete: Some(KEYCHAIN_MCP_PASSWORD_LABEL),
+        fail_owner: None,
+    };
     let phrase = f.phrase.clone();
     let err = recover_with_phrase(
         &f.vault(),
@@ -297,24 +302,34 @@ async fn keychain_failure_aborts_without_commit() {
     assert!(!f.home.join("sentinel.blob.pre-recover").exists());
 }
 
-/// Fake keychain whose mcp-password entry (bound to this vault) cannot be
-/// deleted.
-struct FailingMcp(FileCredentialCaches);
-impl kvendra::rekey::CredentialCaches for FailingMcp {
-    fn owner(&self, label: &str) -> Option<String> {
-        self.0.owner(label)
+/// Fake keychain wrapper with switchable failures (no env vars: tests in
+/// this binary run in parallel).
+struct Faulty {
+    inner: FileCredentialCaches,
+    fail_delete: Option<&'static str>,
+    fail_owner: Option<&'static str>,
+}
+impl kvendra::rekey::CredentialCaches for Faulty {
+    fn owner(&self, label: &str) -> kvendra::error::KvendraResult<Option<String>> {
+        if self.fail_owner == Some(label) {
+            return Err(KvendraError::Keychain("fake backend failure".into()));
+        }
+        self.inner.owner(label)
+    }
+    fn exists(&self, label: &str) -> kvendra::error::KvendraResult<bool> {
+        self.inner.exists(label)
     }
     fn set_owner(&self, label: &str, id: &str) -> kvendra::error::KvendraResult<()> {
-        self.0.set_owner(label, id)
+        self.inner.set_owner(label, id)
     }
-    fn delete_entry(&self, label: &str) -> kvendra::error::KvendraResult<()> {
-        if label == KEYCHAIN_MCP_PASSWORD_LABEL {
+    fn delete_entry(&self, label: &str) -> kvendra::error::KvendraResult<bool> {
+        if self.fail_delete == Some(label) {
             return Err(KvendraError::Keychain("fake refusal".into()));
         }
-        self.0.delete_entry(label)
+        self.inner.delete_entry(label)
     }
     fn delete_owner(&self, label: &str) -> kvendra::error::KvendraResult<()> {
-        self.0.delete_owner(label)
+        self.inner.delete_owner(label)
     }
 }
 
@@ -353,7 +368,10 @@ async fn keychain_entries_of_another_vault_are_left_untouched() {
         "B's entry removed"
     );
     assert_eq!(
-        shared.owner(KEYCHAIN_MCP_PASSWORD_LABEL).as_deref(),
+        shared
+            .owner(KEYCHAIN_MCP_PASSWORD_LABEL)
+            .unwrap()
+            .as_deref(),
         Some(b_id.as_str())
     );
     assert!(
@@ -379,7 +397,7 @@ async fn keychain_entries_of_another_vault_are_left_untouched() {
         .unwrap();
     assert!(!shared.entry_path(KEYCHAIN_MCP_PASSWORD_LABEL).exists());
     assert!(!shared.entry_path(KEYCHAIN_DERIVED_KEY_LABEL).exists());
-    assert!(shared.owner(KEYCHAIN_MCP_PASSWORD_LABEL).is_none());
+    assert!(shared.owner(KEYCHAIN_MCP_PASSWORD_LABEL).unwrap().is_none());
     // B is still intact with its own password.
     assert_eq!(opening_password(&b.home), OLD_PW);
 }
@@ -424,4 +442,215 @@ async fn rekey_lock_serializes_commits_and_protects_leftovers() {
     recover(&f, &f.phrase, Some(NEW_PW)).await.unwrap();
     assert!(!kvendra::rekey::pre_recover_path(&v).exists());
     assert_eq!(opening_password(&f.home), NEW_PW);
+}
+
+async fn recover_report(
+    f: &Fixture,
+    caches: &dyn kvendra::rekey::CredentialCaches,
+) -> kvendra::rekey::RekeyReport {
+    let phrase = f.phrase.clone();
+    recover_with_phrase(
+        &f.vault(),
+        move || Ok(Zeroizing::new(phrase)),
+        || Ok(Zeroizing::new(NEW_PW.to_string())),
+        caches,
+    )
+    .await
+    .unwrap()
+}
+
+/// M1 — removed entries are reported as removed, and the message lists
+/// exactly what was cleared.
+#[tokio::test]
+async fn report_and_message_when_everything_was_bound() {
+    use kvendra::rekey::{CacheOutcome, RekeyAction, success_message};
+    let f = setup().await;
+    let r = recover_report(&f, &f.caches()).await;
+    assert!(r.session_removed && r.wrapper_removed);
+    assert_eq!(
+        r.keychain,
+        vec![
+            (KEYCHAIN_DERIVED_KEY_LABEL, CacheOutcome::Removed),
+            (KEYCHAIN_MCP_PASSWORD_LABEL, CacheOutcome::Removed)
+        ]
+    );
+    let msg = success_message(RekeyAction::Recover, &r);
+    assert!(msg.contains("The local session (sessions/active.blob) was cleared."));
+    assert!(msg.contains("The legacy MCP wrapper script was removed."));
+    assert!(msg.contains("Keychain entry kvendra/derived-key/v1 was removed."));
+    assert!(msg.contains("Keychain entry kvendra/mcp-password/v1 was removed."));
+    assert!(!msg.contains("left untouched"));
+}
+
+/// M1 — on a machine with no keychain entries and no session there is no
+/// false warning and no false "cleared": the exact message.
+#[tokio::test]
+async fn report_and_exact_message_when_nothing_exists() {
+    use kvendra::rekey::{CacheOutcome, RekeyAction, success_message};
+    let f = setup().await;
+    std::fs::remove_dir_all(&f.keychain).unwrap();
+    std::fs::create_dir_all(&f.keychain).unwrap();
+    std::fs::remove_file(f.home.join("sessions/active.blob")).unwrap();
+    std::fs::remove_file(f.home.join("sessions/active.blob.hmac")).unwrap();
+    std::fs::remove_file(f.home.join("wrappers").join(LEGACY_WRAPPER_NAME)).unwrap();
+    let r = recover_report(&f, &f.caches()).await;
+    assert_eq!(
+        r.keychain,
+        vec![
+            (KEYCHAIN_DERIVED_KEY_LABEL, CacheOutcome::Absent),
+            (KEYCHAIN_MCP_PASSWORD_LABEL, CacheOutcome::Absent)
+        ]
+    );
+    assert_eq!(
+        success_message(RekeyAction::Recover, &r),
+        "Master password reset. Your secrets, local variables, allowlists, grants and backups \
+         keep working.\n\
+         There was no local session to clear.\n\
+         No kvendra keychain entries were found.\n\
+         Any running `kvendra mcp serve` keeps its in-memory session until it expires — \
+         restart it.\n\
+         If you suspect the old password was stolen, recovery is not enough: create a new vault."
+    );
+}
+
+/// M1 — entries of another vault and untagged entries are kept, each with
+/// its own notice (and the `disable` command for the untagged one).
+#[tokio::test]
+async fn report_and_message_for_kept_entries() {
+    use kvendra::rekey::{CacheOutcome, KeptReason, RekeyAction, success_message};
+    let f = setup().await;
+    let c = f.caches();
+    c.set_owner(
+        KEYCHAIN_MCP_PASSWORD_LABEL,
+        "00112233445566778899aabbccddeeff",
+    )
+    .unwrap();
+    c.delete_owner(KEYCHAIN_DERIVED_KEY_LABEL).unwrap();
+    let r = recover_report(&f, &c).await;
+    assert_eq!(
+        r.keychain,
+        vec![
+            (
+                KEYCHAIN_DERIVED_KEY_LABEL,
+                CacheOutcome::Kept(KeptReason::NoOwner)
+            ),
+            (
+                KEYCHAIN_MCP_PASSWORD_LABEL,
+                CacheOutcome::Kept(KeptReason::OtherVault)
+            )
+        ]
+    );
+    let msg = success_message(RekeyAction::Recover, &r);
+    assert!(msg.contains(
+        "Keychain entry kvendra/mcp-password/v1 was left untouched: it belongs to another vault."
+    ));
+    assert!(
+        msg.contains("Keychain entry kvendra/derived-key/v1 was left untouched: it is not bound")
+    );
+    assert!(msg.contains("`kvendra config keychain disable`"));
+    assert!(!msg.contains("v1 was removed"), "{msg}");
+    assert!(!msg.contains("No kvendra keychain entries were found"));
+    assert!(c.entry_path(KEYCHAIN_MCP_PASSWORD_LABEL).exists());
+    assert!(c.entry_path(KEYCHAIN_DERIVED_KEY_LABEL).exists());
+}
+
+/// B4 — a backend error reading the owner of mcp-password/v1 aborts the
+/// commit (fail-closed); for derived-key/v1 it is best effort with notice.
+#[tokio::test]
+async fn owner_read_failure_is_fail_closed_for_mcp_password_only() {
+    use kvendra::rekey::{CacheOutcome, KeptReason};
+    let f = setup().await;
+    let before = hashes_except(&f.home, &[PREAUTH]);
+    let phrase = f.phrase.clone();
+    let err = recover_with_phrase(
+        &f.vault(),
+        move || Ok(Zeroizing::new(phrase)),
+        || Ok(Zeroizing::new(NEW_PW.to_string())),
+        &Faulty {
+            inner: f.caches(),
+            fail_delete: None,
+            fail_owner: Some(KEYCHAIN_MCP_PASSWORD_LABEL),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, KvendraError::Keychain(_)), "{err:?}");
+    assert_eq!(opening_password(&f.home), OLD_PW);
+    assert!(f.caches().entry_path(KEYCHAIN_MCP_PASSWORD_LABEL).exists());
+    // Only caches that never hold a key may have gone (session blob).
+    let after = hashes_except(&f.home, &[PREAUTH, "sessions/", ".rekey.lock"]);
+    let before: std::collections::BTreeMap<_, _> = before
+        .into_iter()
+        .filter(|(k, _)| !k.starts_with("sessions/"))
+        .collect();
+    assert_eq!(before, after);
+
+    let r = recover_report(
+        &f,
+        &Faulty {
+            inner: f.caches(),
+            fail_delete: None,
+            fail_owner: Some(KEYCHAIN_DERIVED_KEY_LABEL),
+        },
+    )
+    .await;
+    assert!(matches!(
+        r.keychain[0],
+        (
+            KEYCHAIN_DERIVED_KEY_LABEL,
+            CacheOutcome::Kept(KeptReason::BackendError(_))
+        )
+    ));
+    assert_eq!(
+        r.keychain[1],
+        (KEYCHAIN_MCP_PASSWORD_LABEL, CacheOutcome::Removed)
+    );
+    assert_eq!(opening_password(&f.home), NEW_PW);
+}
+
+/// B2 — a stale `.pre-recover` removed by a later recover is audited as
+/// `recover_cleanup` before the new `recover` row.
+#[tokio::test]
+async fn stale_pre_recover_removed_by_recover_is_audited() {
+    let f = setup().await;
+    let v = f.vault();
+    std::fs::copy(v.sentinel_path(), kvendra::rekey::pre_recover_path(&v)).unwrap();
+    recover(&f, &f.phrase, Some(NEW_PW)).await.unwrap();
+    assert!(!kvendra::rekey::pre_recover_path(&v).exists());
+    let actions: Vec<String> = audit_rows(&f.home)
+        .into_iter()
+        .filter(|r| r.action == "recover" || r.action == "recover_cleanup")
+        .map(|r| r.action)
+        .collect();
+    assert_eq!(actions, vec!["recover_cleanup", "recover"]);
+    assert_all_intact(&f, NEW_PW);
+}
+
+/// B5 — a leftover `sentinel.blob.init-tmp` next to a sentinel: removed when
+/// byte-identical, quarantined (never deleted) when different.
+#[tokio::test]
+async fn init_tmp_leftover_is_removed_or_quarantined() {
+    let f = setup().await;
+    let v = f.vault();
+    let tmp = f.home.join(kvendra::rekey::INIT_TMP_NAME);
+    std::fs::copy(v.sentinel_path(), &tmp).unwrap();
+    kvendra::rekey::cleanup_before_auth(&v).unwrap();
+    assert!(!tmp.exists());
+    assert!(!std::fs::read_dir(&f.home).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".init-orphans-")
+    }));
+
+    std::fs::write(&tmp, b"kvd-different-bytes").unwrap();
+    let dir = kvendra::rekey::cleanup_init_tmp(&f.home)
+        .unwrap()
+        .expect("quarantined");
+    assert!(!tmp.exists());
+    assert_eq!(
+        std::fs::read(dir.join(kvendra::rekey::INIT_TMP_NAME)).unwrap(),
+        b"kvd-different-bytes"
+    );
+    assert_eq!(opening_password(&f.home), OLD_PW);
 }

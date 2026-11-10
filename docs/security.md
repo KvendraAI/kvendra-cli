@@ -66,8 +66,12 @@ Vaults created with 0.9.0 or later use an envelope:
 `kvendra passwd` (current password → new password) only re-wrap MK and
 replace `sentinel.blob` with an atomic tmp + fsync + rename commit; the
 previous sentinel is restored on any failure, and a crash leaves a vault
-that opens with the old password or the new one. Both invalidate the
-session blob and the keychain caches. Rejected attempts happen before any
+that opens with the old password or the new one. Both remove the session
+blob and the keychain entries bound to THIS vault (owner tag = its
+`vault_id`); entries of another vault or without an owner are left in
+place, and the final message reports each entry as removed, absent or left.
+A backend error reading the owner of `mcp-password/v1` aborts the change.
+Rejected attempts happen before any
 key exists, so they are logged to `audit.preauth.jsonl` (no secret, closed
 vocabulary) and imported into the HMAC chain, flagged
 `preauth_unauthenticated`, at the next successful unlock.

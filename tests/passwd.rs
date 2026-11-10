@@ -28,6 +28,7 @@ async fn passwd(f: &Fixture, current: &str, new: Option<&str>) -> Result<(), Kve
         &f.caches(),
     )
     .await
+    .map(|_| ())
 }
 
 #[tokio::test]

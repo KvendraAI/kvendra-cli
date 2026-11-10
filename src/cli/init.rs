@@ -120,6 +120,9 @@ pub async fn run(args: InitArgs) -> KvendraResult<()> {
 
     let vault = Vault::new(home.clone());
     if vault.sentinel_path().exists() {
+        // An earlier init may have crashed between the publish (hard link)
+        // and removing its tmp (B5).
+        crate::rekey::cleanup_init_tmp_locked(&home)?;
         return Err(KvendraError::Vault(ALREADY_INITIALIZED.into()));
     }
     if let Some(dir) = quarantine_init_orphans(&home)? {
@@ -449,6 +452,22 @@ fn rollback(home: &Path, before: &HashSet<OsString>) {
     }
 }
 
+/// Fresh `.init-orphans-<unix_ts>[-n]/` (0700) under `home`.
+pub(crate) fn new_orphans_dir(home: &Path) -> KvendraResult<PathBuf> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut dir = home.join(format!(".init-orphans-{ts}"));
+    let mut n = 1;
+    while dir.exists() {
+        dir = home.join(format!(".init-orphans-{ts}-{n}"));
+        n += 1;
+    }
+    create_dir_secure(&dir)?;
+    Ok(dir)
+}
+
 /// Without `sentinel.blob`, any init artifact is a leftover of an aborted
 /// init. Move them (never delete) to `.init-orphans-<unix_ts>/` (0700).
 fn quarantine_init_orphans(home: &Path) -> KvendraResult<Option<PathBuf>> {
@@ -463,17 +482,7 @@ fn quarantine_init_orphans(home: &Path) -> KvendraResult<Option<PathBuf>> {
     if found.is_empty() {
         return Ok(None);
     }
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let mut dir = home.join(format!(".init-orphans-{ts}"));
-    let mut n = 1;
-    while dir.exists() {
-        dir = home.join(format!(".init-orphans-{ts}-{n}"));
-        n += 1;
-    }
-    create_dir_secure(&dir)?;
+    let dir = new_orphans_dir(home)?;
     for p in found {
         if let Some(name) = p.file_name() {
             std::fs::rename(&p, dir.join(name))?;

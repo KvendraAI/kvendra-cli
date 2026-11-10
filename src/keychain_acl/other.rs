@@ -19,3 +19,8 @@ pub fn delete(_label: &str) -> Result<(), BiometricError> {
 pub fn request_user_presence_only(_reason: &str) -> Result<(), BiometricError> {
     Err(BiometricError::Unavailable(unavailable_user_message()))
 }
+
+/// No presence-gated items can exist on this platform.
+pub fn exists(_label: &str) -> Result<bool, BiometricError> {
+    Ok(false)
+}

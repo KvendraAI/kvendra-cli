@@ -39,13 +39,13 @@ bound to the vault, and `kvendra recover` works for real on those vaults.
   re-wraps MK. Distinct errors: `RecoveryUnavailable`,
   `RecoveryPhraseInvalid`, `RecoveryPhraseMismatch`,
   `RecoveryBlobMissing`, `RecoveryMaterialCorrupt` (replace the old
-  `RecoveryFailed`). Every one
-  says "Nothing was changed".
+  `RecoveryFailed`). Every one says "Nothing was changed".
 - **`kvendra passwd`** (ISSUE-KVD-CLI-80887F): change the master password
   knowing the current one. Real terminal required (anti-captured-env, same
   as `unlock`); `KVENDRA_PASSWORD` + `KVENDRA_NEW_PASSWORD` for tests/CI.
 - **Atomic password commit** shared by `recover` and `passwd` (`rekey`):
-  invalidate the session blob, keychain caches and legacy MCP wrapper →
+  invalidate the session blob, this vault's keychain entries and the
+  legacy MCP wrapper →
   copy to `sentinel.blob.pre-recover` → write `sentinel.blob.recover-tmp`
   → rename (publication point) + dir fsync → verify the new password yields
   the same MK → audit row (`recover_ok` / `passwd_ok`) → remove the copy.
@@ -101,7 +101,17 @@ bound to the vault, and `kvendra recover` works for real on those vaults.
   bound to THIS vault (an owner tag holding its `vault_id`, written by
   `config mcp-password enable` / `migrate-to-keychain-acl` and by `unlock`
   with the keychain cache). Entries of another vault, or untagged ones from
-  before 0.9, are left untouched with a notice telling how to remove them.
+  before 0.9, are left untouched. The final message of `recover` /
+  `passwd` reports each entry as removed, absent (no warning) or left
+  (with the `disable` command that removes it) instead of a fixed "the
+  keychain cache was cleared". A backend error reading the owner of
+  `mcp-password/v1` aborts the change; `derived-key/v1` (presence flag
+  only) is best effort with a notice.
+- A stale `sentinel.blob.pre-recover` removed by a later `recover` /
+  `passwd` is audited as `recover_cleanup` too.
+- A `sentinel.blob.init-tmp` left by an init that crashed right after
+  publishing is removed at the next start when it matches `sentinel.blob`,
+  or moved to `.init-orphans-<ts>/` when it does not.
 - `recover` and `passwd` share a per-vault lock: a second one refuses
   without changes instead of racing the first one's commit.
 - A 0.9 vault whose `recovery.blob` is missing gets its own message

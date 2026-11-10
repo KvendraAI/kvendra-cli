@@ -222,3 +222,37 @@ async fn keychain_refusal_aborts() {
     assert_eq!(opening_password(&f.home), OLD_PW);
     assert_no_leftovers(&f.home);
 }
+
+/// B4 — the fake keychain failing to read the OWNER tag of
+/// mcp-password/v1 aborts the recovery before the commit (fail-closed).
+#[tokio::test]
+async fn owner_read_failure_on_mcp_password_aborts() {
+    let f = setup().await;
+    let out = recover_cmd(&f, &f.phrase)
+        .env(
+            "KVENDRA_TEST_KEYCHAIN_FAIL",
+            "kvendra/mcp-password/v1#owner",
+        )
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("fake keychain backend failure"));
+    assert_eq!(opening_password(&f.home), OLD_PW);
+    assert_no_leftovers(&f.home);
+}
+
+/// M1 — the binary prints what actually happened (entries bound to this
+/// vault were removed), not a fixed sentence.
+#[tokio::test]
+async fn success_message_reports_what_was_removed() {
+    let f = setup().await;
+    let out = recover_cmd(&f, &f.phrase).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Keychain entry kvendra/mcp-password/v1 was removed."),
+        "{stdout}"
+    );
+    assert!(stdout.contains("The local session (sessions/active.blob) was cleared."));
+    assert!(!stdout.contains("keychain cache were cleared"));
+}
