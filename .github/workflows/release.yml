@@ -120,4 +120,4 @@ jobs:
           if ! gh release view "${TAG}" > /dev/null 2>&1; then
             gh release create "${TAG}" --verify-tag --title "kvendra ${TAG#v}" --notes "Binaries for ${TAG}. Install: curl -fsSL https://raw.githubusercontent.com/KvendraAI/kvendra-cli/main/install.sh | sh"
           fi
-          gh release upload "${TAG}" dist/*.tar.gz dist/*.zip dist/*.sha256 "dist/kvendra-${TAG}-checksums.txt" install.sh --clobber
+          gh release upload "${TAG}" dist/*.tar.gz dist/*.zip dist/*.sha256 "dist/kvendra-${TAG}-checksums.txt" --clobber
