@@ -7,6 +7,27 @@ and this project follows [Semantic Versioning](https://semver.org/) with
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-11-15 — pre-built binaries, one-line installer, patched SQLite and rustls
+
+Patch release (ISSUE-KVD-CLI-97093A).
+
+### Added
+- **Pre-built binaries** on every `v*` tag: macOS (arm64, x86_64), Linux (x86_64,
+  arm64; glibc) and Windows (x86_64), each with a `.sha256`, plus
+  `kvendra-<tag>-checksums.txt` on the GitHub Release.
+- **One-line installer** for macOS and Linux:
+  `curl -fsSL https://raw.githubusercontent.com/KvendraAI/kvendra-cli/main/install.sh | sh`.
+  It verifies the sha256 and installs to `~/.local/bin`. No Rust toolchain needed.
+
+### Security
+- `rusqlite` 0.31 → 0.41 (`libsqlite3-sys` 0.39.1, bundled SQLite 3.54.1):
+  RUSTSEC-2026-0459.
+- `rustls` 0.23.45 → 0.23.46: RUSTSEC-2026-0346, -0347, -0348, -0349.
+
+### Changed
+- MSRV 1.88 → 1.89 (required by `rusqlite` 0.41). Only matters for `cargo install`.
+- No change to the vault format, commands or flags.
+
 ## [0.9.0] — 2026-11-10 — feat: forgotten-password recovery with the 12-word phrase + `kvendra passwd`
 
 Feature release (REQ-KVD-CLI-CFB449, ADR-KVD-CLI-4810AF). New vaults use an

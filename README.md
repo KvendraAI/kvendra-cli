@@ -89,7 +89,7 @@ the [latest release](https://github.com/KvendraAI/kvendra-cli/releases/latest):
   → "Run anyway".
 - **Linux**: `chmod +x kvendra && ./kvendra --version`.
 
-### What's included (0.9.0)
+### What's included (0.9.1)
 
 - ✓ Capability-based MCP broker (7 primitives + escape hatch)
 - ✓ Zero-knowledge vault (Argon2id + AES-256-GCM)
