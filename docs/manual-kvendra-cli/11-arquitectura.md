@@ -2,7 +2,7 @@
 
 ## Descripción
 
-El binario `kvendra` es una crate Rust única (edition 2024, MSRV 1.88) organizada en módulos canónicos por responsabilidad. No hay daemon, ni servicio del sistema, ni proceso background — cada cliente MCP que se conecta arranca su propio subprocess `kvendra mcp serve`.
+El binario `kvendra` es una crate Rust única (edition 2024, MSRV 1.89) organizada en módulos canónicos por responsabilidad. No hay daemon, ni servicio del sistema, ni proceso background — cada cliente MCP que se conecta arranca su propio subprocess `kvendra mcp serve`.
 
 Este capítulo describe los módulos, sus límites, cómo se conectan, y el flujo end-to-end de una invocación MCP. Los detalles internos de cada módulo crítico están en capítulos dedicados ([12](./12-vault-criptografia.md), [13](./13-mcp-server.md), [14](./14-primitives.md), [15](./15-allowlist-enforcer.md), [16](./16-detection-layer.md), [17](./17-audit-internals.md)).
 

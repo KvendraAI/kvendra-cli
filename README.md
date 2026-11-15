@@ -45,6 +45,17 @@ package operations through it, with your credentials kept in a local vault.
 
 ## Install
 
+### One line (macOS and Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KvendraAI/kvendra-cli/main/install.sh | sh
+kvendra --version
+```
+
+The script picks the binary for your OS and CPU from the latest GitHub Release, checks
+its sha256 and installs it in `~/.local/bin` (set `KVENDRA_INSTALL_DIR` to change it, or
+`KVENDRA_VERSION=v0.9.1` to pin a version). No Rust toolchain needed.
+
 ### With `cargo install`
 
 ```bash
@@ -66,8 +77,10 @@ features work cross-platform:
 
 ### Pre-built binaries (GitHub Releases)
 
-Download the unsigned binary for your platform from the [latest release](
-https://github.com/KvendraAI/kvendra-cli/releases/latest):
+Every `v*` tag builds binaries for macOS (arm64, x86_64), Linux (x86_64, arm64; glibc,
+needs `libdbus-1` for the optional keychain) and Windows (x86_64), each with a `.sha256`
+and a `kvendra-<tag>-checksums.txt`. Download the unsigned binary for your platform from
+the [latest release](https://github.com/KvendraAI/kvendra-cli/releases/latest):
 
 - **macOS**: Gatekeeper may show a warning ("unidentified developer").
   Bypass with `xattr -d com.apple.quarantine kvendra` or via System
@@ -76,7 +89,7 @@ https://github.com/KvendraAI/kvendra-cli/releases/latest):
   → "Run anyway".
 - **Linux**: `chmod +x kvendra && ./kvendra --version`.
 
-### What's included (0.9.0)
+### What's included (0.9.1)
 
 - ✓ Capability-based MCP broker (7 primitives + escape hatch)
 - ✓ Zero-knowledge vault (Argon2id + AES-256-GCM)
