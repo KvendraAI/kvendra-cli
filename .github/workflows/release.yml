@@ -33,10 +33,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Both macOS targets build on the Apple Silicon runner; x86_64 is a cross build
-          # (the macos-13 Intel image is retired and its jobs queue forever).
-          - { os: macos-14, target: aarch64-apple-darwin, archive: tar.gz }
-          - { os: macos-14, target: x86_64-apple-darwin, archive: tar.gz }
+          # Both macOS targets build on the Apple Silicon runner; x86_64 is a cross build.
+          # `macos-latest` is the label ci.yml already uses successfully: macos-13 queues forever
+          # (retired) and macos-14 is refused ("configuration 'macos-14-arm64-us-default' is not
+          # supported"), observed on the v0.9.1 release runs.
+          - { os: macos-latest, target: aarch64-apple-darwin, archive: tar.gz }
+          - { os: macos-latest, target: x86_64-apple-darwin, archive: tar.gz }
           # Oldest supported Ubuntu runner, so the glibc requirement stays low.
           - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, archive: tar.gz }
           - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz }
