@@ -2,7 +2,7 @@
 name = "kvendra"
 version = "0.9.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "Apache-2.0"
 description = "Developer harness CLI for Kvendra — capability broker via MCP with zero-knowledge local vault."
 repository = "https://github.com/KvendraAI/kvendra-cli"
@@ -47,7 +47,7 @@ ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 # Recovery
 bip39 = { version = "2", features = ["rand", "zeroize"] }
 # Storage
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # OS keychain (opt-in)
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent"] }
 # HTTP

@@ -10,7 +10,7 @@ Inventario canónico del stack de `0.6.4`: crates Rust con versiones reales (`Ca
 >
 > **Edition:** 2024
 >
-> **MSRV:** 1.88 (`rust-version` en `Cargo.toml`; edition 2024 requiere ≥1.85, el resto del stack eleva el mínimo efectivo a 1.88)
+> **MSRV:** 1.89 (`rust-version` en `Cargo.toml`; edition 2024 requiere ≥1.85; `rusqlite` 0.41, que trae el SQLite parcheado de RUSTSEC-2026-0459, eleva el mínimo a 1.89)
 >
 > **Toolchain:** stable
 >
@@ -162,7 +162,7 @@ Todas las versiones reflejan el `Cargo.toml` real de `0.6.4`:
 
 ## Decisión MSRV
 
-`ADR-KVD-009`: MSRV `1.88` (`rust-version` en `Cargo.toml`). Edition 2024 requiere ≥1.85; el mínimo efectivo sube a 1.88 por el resto del stack. Coste: usuarios con toolchain antigua no pueden `cargo install`. Aceptable — cualquier dev activo en 2026 tiene una stable ≥1.88.
+`ADR-KVD-009`: MSRV `1.89` (`rust-version` en `Cargo.toml`). Edition 2024 requiere ≥1.85; el mínimo efectivo sube a 1.89 por `rusqlite` 0.41 (SQLite parcheado, RUSTSEC-2026-0459). Coste: usuarios con toolchain antigua no pueden `cargo install`; los binarios precompilados no lo necesitan.
 
 ## Roadmap del stack
 
@@ -183,7 +183,7 @@ Cambios de stack previstos siguen la roadmap de endurecimiento del vault (`ROAD-
 | `ADR-KVD-006` | MCP thin JSON-RPC propio (no `rmcp`) |
 | `ADR-KVD-007` | `rusqlite` bundled (no `sqlx`) |
 | `ADR-KVD-008` | Fork YAML mantenido (`serde_yaml_ng`) |
-| `ADR-KVD-009` | MSRV 1.88 (edition 2024 + stack) |
+| `ADR-KVD-009` | MSRV 1.89 (edition 2024 + rusqlite 0.41) |
 | `ADR-KVD-010` | Threat model Nivel 2 zero-knowledge formal |
 | `ADR-KVD-011` | Recovery codes UX pattern |
 | `ADR-KVD-CLI-4810AF` | Envelope de la clave de vault y recuperación por frase atada al vault (0.9.0) |

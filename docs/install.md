@@ -13,7 +13,7 @@ cargo install --locked kvendra                                          # from c
 cargo install --locked --git https://github.com/KvendraAI/kvendra-cli kvendra
 ```
 
-Requires Rust 1.88+ (edition 2024). The build downloads its dependencies
+Requires Rust 1.89+ (edition 2024). The build downloads its dependencies
 and takes ~3-5 minutes on a modern machine.
 
 ### Option 2: pre-built binary
