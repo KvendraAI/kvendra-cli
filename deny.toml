@@ -21,6 +21,7 @@ ignore = [
   "RUSTSEC-2024-0436",
   { id = "RUSTSEC-2026-0187", reason = "2026-09-22 SA10: lopdf 0.31 via printpdf 0.7 (fix needs lopdf >=0.42, no compatible printpdf). kvendra only WRITES PDFs (audit export); it never calls lopdf load/parse on untrusted input, so the parser stack overflow is unreachable." },
   { id = "RUSTSEC-2026-0192", reason = "2026-09-22 SA10: ttf-parser 0.19 (unmaintained) via printpdf 0.7. kvendra renders with printpdf BuiltinFont only and never loads external/untrusted font files. Replace on the printpdf upgrade." },
+  { id = "RUSTSEC-2024-0449", reason = "2026-11-15: unsafe-libyaml (unmaintained, no safe upgrade) via serde_yaml_ng 0.10.0, the latest release. kvendra parses only local YAML (HMAC-signed allowlists, own config), never untrusted remote YAML. Replacement tracked in ISSUE-KVD-CLI-BD5435." },
 ]
 
 [licenses]

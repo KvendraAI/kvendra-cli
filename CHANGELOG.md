@@ -23,6 +23,7 @@ Patch release (ISSUE-KVD-CLI-97093A).
 - `rusqlite` 0.31 → 0.41 (`libsqlite3-sys` 0.39.1, bundled SQLite 3.54.1):
   RUSTSEC-2026-0459.
 - `rustls` 0.23.45 → 0.23.46: RUSTSEC-2026-0346, -0347, -0348, -0349.
+- `rustls-webpki` 0.103.17 (RUSTSEC-2026-0382), `webpki-roots` 1.0.12 (RUSTSEC-2026-0381), `tokio` 1.54.1 (RUSTSEC-2026-0386).
 
 ### Changed
 - MSRV 1.88 → 1.89 (required by `rusqlite` 0.41). Only matters for `cargo install`.
